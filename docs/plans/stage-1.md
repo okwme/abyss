@@ -750,6 +750,23 @@ Open items:
 - An echo in `SentUnconfirmed` can be dropped by a `Reconciled` whose tail was requested before the send was accepted. 10b should keep `SentUnconfirmed` echoes until a later `Reconciled` or a `Sent`.
 - The fake does not push `updateMessageID` on its own; tests inject it. 12 should check the ordering against a live server.
 
+**Task 4c status (2026-11-16): round 9 re-check fixes to the core actor, done against the fake.** Regression tests are in `crates/core/src/actor/tests/review4c.rs` unless noted; findings 1–4 fail on the old code (checked by reverting each fix), finding 5 fills a test gap.
+1. **An emptied partial tail deleted older messages (HIGH).** `HistoryReply` now carries `covered: Option<Coverage>` (the oldest and newest id the server page held), captured before buffered tombstones filter the page. `authoritative_range()` is `[covered.oldest, max(covered.newest, floor)]` for a partial page, `[MIN, top]` only when the page is the whole history, and `None` (delete nothing) for a partial page that covered nothing. `tail_diff`, the merge's cache `Reconcile`, the Older/Newer cache reconciles and the bootstrap's `CacheCmd::ReconcileTail` all use it; `ReconcileTail` now takes `from: Option<MsgId>` (covered start, or `None` for the whole history) instead of deriving it from the first surviving message, and is skipped (window not marked cache-contiguous) when a partial page covered nothing. Tests: `emptied_refresh_tail_keeps_older_messages_in_window_and_cache`, `emptied_bootstrap_tail_keeps_older_cached_messages`, `merge::emptied_partial_tail_keeps_older_messages`.
+2. **Repeated FloodWait bypassed every retry bound.** The unknown-outcome attempt budget is unchanged. Flood waits are now bounded separately, per user action and across rebuilds (the pending-send table outlives instances): at most `MAX_FLOOD_WAITS` (5) automatic resends, no resend later than `AUTO_RETRY_WINDOW` (10 min) after the send or the last Retry, and every wait lasts at least `MIN_FLOOD_WAIT` (1 s). Past either bound the send emits `Error(FloodWait { seconds })` and goes `Failed` (Retry resets both bounds, same `random_id`; Discard frees it). Tests: `repeated_flood_waits_end_failed_across_rebuilds` (zero-second waits plus a rebuild during a wait), `flood_wait_past_the_retry_window_fails_at_once`.
+3. **A refresh hid newly found dialogs at capacity.** `Dialogs` tracks a confirmed prefix: a refreshed first page is confirmed, the kept rows from earlier pages are provisional. `append(chats, rest)` confirms provisional rows and admits new ones at the end of the confirmed rows (server order), evicting the lowest-ranked provisional row when full; a new chat is dropped only when every row is confirmed. A page ending the server's list drops provisional rows the traversal never reached. A bump that moves a provisional row to the top confirms it. A page that reorders, evicts or drops rows is emitted as `DialogsReset` (whole list) instead of `DialogsAppended`. Tests: `refresh_at_capacity_admits_a_new_chat_in_server_order` (1,200 server dialogs, 1,000 retained, newcomer at position 150 ends at index 150 of the list and of the retained peers), the 250-dialog regression updated to accept the reset, `dialogs::refreshed_traversal_admits_new_chats_at_capacity`, `dialogs::end_of_traversal_drops_unconfirmed_rows`.
+4. **`retain_peers` order went stale after a live bump.** `Dialogs::bump` bumps the revision when it moves a chat. Tests: `retained_peers_follow_a_live_bump`, `dialogs::reordering_bump_changes_the_revision`.
+5. **MessageId-vs-RPC correlation with a late successful answer.** Tests for both orders: `stream_message_id_then_successful_answer_applies_once` and `successful_answer_then_stream_message_id_applies_once` assert one `Sent`, no further send state, one server message, and that the send left the table (Retry gives `NotFound`).
+
+API changes (additive or doc-only in `api.rs`): `SendState::FloodWait` and `Event::DialogsAppended` docs. Internal: `Coverage`, `HistoryReply::{covered, authoritative_range}`, `CacheCmd::ReconcileTail { from }`, `store::Appended`, `Dialogs::append(chats, rest)`, test-only `Boot::awaiting_tail`.
+
+App obligations for **10b**: a `DialogsReset` may follow `LoadDialogs` (not only bootstrap and refresh); a `Failed` send after `FloodWait` comes with `Error(FloodWait)` and needs Retry/Discard.
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (252 core, 3 ignored; 97 app), the actor tests repeated 5 times without a failure.
+
+Open items:
+- Finding 5's two tests pass on the 4b code as well; they pin behaviour rather than fix a bug.
+- A full-bootstrap tail emptied by tombstones still replaces the window with an empty one (older history reloads from the cache on scroll); only the cache keeps 1–50.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.
@@ -867,6 +884,13 @@ Open items:
     - A failed logout is forgotten and shown as "Signed out". Keep an incomplete-logout state with Retry, report it at shutdown, and use the copy "Logout incomplete".
     - Startup waits ignore cancellation, so a stalled Keychain blocks the shutdown acknowledgement. Make them cancellation-aware.
     - Tests: seed recognizable old auth keys and assert they are absent after logout. Add shutdown with a full *command* queue.
+
+- **Round 9 (re-check of task 4b, 2026-11-16).** All fixed in task 4c (section 13):
+  - **High:** a partial tail emptied by buffered deletions deleted older valid messages from the window and the cache (`MIN_ID` lower bound). Reconciliation now uses the server page's coverage captured before tombstone filtering; an empty partial page never establishes the start of history.
+  - Repeated `FloodWait` bypassed all retry bounds (zero-second waits looped). Bounded by a flood-wait count and a total automatic-retry window that survive rebuilds, with a 1 s minimum wait; exhaustion is `Failed` (Retry/Discard).
+  - A refresh at capacity hid newly discovered dialogs. Retained rows are provisional, the refreshed traversal confirms rows in server order and evicts the lowest-ranked provisional rows.
+  - **Low:** `retain_peers` order went stale after a live bump; a reordering bump now bumps the dialogs revision.
+  - Test gap: MessageId-vs-RPC correlation is now tested in both arrival orders with a late successful RPC.
 
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 

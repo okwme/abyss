@@ -7,9 +7,13 @@
 //! - an unknown outcome (time-out, transport, dropped by a rebuild) retries
 //!   automatically up to [`MAX_ATTEMPTS`] across rebuilds, then `Unknown`;
 //! - `FLOOD_WAIT` and an authenticated `303` are *not* rejections: the server
-//!   did not run the request. A flood wait is held as `FloodWait` and resent
-//!   when it expires; a migration stays `Sending` and replays after the
-//!   rebuild it triggers. Neither consumes an attempt.
+//!   did not run the request. A flood wait is held as `FloodWait` (at least
+//!   [`MIN_FLOOD_WAIT`]) and resent when it expires; a migration stays
+//!   `Sending` and replays after the rebuild it triggers. Neither consumes an
+//!   attempt. Flood waits have their own bounds instead: at most
+//!   [`MAX_FLOOD_WAITS`] per user action, and no automatic resend later than
+//!   [`AUTO_RETRY_WINDOW`] after it (both survive rebuilds). Past either the
+//!   send is `Failed`, and the user decides (Retry or Discard).
 //! - The send's server id comes from the RPC response or from a stream
 //!   `updateMessageID`, whichever arrives first; the other is a no-op. A
 //!   `SentUnconfirmed` send is remembered (bounded) so a later stream
@@ -38,6 +42,13 @@ const MAX_ATTEMPTS: u8 = AUTO_RETRIES + 1;
 pub(super) const MAX_SEND_CHARS: usize = 4096;
 /// `SentUnconfirmed` sends remembered for a late stream `updateMessageID`.
 const MAX_UNCONFIRMED: usize = MAX_PENDING_SENDS;
+/// Automatic resends after a `FLOOD_WAIT`, per user action.
+pub(super) const MAX_FLOOD_WAITS: u8 = 5;
+/// The shortest flood wait honoured: a zero-second wait must not loop.
+pub(super) const MIN_FLOOD_WAIT: Duration = Duration::from_secs(1);
+/// How long after a user action (send or retry) a flood-waited send may still
+/// be resent automatically.
+pub(super) const AUTO_RETRY_WINDOW: Duration = Duration::from_mins(10);
 
 #[derive(Debug)]
 struct Pending {
@@ -46,6 +57,11 @@ struct Pending {
     random_id: i64,
     /// Attempts made since the last user action.
     attempts: u8,
+    /// Flood waits since the last user action.
+    flood_waits: u8,
+    /// No automatic resend after a flood wait past this (set by the last
+    /// user action).
+    auto_until: Instant,
     state: SendState,
     /// Queued or running on the live instance.
     in_flight: bool,
@@ -208,6 +224,8 @@ impl<B: Backend> Actor<B> {
             text,
             random_id,
             attempts: 0,
+            flood_waits: 0,
+            auto_until: Instant::now() + AUTO_RETRY_WINDOW,
             state: SendState::Sending,
             in_flight: false,
             retry_at: None,
@@ -225,6 +243,8 @@ impl<B: Backend> Actor<B> {
             return self.error(UserError::Busy).await;
         }
         p.attempts = 0;
+        p.flood_waits = 0;
+        p.auto_until = Instant::now() + AUTO_RETRY_WINDOW;
         self.dispatch_send(local_id).await;
     }
 
@@ -354,13 +374,24 @@ impl<B: Backend> Actor<B> {
     }
 
     /// `FLOOD_WAIT`: the server did not run the send. Hold it for `seconds`
-    /// without consuming an attempt, then resend with the same `random_id`.
+    /// (at least [`MIN_FLOOD_WAIT`]) without consuming an attempt, then
+    /// resend with the same `random_id`. Past [`MAX_FLOOD_WAITS`], or when
+    /// the resend would fall after the send's [`AUTO_RETRY_WINDOW`], it is
+    /// `Failed` instead: the server may keep answering `FLOOD_WAIT` forever.
     async fn hold_flooded(&mut self, local_id: LocalId, seconds: u32) {
         let Some(p) = self.sends.map.get_mut(&local_id) else {
             return;
         };
         p.attempts = p.attempts.saturating_sub(1);
-        p.retry_at = Some(Instant::now() + Duration::from_secs(u64::from(seconds)));
+        p.flood_waits = p.flood_waits.saturating_add(1);
+        let wait = Duration::from_secs(u64::from(seconds)).max(MIN_FLOOD_WAIT);
+        let retry_at = Instant::now() + wait;
+        if p.flood_waits > MAX_FLOOD_WAITS || retry_at > p.auto_until {
+            p.retry_at = None;
+            self.error(UserError::FloodWait { seconds }).await;
+            return self.finish_send(local_id, SendState::Failed).await;
+        }
+        p.retry_at = Some(retry_at);
         self.finish_send(local_id, SendState::FloodWait { seconds })
             .await;
     }

@@ -31,7 +31,10 @@ pub(crate) enum CacheCmd {
     ReconcileTail {
         chat: ChatId,
         messages: Vec<Message>,
-        has_more: bool,
+        /// The oldest id the server page covered when it is partial (which
+        /// may be absent from `messages` if it was deleted meanwhile), or
+        /// `None` when the page is the chat's whole history.
+        from: Option<MsgId>,
     },
     Delete(ChatId, Vec<MsgId>),
     DeleteUnscoped(Vec<MsgId>),
@@ -236,10 +239,9 @@ fn handle(cache: &mut Cache, cmd: CacheCmd) {
         CacheCmd::ReconcileTail {
             chat,
             messages,
-            has_more,
+            from,
         } => {
-            let older = messages.first().map(|m| m.id).filter(|_| has_more);
-            drop(reconcile_tail(cache, chat, &messages, older));
+            drop(reconcile_tail(cache, chat, &messages, from));
         }
         CacheCmd::Delete(chat, ids) => drop(cache.delete_messages(chat, &ids)),
         CacheCmd::DeleteUnscoped(ids) => drop(cache.delete_unscoped(&ids)),

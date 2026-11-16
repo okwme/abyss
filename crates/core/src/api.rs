@@ -129,7 +129,10 @@ pub enum SendState {
     Failed,
     /// The server asked to wait (`FLOOD_WAIT`): not sent. Core resends it with
     /// the same `random_id` once `seconds` (counted from this event) have
-    /// passed; it can be discarded meanwhile.
+    /// passed (at least one second); it can be discarded meanwhile. Automatic
+    /// resends are bounded: after repeated flood waits, or past a total retry
+    /// window, the send becomes `Failed` (with `UserError::FloodWait`) and
+    /// waits for Retry or Discard.
     FloodWait {
         seconds: u32,
     },
@@ -193,7 +196,9 @@ pub enum Event {
     /// pages survive it.
     DialogsReset(Vec<ChatSummary>),
     /// Chats a later page added or changed: the UI updates listed chats in
-    /// place and appends new ones.
+    /// place and appends new ones. A page that reorders the list (after a
+    /// refresh, a newly found chat is placed in server order and may evict a
+    /// provisional one) is sent as `DialogsReset` instead.
     DialogsAppended(Vec<ChatSummary>),
     /// Whether more dialogs pages can be loaded (`LoadDialogs`), after every
     /// applied dialogs page. A refreshed first page restarts pagination, so
