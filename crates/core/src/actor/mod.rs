@@ -11,6 +11,7 @@ mod jobs;
 mod lifecycle;
 mod logout;
 mod merge;
+mod onboarding;
 mod sends;
 #[cfg(all(test, feature = "fake"))]
 mod tests;
@@ -205,9 +206,7 @@ impl<B: Backend> Actor<B> {
                 () = cancel.cancelled() => break,
                 Some(msg) = ch.internal.recv() => self.on_internal(msg).await,
                 step = lifecycle::next_step(self.life.step_mut()) => self.on_step(step).await,
-                (kind, done) = auth::next_auth(self.auth.task_mut()) => {
-                    self.on_auth(kind, done).await;
-                }
+                Some(msg) = self.auth.rx.recv() => self.on_auth(msg).await,
                 ev = lifecycle::next_live(&mut self.live) => self.on_live(ev).await,
                 Some(joined) = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
                     self.on_joined(joined).await;
@@ -237,6 +236,7 @@ impl<B: Backend> Actor<B> {
     async fn shut_down(&mut self) -> ShutdownReport {
         let deadline = Instant::now() + SHUTDOWN_DEADLINE;
         self.auth.abort_task();
+        self.auth.creds.abort();
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
         let life = self.shut_down_lifecycle(deadline).await;
@@ -274,6 +274,7 @@ impl<B: Backend> Actor<B> {
                 }
             });
         }
+        self.resolve_credentials().await;
         self.start_build(Duration::ZERO);
     }
 
@@ -421,6 +422,7 @@ impl<B: Backend> Actor<B> {
                 self.error(UserError::Internal).await;
                 return self.rebuild(Reason::StreamFailed).await;
             }
+            Some(TaskKind::Auth(tag)) => return self.on_auth_panic(tag).await,
             _ => {}
         }
         self.error(UserError::Internal).await;
@@ -451,6 +453,13 @@ impl<B: Backend> Actor<B> {
             Command::ResendCode => self.resend_code().await,
             Command::RetryPasswordParams => self.retry_password_params().await,
             Command::Logout => self.on_logout_command().await,
+            Command::SubmitCredentials { api_id, api_hash } => {
+                self.submit_credentials(api_id, api_hash).await;
+            }
+            Command::ForgetStoredCredentials => self.forget_credentials().await,
+            Command::ReloadCredentials => self.reload_credentials().await,
+            Command::RetryCredentialSave => self.retry_credential_save(),
+            Command::Back => self.back().await,
         }
     }
 

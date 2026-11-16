@@ -31,6 +31,9 @@ pub enum SecretItem {
     Session,
     /// Raw 32-byte SQLCipher key of the message cache.
     CacheKey,
+    /// The entered API credentials (`dev.abyss.apicreds`, plan section 17.1).
+    /// Survives logout; deleted only by `ForgetStoredCredentials`.
+    ApiCredentials,
 }
 
 impl SecretItem {
@@ -39,6 +42,7 @@ impl SecretItem {
         match self {
             Self::Session => "session",
             Self::CacheKey => "cachekey",
+            Self::ApiCredentials => "apicreds",
         }
     }
 }

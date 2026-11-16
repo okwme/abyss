@@ -5,6 +5,7 @@ pub mod api;
 mod auth_types;
 pub mod backend;
 pub mod cache;
+pub mod credentials;
 mod core;
 pub mod events;
 pub mod model;
@@ -16,7 +17,7 @@ pub mod store;
 
 pub use crate::actor::{CALL_DEADLINE, MAX_CONCURRENT, READ_FLUSH, SHUTDOWN_DEADLINE};
 pub use crate::core::{
-    BackendChoice, CacheConfig, CoreConfig, CoreEvents, CoreHandle, CoreSender, Credentials,
+    BackendChoice, CacheConfig, CoreConfig, CoreEvents, CoreHandle, CoreSender,
     SendError, ShutdownReport, StartError, start,
 };
 #[cfg(feature = "fake")]

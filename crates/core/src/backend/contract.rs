@@ -276,7 +276,7 @@ async fn fake_backend_passes_the_contract() {
     assert_eq!(fake.runners_finished(), 2);
 }
 
-/// Needs `ABYSS_API_ID` and a signed-in session in the Keychain. With
+/// Needs `ABYSS_API_ID`/`ABYSS_API_HASH` and a signed-in session in the Keychain. With
 /// `ABYSS_CONTRACT_CHAT=user:<id>` (or `chat:`/`channel:`), the suite also
 /// sends one message there; the chat must be in the first dialogs pages or be
 /// Saved Messages, so its access hash is known.
@@ -284,13 +284,15 @@ async fn fake_backend_passes_the_contract() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Telegram credentials and a signed-in session (task 12)"]
 async fn grammers_backend_passes_the_contract() {
-    let api_id: i32 = std::env::var("ABYSS_API_ID")
-        .expect("ABYSS_API_ID")
-        .parse()
-        .expect("numeric ABYSS_API_ID");
+    let env = crate::credentials::from_env(|k| std::env::var(k).ok());
+    let crate::credentials::EnvResolution::Pair(creds) = env.clone() else {
+        panic!("set ABYSS_API_ID and ABYSS_API_HASH");
+    };
+    let slot = crate::credentials::CredentialSlot::new(env);
+    slot.set(Some(creds));
     let persist = crate::session::PersistHandle::spawn(crate::secret::KeychainStore::new())
         .expect("persistence worker");
-    let backend = super::grammers::GrammersBackend::new(api_id, persist);
+    let backend = super::grammers::GrammersBackend::new(slot, persist);
     let target = std::env::var("ABYSS_CONTRACT_CHAT").ok().map(|s| {
         let (kind, id) = s.split_once(':').expect("kind:id");
         let kind = match kind {

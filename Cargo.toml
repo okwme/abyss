@@ -16,6 +16,8 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "917559da35dd4d626
 grammers-client = { git = "https://codeberg.org/Lonami/grammers", rev = "e61cf8585e1e9969ab81eda9fb4725a1500e2d86" }
 grammers-session = { git = "https://codeberg.org/Lonami/grammers", rev = "e61cf8585e1e9969ab81eda9fb4725a1500e2d86", default-features = false, features = ["serde"] }
 grammers-mtsender = { git = "https://codeberg.org/Lonami/grammers", rev = "e61cf8585e1e9969ab81eda9fb4725a1500e2d86" }
+# SRP for `auth.checkPassword` (task 6b); same pinned commit, already in the graph via grammers-client.
+grammers-crypto = { git = "https://codeberg.org/Lonami/grammers", rev = "e61cf8585e1e9969ab81eda9fb4725a1500e2d86" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "917559da35dd4d626205da705b071c800c9c2553", features = ["font-kit"] }
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-util = { version = "0.7.20", default-features = false }

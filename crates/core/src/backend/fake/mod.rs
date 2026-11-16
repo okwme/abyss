@@ -15,11 +15,12 @@ use grammers_session::Session as _;
 use tokio::sync::{Notify, mpsc};
 
 use super::{
-    Account, AuthError, Backend, BackendError, CheckPassword, Client, DialogsCursor, DialogsPage,
+    Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest, DialogsCursor, DialogsPage,
     HistoryPage, HistoryQuery, Instance, InstanceControl, PasswordChallenge, Seed, SessionSeed,
-    SessionSnapshot, SignIn, StreamError, StreamItem, Update, UpdateStream,
+    SentCode, SessionSnapshot, SignIn, StreamError, StreamItem, Update, UpdateStream,
 };
-use crate::api::PasswordBuf;
+use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
+use crate::credentials::{CredentialSlot, EnvResolution};
 use crate::model::{Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey};
 use crate::rich_text::RichText;
 use crate::session::AbyssSession;
@@ -43,6 +44,8 @@ pub enum Op {
     Read,
     IsAuthorized,
     RequestCode,
+    /// `auth.resendCode` (task 6b).
+    ResendCode,
     SignIn,
     CheckPassword,
     PasswordChallenge,
@@ -86,14 +89,42 @@ pub enum QuitBehavior {
 }
 
 /// Initial data for a fake account.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FakeScript {
     pub dialogs: Vec<ChatSummary>,
     /// Per chat, ascending by id.
     pub history: HashMap<ChatId, Vec<Message>>,
     pub latency: Duration,
     pub login: FakeLogin,
+    /// What the environment says about credentials. The default is a valid
+    /// env pair ([`fake_credentials`]), so the fake starts at the phone
+    /// screen; `Absent` starts onboarding (`--fake --onboarding`).
+    pub env: EnvResolution,
 }
+
+impl Default for FakeScript {
+    fn default() -> Self {
+        Self {
+            dialogs: Vec::new(),
+            history: HashMap::new(),
+            latency: Duration::ZERO,
+            login: FakeLogin::default(),
+            env: EnvResolution::Pair(fake_credentials()),
+        }
+    }
+}
+
+/// A valid-looking pair the fake server accepts.
+pub fn fake_credentials() -> ApiCredentials {
+    ApiCredentials::fake(FAKE_API_ID)
+}
+
+/// The `api_id` of [`fake_credentials`].
+pub const FAKE_API_ID: i32 = 1_000_000;
+/// An `api_id` the fake server answers with `API_ID_INVALID`.
+pub const FAKE_INVALID_API_ID: i32 = 1;
+/// An `api_id` the fake server answers with `API_ID_PUBLISHED_FLOOD`.
+pub const FAKE_PUBLISHED_API_ID: i32 = 2;
 
 /// How the fake server answers a login.
 #[derive(Clone, Debug)]
@@ -106,6 +137,9 @@ pub struct FakeLogin {
     /// The number has no account: `sign_in` answers `SignUpRequired`.
     pub sign_up_required: bool,
     pub display_name: String,
+    /// Where a first code request says the code went. `None` scripts an
+    /// unsupported flow (email setup): `OfficialAppRequired`.
+    pub sent: Option<SentCode>,
 }
 
 impl Default for FakeLogin {
@@ -116,6 +150,12 @@ impl Default for FakeLogin {
             hint: None,
             sign_up_required: false,
             display_name: "Fake User".into(),
+            sent: Some(SentCode {
+                delivery: CodeDelivery::App,
+                length: Some(5),
+                next: Some(NextDelivery::Sms),
+                timeout: Some(Duration::from_secs(60)),
+            }),
         }
     }
 }
@@ -253,11 +293,18 @@ pub struct FakeHandle {
 pub struct FakeBackend {
     shared: Arc<Shared>,
     stream: Arc<tokio::sync::Mutex<mpsc::Receiver<StreamCmd>>>,
+    /// The pair in use; a build waits for one (plan section 17.2a).
+    slot: CredentialSlot,
 }
 
 impl FakeBackend {
     pub fn new(script: FakeScript) -> (FakeBackend, FakeHandle) {
         let (tx, rx) = mpsc::channel(UPDATE_CAPACITY);
+        let slot = CredentialSlot::new(script.env.clone());
+        // Direct builds (the contract suite) need no actor to resolve an env pair.
+        if let EnvResolution::Pair(creds) = script.env {
+            slot.set(Some(creds));
+        }
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 dialogs: script.dialogs,
@@ -279,6 +326,7 @@ impl FakeBackend {
         let backend = FakeBackend {
             shared,
             stream: Arc::new(tokio::sync::Mutex::new(rx)),
+            slot,
         };
         (backend, handle)
     }
@@ -479,7 +527,12 @@ impl Backend for FakeBackend {
         self.shared.with(|s| s.account = Some(account));
     }
 
+    fn credentials(&self) -> &CredentialSlot {
+        &self.slot
+    }
+
     async fn build(&self, seed: Seed) -> Result<Instance<Self>, BackendError> {
+        let creds = self.slot.wait().await;
         // Like the real backend: a fresh session object over the account's
         // critical cell (or the retired instance's), taking its write token.
         let account = self.shared.with(|s| s.account.clone());
@@ -511,7 +564,7 @@ impl Backend for FakeBackend {
             stream: Arc::clone(&self.stream),
             baseline,
         };
-        Ok(self.instance(session, updates, runner_rx))
+        Ok(self.instance(session, updates, runner_rx, creds))
     }
 }
 
@@ -526,12 +579,14 @@ impl FakeBackend {
         session: Arc<AbyssSession>,
         updates: FakeUpdates,
         runner_rx: mpsc::Receiver<RunnerCmd>,
+        creds: Arc<ApiCredentials>,
     ) -> Instance<Self> {
         let quit = Arc::new(Notify::new());
         Instance {
             client: FakeClient {
                 shared: Arc::clone(&self.shared),
                 session: Arc::clone(&session),
+                creds,
             },
             updates,
             runner: Box::pin(run_runner(
@@ -623,6 +678,8 @@ pub struct FakeClient {
     shared: Arc<Shared>,
     /// This instance's session.
     session: Arc<AbyssSession>,
+    /// The pair this instance was built with.
+    creds: Arc<ApiCredentials>,
 }
 
 impl FakeClient {
@@ -689,8 +746,18 @@ impl Client for FakeClient {
         self.auth_is_authorized().await
     }
 
-    async fn request_login_code(&self, phone: &str) -> Result<Self::LoginToken, AuthError> {
+    async fn request_login_code(
+        &self,
+        phone: &str,
+    ) -> Result<CodeRequest<Self::LoginToken>, AuthError> {
         self.auth_request_code(phone).await
+    }
+
+    async fn resend_login_code(
+        &self,
+        token: &Self::LoginToken,
+    ) -> Result<CodeRequest<Self::LoginToken>, AuthError> {
+        self.auth_resend_code(token).await
     }
 
     async fn sign_in(
