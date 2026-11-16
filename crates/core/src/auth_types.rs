@@ -373,7 +373,10 @@ mod tests {
             code: -25300,
             message: "x".into(),
         };
-        assert_eq!(UserError::from(&os), UserError::Storage(StorageError::Keychain));
+        assert_eq!(
+            UserError::from(&os),
+            UserError::Storage(StorageError::Keychain)
+        );
         assert_eq!(
             UserError::from(&PersistError::NotQueued),
             UserError::Storage(StorageError::Busy)

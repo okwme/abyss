@@ -22,13 +22,15 @@ use tokio_util::sync::CancellationToken;
 use super::{Actor, ActorInit, CacheParts, Internal, open_cache};
 use crate::ShutdownReport;
 use crate::api::{AuthState, Command, ConnState, Event, HistoryDir, SendState, UserError};
-use crate::secret::{FaultControl, FaultyStore, MemoryStore, SecretItem, SecretStore};
-use crate::session::{PersistHandle, signed_in_blob};
-use crate::backend::fake::{FakeBackend, FakeHandle, FakeScript, Fault, Op, text_message};
+use crate::backend::fake::{
+    FAKE_SELF_HASH, FAKE_SELF_ID, FakeBackend, FakeHandle, FakeScript, Fault, Op, text_message,
+};
 use crate::backend::{BackendError, Update};
 use crate::cache::{CacheHandle, CacheKey};
 use crate::events::{self, EventReceiver};
 use crate::model::{ChatId, LocalId, MsgId, PeerKind};
+use crate::secret::{FaultControl, FaultyStore, MemoryStore, SecretItem, SecretStore};
+use crate::session::{PersistHandle, signed_in_blob};
 
 const WAIT: Duration = Duration::from_secs(600);
 
@@ -45,9 +47,6 @@ struct Harness {
     store: MemoryStore,
     faults: FaultControl,
 }
-
-/// The self user of the seeded session (matches the fake server's).
-const SELF_ID: i64 = 777_000;
 
 fn chat(id: i64) -> ChatId {
     ChatId {
@@ -91,11 +90,14 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
     let store = MemoryStore::new();
     if !setup.signed_out {
         store
-            .set(SecretItem::Session, &signed_in_blob(SELF_ID))
+            .set(
+                SecretItem::Session,
+                &signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH),
+            )
             .unwrap();
     }
-    let (faulty, faults) = FaultyStore::new(store.clone());
-    let persist = PersistHandle::spawn(faulty).unwrap();
+    let (wrapped, faults) = FaultyStore::new(store.clone());
+    let persist = PersistHandle::spawn(wrapped).unwrap();
     let account = persist.load_session().await.unwrap().snapshot;
     let (cache, cache_parts) = match setup.cache_dir {
         Some(dir) => {

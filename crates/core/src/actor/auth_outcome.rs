@@ -58,7 +58,11 @@ impl<B: Backend> Actor<B> {
     }
 
     async fn on_startup(&mut self, res: Result<Account, AuthFail>) {
-        if res == Err(AuthFail::Auth(AuthError::Backend(BackendError::Unauthorized))) {
+        if res
+            == Err(AuthFail::Auth(AuthError::Backend(
+                BackendError::Unauthorized,
+            )))
+        {
             return self.session_revoked().await;
         }
         if self.auth.state != AuthState::Connecting {
@@ -198,8 +202,7 @@ impl<B: Backend> Actor<B> {
                 self.on_startup(Err(AuthFail::Dropped)).await;
             }
             AuthKind::RequestCode => {
-                self.set_auth(AuthState::Phone { error: Some(error) })
-                    .await;
+                self.set_auth(AuthState::Phone { error: Some(error) }).await;
             }
             AuthKind::ResendCode | AuthKind::SignIn | AuthKind::Probe(Ambiguous::Code) => {
                 self.code_state(Some(error)).await;

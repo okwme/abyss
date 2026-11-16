@@ -617,6 +617,34 @@ Open for task 6 (and 5/11):
 - A retirement step that panics keeps the previous snapshot and recycles parked permits.
 - `SentUnconfirmed` and `updateMessageID` correlation are not modelled yet (task 10/11).
 
+**Task 11 status (2026-11-16): done offline; live verification is task 12.** `GrammersBackend` lives in `crates/core/src/backend/grammers/`:
+- **Snapshot unification.** `backend/seed.rs` re-exports `crate::session::SessionSnapshot`; the placeholder is gone. `SessionSnapshot::detached()` (test/`fake` only) gives the fake a snapshot without a persistence worker. `FakeBackend::build` now builds a real `AbyssSession` from the seed and makes one critical write per build (`set_home_dc_id`), so `rev` advances across rebuilds; `FakeControl::retire` revokes, then snapshots. `GrammersControl::retire` does the same (a poisoned cell is logged, the snapshot is still returned).
+- **Instance.** `GrammersBackend::new(api_id, PersistHandle)`. `build`: `SessionSeed::Stored` → `PersistHandle::load_session` (an unreadable store falls back to `fresh_session`, logged without details); `Live` → `AbyssSession::from_snapshot`. `SenderPool::with_configuration` with `NoRetries` and `updates_channel_capacity` 1024; `Client` with `auto_cache_peers`; `stream_updates` with `catch_up = false`. Runner = `pool.runner.run()`; `quit` = `pool.handle.quit()`.
+- **Update stream** (`stream.rs`): the baseline comes from `AbyssSession::baseline_established()`. The pull future owns the stream and hands it back, so racing the baseline watch never cancels a pull mid-way; `Baseline` is reported once, before any update pulled in the same wake. Errors are classified `Transient`/`Fatal` (`errors::stream_error`); panics are contained by the actor's join handles.
+- **Calls** (`calls.rs`, `invoke.rs`): raw TL over an `Invoke` trait (implemented for `grammers_client::Client`, mocked in tests). Retry classes: `Read` sleeps floods of at most 5 s, twice at most, and retries I/O once; `Never` (sends, and auth later) never retries. `303` → `Migrated`. `messages.sendMessage` with the caller's `random_id` and `no_webpage`; the id comes from `UpdateShortSentMessage` or the `updateMessageID` matching the `random_id`, else `SentUnconfirmed`. `messages.readHistory` / `channels.readHistory` with `max_id`. Peers resolve only through the session's cached access hashes (unknown → `Rejected`, no request); every dialogs/history response re-caches the hashes it carries, and the first dialogs page re-pins the page plus the carried peers.
+- **Mapping** (`map/`, pure functions): ids are range-checked before grammers' `PeerId` constructors (which debug-panic or overflow out of range); names/titles sanitized; text through `RichText::from_entities` (plain when oversized or with too many entities; URLs bounded); media to inert `MediaKind` placeholders (no download); service messages to sanitized strings naming the actor; broadcast channels excluded (by `post` flag or directory) and counted; forum replies fill `ThreadKey.topic`; deletes bounded to 10,000 ids; dialogs cursor from the last raw dialog.
+- **Logging:** only RPC error names matching `[A-Z0-9_]{1,64}` and codes are logged; never payloads, text, names or phones. A test captures `tracing` output at TRACE across failing and succeeding calls and asserts no text, name or phone appears.
+- **Contract suite** (`backend/contract.rs`): `contract::run(&impl Backend, target, Sends)` checks build from stored state, baseline first (10 s), no second baseline, dialog paging without overlap, history Tail/Before/After anchors, one `random_id` → one message, read marks, `quit` stopping the runner (5 s) and `retire` returning a usable snapshot. Runs on `FakeBackend` in CI; on `GrammersBackend` under `#[ignore]` (`ABYSS_API_ID`, optional `ABYSS_CONTRACT_CHAT=user:<id>` to enable the send check).
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (173 core tests, 3 ignored; 55 app), no gpui in `cargo tree -p abyss-core`. Grammers module: 45 tests (mapping incl. UTF-16, oversized text, bidi, media, service, broadcast, topics; the RPC error table; retry classes with paused time; byte-identical resends; log redaction; the baseline race).
+
+Deviations:
+- Raw TL requests and our own mapping instead of grammers' high-level iterators and message wrappers, so retries, `random_id` and sanitizing stay in our hands.
+- New `BackendError::SentUnconfirmed` (accepted without an id mapping, or `RANDOM_ID_DUPLICATE`); core marks the send `SentUnconfirmed` and drops it from the pending table at once. Core maps it to `UserError::Network` where a user error is needed.
+- `ThreadKey.topic` is filled for forum messages (Stage 1 still never keys windows on it).
+- `Preview::of` moved from `actor/apply.rs` to `model.rs`.
+- The fake now deduplicates `(chat, random_id)` (second send → `SentUnconfirmed`) and makes one critical write per build.
+- `updateMessageID` arriving on the update stream (rather than in the send response) is not correlated; the send response is authoritative.
+- `GrammersBackend` is not wired into `core.rs`/`api.rs` (task 6 owns that, together with auth).
+
+Remaining for task 12 (live):
+- Run the ignored contract test against a real account (and the test DC, if usable).
+- Confirm `getHistory` After semantics (`add_offset = -limit`, `min_id`) and the dialogs cursor at page boundaries with excluded broadcasts.
+- Confirm the baseline arrives within 10 s on a fresh and on a stored session, and that `quit` stops the runner promptly.
+- Watch for grammers-internal panics on odd peers in the update path (contained by core, but each one costs a rebuild).
+
+Auth TODOs for task 6 (listed in `grammers/mod.rs`): `is_authorized`, `request_login_code` (needs `api_hash`), `sign_in`, `check_password` (re-fetch via `account.getPassword` on `SRP_ID_INVALID`), `users.getUsers` self after sign-in, `sign_out`. All auth calls use `RetryClass::Never` with typed error mapping; `Unauthorized` from any call must trigger a local logout; no bootstrap while signed out.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.
@@ -687,6 +715,15 @@ Open for task 6 (and 5/11):
 | 7 | Visible URL bytes not counted in the URL budget | Budget counts `TextUrl` targets plus visible `Url` text (fixed in code by the coordinator; plan wording aligned). Invalid UTF-16 boundaries are dropped, not clamped (section 6) |
 | Deferred | Full authenticated migration; framework, clipboard and SRP password copies | Recorded as residual risks 6 and 9 (section 14) |
 
+- **Round 4 (code review of task 4, 2026-11-16).** These are open, and are fixed in "Task 4b" after the 6/9/10/11 wave merges, because that wave touches the same files.
+  - **High:** reopening the bootstrap tail chat during bootstrap orphans its snapshot, so `Online` never comes (`boot.rs`, `apply.rs`). Track the snapshot by `(chat, request id)`, complete it even when stale, and queue a replacement through bootstrap.
+  - Refresh never removes a deleted newest message, or anything at all when the server tail is empty, because deletion detection is capped at the returned max id. Fix: reconcile the pre-request window against the authoritative tail, including the newest boundary.
+  - Dialog replay suppression keys on timestamps, so two messages in the same second lose a preview or unread count. Fix: carry the snapshot's top message id.
+  - `contiguous` grows by one entry per visited chat. Fix: bound it with the windows.
+  - A send that gets `Migrated` or `FloodWait` becomes `Failed` and is stranded after the rebuild. Fix: classify both separately and keep the send replayable with the same `random_id`.
+  - The send-replay test only covers an unaccepted attempt. Fix: add an "accepted, response lost" fault plus fake server dedup by `random_id`, and check the 3-attempt cap across several rebuilds.
+  - Shutdown during a retirement skips revoke. This one went to task 6.
+
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 
 History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This supersedes the "nothing on disk except the Keychain item" property in sections 3 and 9. The new property: **nothing plaintext on disk; everything on disk is undecryptable without a device-only Keychain key.**
@@ -729,8 +766,32 @@ Telegram requires an `api_id`/`api_hash` per client application. Decision: **bri
   - Validation: `api_id > 0`. `ApiHash` is exactly 32 hex chars, normalized to lowercase, with whitespace trimmed on paste.
   - Persist **only after the first successful `request_login_code`**, which proves the pair is valid. Until then the pair lives in memory only.
 - `API_ID_INVALID` and `API_ID_PUBLISHED_FLOOD` from `request_login_code` map to `CredentialError`. The state goes back to `NeedCredentials` with that error, without touching the session. The client is retired through the normal rebuild boundary.
-- `Command::ResetCredentials` is allowed only while logged out. It deletes `dev.abyss.apicreds`. While signed in, changing credentials means logging out first; the UI says so.
+- `Command::ForgetStoredCredentials` (renamed from `ResetCredentials`) is allowed only while logged out and only deletes the stored pair. It never touches an env override. While signed in, changing credentials means logging out first; the UI says so.
 - `ApiHash` has a redacting `Debug` and is never logged. This is the same rule as phone numbers.
+
+### 17.2a Credential provenance and auth-attempt rules (review round 4)
+
+**Provenance.** Resolution is atomic per source. Core reports `CredentialSource::{Env, Stored, Embedded, Entered}` alongside `AuthState` and the UI shows which source is in control.
+- **Env pair:**
+  - A partial env pair (only one variable set) is an explicit error naming the missing variable. It never falls through to the Keychain.
+  - An invalid env pair yields `NeedCredentials { error, source: Env }`, and the screen explains how to unset the variables. Entering a new pair is disabled while the env override is active.
+- **Keychain:**
+  - A Keychain read *failure* (locked, denied) is distinct from *absent*. It shows "Keychain unavailable" with Retry, and never shows the onboarding as if no pair were stored.
+  - Credential write and delete failures surface as `UserError` with Retry. A failed write after a successful `sendCode` does not block login; the pair is retried on the next successful auth step and stays in memory until then.
+
+**Auth attempts.** Every `SubmitCredentials`, `RequestCode`, `SubmitCode` and `SubmitPassword` runs under an `AuthAttempt` id.
+- **Back and Forget** are actor transitions, not UI-only navigation. Each one:
+  1. bumps the attempt id;
+  2. retires the client built for the superseded credentials through the normal retirement boundary;
+  3. clears the login and password tokens.
+- **Stale completions** carry an old attempt id and are dropped, including credential persistence. A late `sendCode` success can never persist a superseded pair.
+- **Ambiguous completion:** if a superseded `sign_in` or `check_password` may have completed, core runs the section 4 `is_authorized` probe before it accepts new credentials. If the probe says authorized, the user is signed in with the pair in use, and that pair is persisted.
+
+**Sent-code handling.** The pinned grammers `request_login_code` discards the sent-code type, timeout and next type (`auth.rs:290`). Use a raw `auth.sendCode` adapter that keeps the full `auth.SentCode`.
+- **Supported:** delivery in the app, SMS, call and flash call shown as text, plus server-directed resend with the server timeout.
+- **Unsupported:** the email-setup flow (`sentCodeTypeSetUpEmailRequired`) and `auth.sentCodeSuccess`. Both show "Finish this step in an official Telegram app, then try again" and never fake the flow.
+
+**`API_ID_PUBLISHED_FLOOD`** means the id is unusable (for example, it was published). It is not a timed wait. The message says to create or use a different application, with no countdown.
 
 ### 17.3 Screens
 
@@ -743,20 +804,21 @@ Every screen has Back except Welcome. Copy lives in one module (`crates/app/src/
 
    One button: **Connect to Telegram**.
 2. **Get API credentials.** Numbered steps, with **Open my.telegram.org** opening the system browser.
-   - The URL is the hardcoded constant `https://my.telegram.org/apps`, opened via `cx.open_url`. This is the only URL the app ever opens.
+   - The URL is the hardcoded constant `https://my.telegram.org/apps`, opened via `cx.open_url`. This is the only URL onboarding opens directly. Message links keep the separate confirm-before-open policy in section 8.
    - The steps:
+     0. Prerequisite: you need an existing Telegram account signed in on an official app (phone or desktop), and you must keep that session available. Login codes for my.telegram.org and for abyss arrive there.
      1. Log in with your phone number. The login code arrives *in your Telegram app*, not by SMS.
      2. Open "API development tools".
      3. Fill App title `abyss`, a Short name of 5–32 letters/digits, and Platform "Desktop"; leave URL empty.
      4. Copy `api_id` and `api_hash`.
    - Troubleshooting:
      - If the form says "ERROR", retry later, with VPN and ad blockers off and a letters-only short name.
-     - There is one app per account.
+     - There is one app per phone number. If you already registered one, copy its existing `api_id`/`api_hash`; don't try to create a second.
      - Never share the `api_hash`.
      - New `api_id`s can draw extra anti-spam scrutiny.
 3. **Enter credentials.** The `api_id` field accepts digits only, at most 10. The `api_hash` field accepts hex only, exactly 32 characters; it has a paste-normalizing filter and is masked with a reveal toggle. Inline validation runs, then **Continue** sends `SubmitCredentials`. A `CredentialError` comes back here with a specific message.
 4. **Phone** (section 4). International format with a leading `+`. Explain that the code is sent to your other Telegram sessions first.
-5. **Code.** Show where the code went (the sent-code type from `auth.sentCode`). Add a fixed warning: "Telegram and abyss will never ask for this code anywhere else." Expect a "new login" notice on your other devices.
+5. **Code.** Show where the code went, from the full `auth.SentCode` (section 17.2a), including the resend countdown and the next delivery type. Add a fixed warning: "Telegram and abyss will never ask for this code anywhere else." Expect a "new login" notice on your other devices.
 6. **Password** (2FA, section 4), with the hint.
 7. **Done.** Tips:
    - The session shows as "abyss" under Settings › Devices in official apps, where it can be revoked remotely.
@@ -775,7 +837,11 @@ Back from screens 4–6 to the credential screens is allowed only before the ses
   - Credentials are not persisted before a successful code request and are persisted after.
   - An env override is never persisted.
   - `API_ID_INVALID` returns to `NeedCredentials` with an error, and the session stays untouched.
-  - `ResetCredentials` is refused while signed in.
+  - `ForgetStoredCredentials` is refused while signed in and never affects an env override.
+  - A partial env pair is an error. A Keychain read failure is not treated as absent.
+  - A stale `sendCode` success after Back persists nothing. A superseded `sign_in` that succeeded is detected by the probe.
+  - The raw `sendCode` adapter keeps the delivery type and timeout. Email setup and `sentCodeSuccess` route to the official-app message.
+  - `API_ID_PUBLISHED_FLOOD` shows no countdown.
   - `ApiHash` `Debug` redacts.
 - **Fake backend:** scripted `API_ID_INVALID` and `API_ID_PUBLISHED_FLOOD` on the first code request.
 - **App:**

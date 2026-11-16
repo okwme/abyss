@@ -270,7 +270,11 @@ impl<'a> Cap<'a> {
         } else {
             now + cap
         };
-        Self { at, short, shutdown }
+        Self {
+            at,
+            short,
+            shutdown,
+        }
     }
 
     /// `None` when the cap expired first.
@@ -458,7 +462,11 @@ impl<B: Backend> Actor<B> {
         let Some(live) = self.live.as_mut() else {
             return;
         };
-        let updates = live.updates.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let updates = live
+            .updates
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(updates) = updates {
             let consumer = jobs::consume_updates(
                 updates,

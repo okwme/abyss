@@ -13,8 +13,11 @@
 //! There is deliberately no media or download method: Stage 1 never fetches media,
 //! and a backend cannot be asked to.
 
+#[cfg(test)]
+mod contract;
 #[cfg(feature = "fake")]
 pub mod fake;
+pub mod grammers;
 mod seed;
 
 use std::future::Future;
@@ -90,6 +93,10 @@ pub enum BackendError {
     /// An authenticated, non-file request was answered with a `303` migration.
     /// Stage 1 does not move authorizations between DCs (plan section 2, risk 6).
     Migrated,
+    /// Sends only: the server accepted the message, but no id mapping is known
+    /// (`RANDOM_ID_DUPLICATE` on a resend, or a response without
+    /// `updateMessageID`). Never retried (plan section 9).
+    SentUnconfirmed,
 }
 
 /// One item from an instance's update stream.
@@ -225,7 +232,6 @@ pub trait Client: Send + Sync + 'static {
 
     /// `auth.logOut`. The runner must still be running.
     fn sign_out(&self) -> impl Future<Output = Result<(), BackendError>> + Send;
-
 
     fn dialogs(
         &self,

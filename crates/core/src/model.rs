@@ -2,7 +2,7 @@
 //! stay inside the backend.
 
 use crate::rich_text::RichText;
-use crate::sanitize::{MAX_NAME_BYTES, MAX_PREVIEW_BYTES, MAX_SERVICE_BYTES, is_clean};
+use crate::sanitize::{MAX_NAME_BYTES, MAX_PREVIEW_BYTES, MAX_SERVICE_BYTES, clean, is_clean};
 
 #[derive(
     serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord,
@@ -57,7 +57,9 @@ pub(crate) fn group_by_chat(
     groups
 }
 
-/// A conversation within a chat. `topic` is always `None` until forum topics land.
+/// A conversation within a chat. `topic` is the forum topic a message belongs to
+/// when the server says so; Stage 1 shows forum chats as one stream and never
+/// keys on it (forum topics are Stage 2).
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ThreadKey {
     pub chat: ChatId,
@@ -209,6 +211,16 @@ impl MediaKind {
 }
 
 impl Preview {
+    /// The chat-list preview of a message: a one-line, bounded, clean text, or
+    /// the media kind.
+    pub fn of(m: &Message) -> Self {
+        match &m.body {
+            Body::Text(rt) => Preview::Text(clean(rt.text(), MAX_PREVIEW_BYTES)),
+            Body::Media { kind, .. } => Preview::Media(kind.clone()),
+            Body::Service(_) | Body::Unsupported => Preview::Service,
+        }
+    }
+
     pub fn is_valid(&self) -> bool {
         match self {
             Preview::Text(s) => is_clean(s, MAX_PREVIEW_BYTES),

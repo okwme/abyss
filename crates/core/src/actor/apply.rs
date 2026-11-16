@@ -7,8 +7,7 @@ use super::lifecycle::Reason;
 use crate::api::{Event, HistoryDir, UserError};
 use crate::backend::{Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, Update};
 use crate::cache::CacheCmd;
-use crate::model::{Body, ChatId, ChatSummary, Message, MsgId, Preview};
-use crate::sanitize::{MAX_PREVIEW_BYTES, clean};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview};
 use crate::store::{Bump, Change, Unread, ViewGen};
 
 pub(super) fn user_error(e: CallError) -> UserError {
@@ -18,9 +17,10 @@ pub(super) fn user_error(e: CallError) -> UserError {
         }
         CallError::Backend(BackendError::FloodWait { seconds }) => UserError::FloodWait { seconds },
         CallError::Backend(BackendError::Migrated) => UserError::AccountMigrated,
-        CallError::Backend(BackendError::Transient) | CallError::Timeout | CallError::Dropped => {
-            UserError::Network
-        }
+        // `SentUnconfirmed` is a send outcome, handled before errors are mapped.
+        CallError::Backend(BackendError::Transient | BackendError::SentUnconfirmed)
+        | CallError::Timeout
+        | CallError::Dropped => UserError::Network,
     }
 }
 
@@ -32,14 +32,6 @@ fn call_error(outcome: &Outcome) -> Option<CallError> {
         | Outcome::Send { res: Err(e), .. }
         | Outcome::Read(Err(e)) => Some(*e),
         _ => None,
-    }
-}
-
-fn preview_of(m: &Message) -> Preview {
-    match &m.body {
-        Body::Text(rt) => Preview::Text(clean(rt.text(), MAX_PREVIEW_BYTES)),
-        Body::Media { kind, .. } => Preview::Media(kind.clone()),
-        Body::Service(_) | Body::Unsupported => Preview::Service,
     }
 }
 
@@ -478,7 +470,7 @@ impl<B: Backend> Actor<B> {
             Origin::Replay(dates) => dates.get(&chat).is_some_and(|d| *d >= m.date),
         };
         if !reflected
-            && let Bump::Updated(summary) = self.dialogs.bump(chat, preview_of(&m), m.date, unread)
+            && let Bump::Updated(summary) = self.dialogs.bump(chat, Preview::of(&m), m.date, unread)
         {
             self.emit(Event::ChatBumped(summary)).await;
         }

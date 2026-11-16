@@ -104,15 +104,5 @@ pub(crate) fn launch_error(error: &LaunchError) -> (&'static str, Vec<SharedStri
 
 /// Title and paragraphs for a core that failed to start.
 pub(crate) fn start_error(error: &StartError) -> (&'static str, Vec<SharedString>) {
-    match error {
-        StartError::NotImplemented => (
-            "Can't connect to Telegram yet",
-            vec![
-                "This build doesn't include the Telegram backend yet. Run with --fake to use \
-                 the demo backend."
-                    .into(),
-            ],
-        ),
-        other => ("abyss couldn't start", vec![other.to_string().into()]),
-    }
+    ("abyss couldn't start", vec![error.to_string().into()])
 }

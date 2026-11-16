@@ -14,8 +14,7 @@ use crate::backend::fake::{
     BuildFault, FakeBackend, FakeScript, Fault, Op, QuitBehavior, text_message,
 };
 use crate::backend::{
-    BackendError, DialogsPage, HistoryPage, HistoryQuery, SessionSeed, SessionSnapshot,
-    StreamError, Update,
+    BackendError, DialogsPage, HistoryPage, HistoryQuery, SessionSeed, StreamError, Update,
 };
 use crate::events;
 use crate::model::{LocalId, Message, MsgId};
@@ -271,13 +270,17 @@ async fn rebuild_carries_the_live_session_and_peers() {
     h.online().await;
     let seeds = h.fake.seeds();
     assert_eq!(seeds.len(), 2);
-    assert_eq!(seeds[0].session, SessionSeed::Stored);
-    assert_eq!(
-        seeds[1].session,
-        SessionSeed::Live(SessionSnapshot::new(1)),
-        "the retired instance's snapshot, not storage"
-    );
+    assert!(seeds[0].session.is_stored());
+    let SessionSeed::Live(snapshot) = &seeds[1].session else {
+        panic!("the retired instance's snapshot, not storage");
+    };
+    // Each fake instance makes one critical write; `rev` continues across the
+    // rebuild because both instances share the account's critical cell.
+    assert_eq!(snapshot.rev().unwrap(), 2);
     assert_eq!(h.fake.stored_loads(), 1);
+    // A write arriving on the retired instance after retirement is dropped.
+    assert!(h.fake.late_critical_write().await);
+    assert_eq!(snapshot.rev().unwrap(), 2);
     let peers = seeds[1].peers.as_slice();
     assert!(peers.contains(&chat(2)) && peers.contains(&chat(1)));
     h.stop().await;

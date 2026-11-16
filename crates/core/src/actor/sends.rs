@@ -202,6 +202,12 @@ impl<B: Backend> Actor<B> {
                 self.sends.map.remove(&local_id);
                 self.send_state(local_id, SendState::Sent { id }).await;
             }
+            Err(CallError::Backend(BackendError::SentUnconfirmed)) => {
+                // Accepted without an id: never replayed, so it leaves the
+                // table; the echo is matched only by a later reconcile.
+                self.sends.map.remove(&local_id);
+                self.send_state(local_id, SendState::SentUnconfirmed).await;
+            }
             Err(
                 CallError::Backend(BackendError::Transient)
                 | CallError::Timeout

@@ -7,11 +7,11 @@
 //! fixed latency, live updates pushed by the test, and counters.
 
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use grammers_session::Session as _;
 use tokio::sync::{Notify, mpsc};
 
 use super::{
@@ -22,9 +22,11 @@ use super::{
 use crate::api::PasswordBuf;
 use crate::model::{Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey};
 use crate::rich_text::RichText;
-use crate::session::{AbyssSession, SessionSnapshot as AccountSnapshot};
+use crate::session::AbyssSession;
 
 mod auth;
+
+pub use auth::{FAKE_SELF_HASH, FAKE_SELF_ID};
 
 /// Maximum faults queued per operation.
 const MAX_FAULTS: usize = 1024;
@@ -220,6 +222,8 @@ struct State {
     attempted: Vec<(ChatId, i64)>,
     read: Vec<(ChatId, MsgId)>,
     seeds: Vec<Seed>,
+    /// The most recently retired instance's session, for late-write tests.
+    retired_session: Option<Arc<AbyssSession>>,
     quit: Option<QuitBehavior>,
     runner: Option<mpsc::Sender<RunnerCmd>>,
     /// The account's critical state, from `Backend::use_account`.
@@ -413,7 +417,7 @@ impl FakeHandle {
         self.shared.with(|s| {
             s.seeds
                 .iter()
-                .filter(|seed| seed.session == SessionSeed::Stored)
+                .filter(|seed| seed.session.is_stored())
                 .count()
         })
     }
@@ -447,6 +451,17 @@ impl FakeHandle {
         self.shared.with(|s| s.read.clone())
     }
 
+    /// A critical write (a new home DC) arriving on the most recently retired
+    /// instance's session after retirement, as a late runner write would.
+    /// Returns `false` if no instance was retired yet.
+    pub async fn late_critical_write(&self) -> bool {
+        let Some(session) = self.shared.with(|s| s.retired_session.clone()) else {
+            return false;
+        };
+        let next = next_home_dc(&session);
+        session.set_home_dc_id(next).await.is_ok()
+    }
+
     /// Replaces a chat's server-side history (e.g. simulate deletions).
     pub fn set_history(&self, chat: ChatId, messages: Vec<Message>) {
         self.shared.with(|s| {
@@ -460,50 +475,65 @@ impl Backend for FakeBackend {
     type Updates = FakeUpdates;
     type Control = FakeControl;
 
-    fn use_account(&self, account: AccountSnapshot) {
+    fn use_account(&self, account: SessionSnapshot) {
         self.shared.with(|s| s.account = Some(account));
     }
 
-    fn build(
-        &self,
-        seed: Seed,
-    ) -> impl Future<Output = Result<Instance<Self>, BackendError>> + Send {
-        std::future::ready(self.build_now(seed))
-    }
-}
-
-impl FakeBackend {
-    fn build_now(&self, seed: Seed) -> Result<Instance<Self>, BackendError> {
-        let rev = match &seed.session {
-            SessionSeed::Stored => 0,
-            SessionSeed::Live(snapshot) => snapshot.rev(),
+    async fn build(&self, seed: Seed) -> Result<Instance<Self>, BackendError> {
+        // Like the real backend: a fresh session object over the account's
+        // critical cell (or the retired instance's), taking its write token.
+        let account = self.shared.with(|s| s.account.clone());
+        let snapshot = match &seed.session {
+            SessionSeed::Stored => account.unwrap_or_else(SessionSnapshot::detached),
+            SessionSeed::Live(snapshot) => snapshot.clone(),
         };
         let (runner_tx, runner_rx) = mpsc::channel(4);
-        let (fault, account) = self.shared.with(|s| {
+        let fault = self.shared.with(|s| {
             push_capped(&mut s.seeds, seed);
             s.runner = Some(runner_tx);
-            (s.build_faults.pop_front(), s.account.clone())
+            s.build_faults.pop_front()
         });
         let baseline = match fault {
             Some(BuildFault::Fail(e)) => return Err(e),
             Some(BuildFault::NoBaseline) => false,
             None => true,
         };
-        // Like the real backend: a fresh session object over the account's
-        // critical cell, taking its write token.
-        let session = account
-            .and_then(|a| AbyssSession::from_snapshot(a).ok())
-            .map(Arc::new);
+        let session =
+            Arc::new(AbyssSession::from_snapshot(snapshot).map_err(|_| BackendError::Transient)?);
+        // A critical write during the instance's life, as the runner makes
+        // when it connects (grammers `set_dc_option`): advances `rev`.
+        let next = next_home_dc(&session);
+        session
+            .set_home_dc_id(next)
+            .await
+            .map_err(|_| BackendError::Transient)?;
+        let updates = FakeUpdates {
+            stream: Arc::clone(&self.stream),
+            baseline,
+        };
+        Ok(self.instance(session, updates, runner_rx))
+    }
+}
+
+/// A home DC different from the session's current one, so each call is a change.
+fn next_home_dc(session: &AbyssSession) -> i32 {
+    session.home_dc_id().map_or(1, |dc| dc.rem_euclid(5) + 1)
+}
+
+impl FakeBackend {
+    fn instance(
+        &self,
+        session: Arc<AbyssSession>,
+        updates: FakeUpdates,
+        runner_rx: mpsc::Receiver<RunnerCmd>,
+    ) -> Instance<Self> {
         let quit = Arc::new(Notify::new());
-        Ok(Instance {
+        Instance {
             client: FakeClient {
                 shared: Arc::clone(&self.shared),
-                session: session.clone(),
+                session: Arc::clone(&session),
             },
-            updates: FakeUpdates {
-                stream: Arc::clone(&self.stream),
-                baseline,
-            },
+            updates,
             runner: Box::pin(run_runner(
                 Arc::clone(&self.shared),
                 Arc::clone(&quit),
@@ -512,10 +542,9 @@ impl FakeBackend {
             control: FakeControl {
                 shared: Arc::clone(&self.shared),
                 quit,
-                rev,
                 session,
             },
-        })
+        }
     }
 }
 
@@ -543,8 +572,7 @@ async fn run_runner(shared: Arc<Shared>, quit: Arc<Notify>, mut cmds: mpsc::Rece
 pub struct FakeControl {
     shared: Arc<Shared>,
     quit: Arc<Notify>,
-    rev: u64,
-    session: Option<Arc<AbyssSession>>,
+    session: Arc<AbyssSession>,
 }
 
 impl InstanceControl for FakeControl {
@@ -554,13 +582,15 @@ impl InstanceControl for FakeControl {
 
     fn retire(self) -> SessionSnapshot {
         self.shared.retired.fetch_add(1, Ordering::SeqCst);
-        if let Some(session) = &self.session
-            && session.revoke().is_ok()
-        {
+        // Revoke first: a late write through this instance must not reach the
+        // snapshot the next instance is built from.
+        if self.session.revoke().is_ok() {
             self.shared.revoked.fetch_add(1, Ordering::SeqCst);
         }
-        // Simulates a critical write (e.g. a DC option) during the instance's life.
-        SessionSnapshot::new(self.rev.saturating_add(1))
+        let snapshot = self.session.snapshot();
+        self.shared
+            .with(|s| s.retired_session = Some(Arc::clone(&self.session)));
+        snapshot
     }
 }
 
@@ -591,8 +621,8 @@ impl UpdateStream for FakeUpdates {
 #[derive(Debug)]
 pub struct FakeClient {
     shared: Arc<Shared>,
-    /// This instance's session, when core provided an account.
-    session: Option<Arc<AbyssSession>>,
+    /// This instance's session.
+    session: Arc<AbyssSession>,
 }
 
 impl FakeClient {
@@ -737,6 +767,14 @@ impl Client for FakeClient {
         self.shared
             .with(|s| push_capped(&mut s.attempted, (chat, random_id)));
         let _g = self.enter(Op::Send).await?;
+        // Telegram deduplicates by `random_id` and answers a repeat with
+        // `RANDOM_ID_DUPLICATE`, which carries no message id.
+        if self
+            .shared
+            .with(|s| s.sent.iter().any(|&(c, r)| c == chat && r == random_id))
+        {
+            return Err(BackendError::SentUnconfirmed);
+        }
         // The real server also echoes own sends as updates; the fake does not, so tests
         // control update ordering explicitly with `FakeHandle::push_update`.
         let id = self.shared.with(|s| {

@@ -31,6 +31,10 @@ pub const PERSIST_QUEUE: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AccountGen(u64);
 
+/// Generation of detached snapshots; real generations start at 1.
+#[cfg(any(test, feature = "fake"))]
+const DETACHED: AccountGen = AccountGen(0);
+
 /// Why a persistence request did not confirm durability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PersistError {
@@ -146,6 +150,21 @@ pub struct LoadedSession {
 pub struct PersistHandle {
     tx: mpsc::Sender<PersistMsg>,
     next_gen: Arc<AtomicU64>,
+}
+
+#[cfg(any(test, feature = "fake"))]
+impl SessionSnapshot {
+    /// A logged-out session state with no persistence worker behind it, for the
+    /// fake backend and tests. Mutations still advance `rev`, but nothing is
+    /// ever stored: every barrier reports [`PersistError::NotQueued`] (after a
+    /// change) or [`PersistError::Stopped`].
+    pub fn detached() -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let state = CriticalState::default();
+        let blob = encode(&state).unwrap_or_default();
+        Self::with_sender(state, blob, DETACHED, tx)
+    }
 }
 
 impl PersistHandle {

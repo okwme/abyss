@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::actor::{Actor, ActorChannels, ActorInit, CacheParts, Internal, open_cache};
 use crate::api::{Command, Event, LogoutStatus, SaveStatus, UserError};
 use crate::backend::Backend;
+use crate::backend::grammers::GrammersBackend;
 use crate::events::{self, EventReceiver, EventSender};
 use crate::secret::SecretStore;
 use crate::session::PersistHandle;
@@ -96,7 +97,6 @@ pub enum BackendChoice {
 
 #[derive(Debug)]
 pub enum StartError {
-    NotImplemented,
     Runtime(std::io::Error),
     Thread(std::io::Error),
     /// The persistence worker thread could not start.
@@ -243,19 +243,14 @@ impl CoreHandle {
 }
 
 /// Starts core on its own thread.
-#[cfg_attr(
-    not(feature = "fake"),
-    expect(
-        clippy::needless_pass_by_value,
-        reason = "takes ownership of the backend choice; only the fake backend consumes it until task 11"
-    )
-)]
 pub fn start(config: CoreConfig, backend: BackendChoice) -> Result<CoreHandle, StartError> {
     match backend {
-        // Task 11: `start_with(config, GrammersBackend::new(..), KeychainStore::new(), || {})`.
-        BackendChoice::Grammers(_) => {
-            drop(config);
-            Err(StartError::NotImplemented)
+        BackendChoice::Grammers(Credentials { api_id, api_hash }) => {
+            // TODO(task 6b): the sent-code adapter (plan 17.2a) takes the hash.
+            drop(api_hash);
+            let store = crate::secret::KeychainStore::new();
+            let make = move |persist| GrammersBackend::new(api_id, persist);
+            start_with(config, make, store, || {})
         }
         #[cfg(feature = "fake")]
         BackendChoice::Fake(fake) => start_fake(config, fake),
@@ -279,7 +274,7 @@ fn start_fake(
             control.hold();
         }
     };
-    start_with(config, fake, store, after_load)
+    start_with(config, move |_| fake, store, after_load)
 }
 
 /// Everything the core thread needs to bring the actor up.
@@ -293,13 +288,11 @@ struct Boot<B> {
     cancel: CancellationToken,
 }
 
-#[cfg_attr(
-    not(feature = "fake"),
-    expect(dead_code, reason = "only the fake backend exists until task 11")
-)]
+/// Starts the persistence worker over `store`, builds the backend over it
+/// (`make`), and runs the actor on the core thread.
 fn start_with<B: Backend>(
     config: CoreConfig,
-    backend: B,
+    make: impl FnOnce(PersistHandle) -> B,
     store: impl SecretStore,
     after_load: impl FnOnce() + Send + 'static,
 ) -> Result<CoreHandle, StartError> {
@@ -310,6 +303,7 @@ fn start_with<B: Backend>(
         .build()
         .map_err(StartError::Runtime)?;
     let persist = PersistHandle::spawn(store).map_err(StartError::Persist)?;
+    let backend = make(persist.clone());
     let (cmd_tx, commands) = mpsc::channel(COMMAND_CAPACITY);
     let (internal_tx, internal) = mpsc::channel(INTERNAL_CAPACITY);
     let (events, events_rx) = events::channel();
@@ -378,7 +372,13 @@ async fn bring_up<B: Backend>(
     };
     let (handle, cache_parts) = match cache {
         Some(CacheConfig { dir }) => match open_cache(&persist, dir.clone()).await {
-            Some((handle, key)) => (Some(handle), Some(CacheParts { dir, key: Some(key) })),
+            Some((handle, key)) => (
+                Some(handle),
+                Some(CacheParts {
+                    dir,
+                    key: Some(key),
+                }),
+            ),
             None => (None, Some(CacheParts { dir, key: None })),
         },
         None => (None, None),
@@ -403,18 +403,20 @@ mod tests {
     use crate::api::AuthState;
     use crate::backend::fake::{FAKE_CODE, FakeBackend, FakeScript};
 
-    async fn until(core: &mut CoreHandle, pred: impl Fn(&Event) -> bool) -> Event {
+    /// The next event matching `pred`; `None` if core stopped or 10 s passed.
+    async fn until(core: &mut CoreHandle, pred: impl Fn(&Event) -> bool) -> Option<Event> {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match core.recv().await {
-                    Some(e) if pred(&e) => return e,
+                    Some(e) if pred(&e) => return Some(e),
                     Some(_) => {}
-                    None => panic!("core stopped"),
+                    None => return None,
                 }
             }
         })
         .await
-        .unwrap()
+        .ok()
+        .flatten()
     }
 
     #[tokio::test]
@@ -423,14 +425,31 @@ mod tests {
         script.login.password = None;
         let (fake, _h) = FakeBackend::new(script);
         let mut core = start(CoreConfig::default(), BackendChoice::Fake(fake)).unwrap();
-        until(&mut core, |e| matches!(e, Event::Auth(AuthState::Phone { .. }))).await;
+        until(&mut core, |e| {
+            matches!(e, Event::Auth(AuthState::Phone { .. }))
+        })
+        .await;
         core.send(Command::SubmitPhone("+15550100".into())).unwrap();
-        until(&mut core, |e| matches!(e, Event::Auth(AuthState::Code { .. }))).await;
+        until(&mut core, |e| {
+            matches!(e, Event::Auth(AuthState::Code { .. }))
+        })
+        .await;
         core.send(Command::SubmitCode(FAKE_CODE.into())).unwrap();
-        let signed_in = until(&mut core, |e| matches!(e, Event::Auth(s) if s.is_signed_in())).await;
-        assert!(matches!(signed_in, Event::Auth(AuthState::SignedIn { .. })));
-        let reset = until(&mut core, |e| matches!(e, Event::DialogsReset(v) if !v.is_empty())).await;
-        assert!(matches!(reset, Event::DialogsReset(v) if v.len() == 3));
+        let signed_in = until(
+            &mut core,
+            |e| matches!(e, Event::Auth(s) if s.is_signed_in()),
+        )
+        .await;
+        assert!(matches!(
+            signed_in,
+            Some(Event::Auth(AuthState::SignedIn { .. }))
+        ));
+        let reset = until(
+            &mut core,
+            |e| matches!(e, Event::DialogsReset(v) if !v.is_empty()),
+        )
+        .await;
+        assert!(matches!(reset, Some(Event::DialogsReset(v)) if v.len() == 3));
         let done = core.begin_shutdown().unwrap();
         let report = done.await.unwrap();
         assert_eq!(report.save, SaveStatus::Confirmed);
@@ -457,12 +476,25 @@ mod tests {
             ..CoreConfig::default()
         };
         let mut core = start(config, BackendChoice::Fake(fake)).unwrap();
-        until(&mut core, |e| matches!(e, Event::Auth(AuthState::Phone { .. }))).await;
+        until(&mut core, |e| {
+            matches!(e, Event::Auth(AuthState::Phone { .. }))
+        })
+        .await;
         core.send(Command::SubmitPhone("+15550100".into())).unwrap();
-        until(&mut core, |e| matches!(e, Event::Auth(AuthState::Code { .. }))).await;
+        until(&mut core, |e| {
+            matches!(e, Event::Auth(AuthState::Code { .. }))
+        })
+        .await;
         core.send(Command::SubmitCode(FAKE_CODE.into())).unwrap();
-        let ev = until(&mut core, |e| matches!(e, Event::Auth(s) if s.is_signed_in())).await;
-        assert!(matches!(ev, Event::Auth(AuthState::SignedInUnsaved { .. })));
+        let ev = until(
+            &mut core,
+            |e| matches!(e, Event::Auth(s) if s.is_signed_in()),
+        )
+        .await;
+        assert!(matches!(
+            ev,
+            Some(Event::Auth(AuthState::SignedInUnsaved { .. }))
+        ));
         let report = core.begin_shutdown().unwrap().await.unwrap();
         assert_eq!(report.save, SaveStatus::Unconfirmed);
     }
@@ -475,21 +507,19 @@ mod tests {
     }
 
     #[test]
-    fn grammers_is_not_implemented_yet() {
+    fn credentials_debug_redacts_the_hash() {
         let creds = Credentials {
             api_id: 1,
             api_hash: crate::api::ApiHash::parse(&"a".repeat(32)).unwrap(),
         };
-        assert!(format!("{creds:?}").contains("redacted"));
-        let res = start(CoreConfig::default(), BackendChoice::Grammers(creds));
-        assert!(matches!(res, Err(StartError::NotImplemented)));
+        let shown = format!("{creds:?}");
+        assert!(shown.contains("redacted") && !shown.contains("aaaa"));
     }
 }
 
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotImplemented => f.write_str("this backend is not implemented yet"),
             Self::Runtime(_) => f.write_str("could not start the async runtime"),
             Self::Thread(_) => f.write_str("could not start the core thread"),
             Self::Persist(_) => f.write_str("could not start the session store"),
@@ -500,7 +530,6 @@ impl std::fmt::Display for StartError {
 impl std::error::Error for StartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::NotImplemented => None,
             Self::Runtime(e) | Self::Thread(e) | Self::Persist(e) => Some(e),
         }
     }

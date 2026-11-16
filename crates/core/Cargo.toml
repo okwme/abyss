@@ -11,6 +11,8 @@ grammers-session.workspace = true
 grammers-mtsender.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+# Sanitized events only (plan section 11); already in the graph via grammers.
+tracing = "0.1.44"
 rusqlite = { version = "0.43", features = ["bundled-sqlcipher"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
@@ -36,4 +38,5 @@ fake = []
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 tokio = { version = "1.54", features = ["test-util", "macros", "rt"] }

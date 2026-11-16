@@ -310,7 +310,10 @@ impl<B: Backend> Actor<B> {
 
     /// The signed-out instance's login context, if one is up.
     fn login_ctx(&self) -> Option<Ctx<B::Client>> {
-        let live = self.live.as_ref().filter(|_| self.life.phase == Phase::SignedOut)?;
+        let live = self
+            .live
+            .as_ref()
+            .filter(|_| self.life.phase == Phase::SignedOut)?;
         Some(Ctx {
             client: Arc::clone(&live.client),
             cancel: live.cancel.clone(),
@@ -436,7 +439,12 @@ impl<B: Backend> Actor<B> {
             return;
         };
         self.spawn_auth(kind, guard, async move {
-            let res = call(&ctx.cancel, ctx.deadline, ctx.client.request_login_code(&phone)).await;
+            let res = call(
+                &ctx.cancel,
+                ctx.deadline,
+                ctx.client.request_login_code(&phone),
+            )
+            .await;
             AuthStep::CodeSent(res)
         });
     }

@@ -5,13 +5,13 @@ use grammers_session::Session as _;
 use grammers_session::types::{PeerAuth, PeerInfo};
 
 use super::{
-    Account, AuthError, BackendError, CheckPassword, Fault, FakeClient, FakeHandle, FakeLogin, Op,
+    Account, AuthError, BackendError, CheckPassword, FakeClient, FakeHandle, FakeLogin, Fault, Op,
     PasswordBuf, PasswordChallenge, SignIn, injected_panic,
 };
 
 /// The fake account's user id and access hash.
-const SELF_ID: i64 = 777_000;
-const SELF_HASH: i64 = 0x5e1f;
+pub const FAKE_SELF_ID: i64 = 777_000;
+pub const FAKE_SELF_HASH: i64 = 0x5e1f;
 /// Shortest phone number the fake accepts (digits).
 const MIN_PHONE_DIGITS: usize = 5;
 
@@ -166,12 +166,10 @@ impl FakeClient {
 
     /// Caches the self user like grammers' `complete_login`: a critical write.
     async fn cache_self(&self) -> Result<(), AuthError> {
-        let Some(session) = &self.session else {
-            return Ok(());
-        };
+        let session = &self.session;
         let info = PeerInfo::User {
-            id: SELF_ID,
-            auth: Some(PeerAuth::from_hash(SELF_HASH)),
+            id: FAKE_SELF_ID,
+            auth: Some(PeerAuth::from_hash(FAKE_SELF_HASH)),
             bot: Some(false),
             is_self: Some(true),
         };
@@ -189,15 +187,15 @@ impl FakeClient {
     }
 
     pub(super) async fn auth_is_authorized(&self) -> Result<bool, BackendError> {
-        let answer = self.auth_enter(Op::IsAuthorized).await.map_err(to_backend)?;
+        let answer = self
+            .auth_enter(Op::IsAuthorized)
+            .await
+            .map_err(to_backend)?;
         let authorized = self.shared.with(|s| s.auth.authorized);
         Self::answer(answer, Ok(authorized)).await
     }
 
-    pub(super) async fn auth_request_code(
-        &self,
-        phone: &str,
-    ) -> Result<FakeLoginToken, AuthError> {
+    pub(super) async fn auth_request_code(&self, phone: &str) -> Result<FakeLoginToken, AuthError> {
         let answer = self.auth_enter(Op::RequestCode).await?;
         if phone.chars().filter(char::is_ascii_digit).count() < MIN_PHONE_DIGITS {
             return Err(AuthError::PhoneInvalid);
@@ -240,10 +238,12 @@ impl FakeClient {
         drop(password);
         let out = match verdict {
             PasswordVerdict::Consumed => return Err(AuthError::Backend(BackendError::Rejected)),
-            PasswordVerdict::Invalid(id, hint) => CheckPassword::InvalidPassword(PasswordChallenge {
-                token: FakePasswordToken(id),
-                hint,
-            }),
+            PasswordVerdict::Invalid(id, hint) => {
+                CheckPassword::InvalidPassword(PasswordChallenge {
+                    token: FakePasswordToken(id),
+                    hint,
+                })
+            }
             PasswordVerdict::Done(name) => {
                 self.cache_self().await?;
                 CheckPassword::Done(account(&name))
