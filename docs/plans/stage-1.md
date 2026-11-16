@@ -1051,6 +1051,11 @@ Open items:
   - **Medium:** an update-stream hash did not repair a previously unknown required peer. `store_peer` only cached it, `Calls::remember` (the only retry) is bypassed by `cache_peer`, and `repin` ignored an identical required set, so the peer could be evicted and was never carried.
   - Test sensitivity: the full-size unit test put dialogs last, the order the old FIFO survives. The two-peer backend test depended on hash-ordered directory iteration, so it failed on the old code for only one order.
 
+- **Round 14 (re-check of task 11e, 2026-11-16).** Original findings fixed. Follow-ups, fixed by the coordinator:
+  - Pin change detection now includes the required/transient split, so a role change with the same members reaches the session.
+  - The log-redaction test now uses a process-global TRACE subscriber with per-thread capture. Rebuilding the interest cache once could not stop other threads re-caching "never". 40/40 runs are clean.
+  - The second-migration seed reuse finding went to the 6c re-check.
+
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 
 History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This supersedes the "nothing on disk except the Keychain item" property in sections 3 and 9. The new property: **nothing plaintext on disk; everything on disk is undecryptable without a device-only Keychain key.**

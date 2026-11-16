@@ -680,6 +680,56 @@ async fn retire_revokes_before_snapshotting() {
     assert_eq!(session.home_dc_id().unwrap(), 5);
 }
 
+/// Process-wide TRACE subscriber whose output goes to the calling thread's
+/// capture buffer, if any. A thread-local default subscriber is unreliable
+/// here: callsites registered by other test threads cache their interest
+/// against *their* (absent) default, so this thread could miss events. A
+/// global dispatcher makes every callsite interested; the writer then keeps
+/// only this thread's output.
+fn capture_logs(buf: &LogBuf) -> CaptureGuard {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(|| ThreadCapture)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
+    CAPTURE.with(|c| *c.borrow_mut() = Some(buf.clone()));
+    CaptureGuard
+}
+
+thread_local! {
+    static CAPTURE: std::cell::RefCell<Option<LogBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Stops capturing on drop.
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        CAPTURE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Writes to the current thread's capture buffer, or discards.
+struct ThreadCapture;
+
+impl std::io::Write for ThreadCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURE.with(|c| {
+            if let Some(capture) = c.borrow().as_ref() {
+                capture.0.lock().unwrap().extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Collects formatted log output.
 #[derive(Clone, Default)]
 struct LogBuf(Arc<Mutex<Vec<u8>>>);
@@ -698,16 +748,7 @@ impl std::io::Write for LogBuf {
 #[tokio::test(start_paused = true)]
 async fn logs_never_carry_text_phones_or_payloads() {
     let buf = LogBuf::default();
-    let writer = buf.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(move || writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    // Other test threads may have registered these callsites while no
-    // subscriber was interested, caching them as "never"; recompute so this
-    // thread-local subscriber actually sees the events.
-    tracing::callsite::rebuild_interest_cache();
+    let _capture = capture_logs(&buf);
 
     let mut bob = user(8, "Secret Name", "");
     bob.phone = Some("+447700900123".into());

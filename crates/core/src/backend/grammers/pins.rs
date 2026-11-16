@@ -54,6 +54,10 @@ pub(crate) struct Pins {
     in_flight: Vec<(PeerId, u32)>,
     /// The set last handed to the session.
     applied: HashSet<PeerId>,
+    /// The required part of that set. A role change with identical
+    /// membership must still reach the session, because only required ids
+    /// end handoff holds.
+    applied_required: HashSet<PeerId>,
     /// Listed peers the session could not pin at the last application.
     unknown: usize,
 }
@@ -69,6 +73,7 @@ impl Pins {
             origin: Base::Inherited,
             in_flight: Vec::with_capacity(MAX_IN_FLIGHT),
             applied,
+            applied_required: HashSet::new(),
             unknown: 0,
         }
     }
@@ -163,14 +168,16 @@ impl Pins {
     /// The selected set when it differs from the one last applied.
     pub(crate) fn changed(&self) -> Option<Vec<PeerId>> {
         let selected = self.selected();
-        let same = selected.len() == self.applied.len()
-            && selected.iter().all(|id| self.applied.contains(id));
+        let (required, _) = self.split(&selected);
+        let same = same_set(&selected, &self.applied) && same_set(required, &self.applied_required);
         (!same).then_some(selected)
     }
 
     /// Records what was handed to the session and how many it could not pin.
     pub(crate) fn applied(&mut self, set: &[PeerId], unknown: usize) {
         self.applied = set.iter().copied().collect();
+        let (required, _) = self.split(set);
+        self.applied_required = required.iter().copied().collect();
         self.unknown = unknown;
     }
 
@@ -183,4 +190,9 @@ impl Pins {
     pub(crate) fn unknown(&self) -> usize {
         self.unknown
     }
+}
+
+/// Whether the distinct ids in `ids` are exactly `set`.
+fn same_set(ids: &[PeerId], set: &HashSet<PeerId>) -> bool {
+    ids.len() == set.len() && ids.iter().all(|id| set.contains(id))
 }
