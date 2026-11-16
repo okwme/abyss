@@ -704,6 +704,10 @@ async fn logs_never_carry_text_phones_or_payloads() {
         .with_writer(move || writer.clone())
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // Other test threads may have registered these callsites while no
+    // subscriber was interested, caching them as "never"; recompute so this
+    // thread-local subscriber actually sees the events.
+    tracing::callsite::rebuild_interest_cache();
 
     let mut bob = user(8, "Secret Name", "");
     bob.phone = Some("+447700900123".into());
