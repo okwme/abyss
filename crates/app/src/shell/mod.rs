@@ -1,0 +1,175 @@
+//! The main window: startup failures, the auth router, the chat shell, and
+//! the shutdown protocol (plan sections 1, 4, 5, 12).
+
+mod auth;
+mod bridge;
+mod chats;
+mod session;
+mod shutdown;
+mod view;
+
+use abyss_core::StartError;
+use abyss_core::api::Event;
+use gpui::{
+    App, AppContext, Bounds, Context, KeyBinding, Menu, MenuItem, Subscription, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, actions, px, size,
+};
+
+use self::bridge::EventSink;
+use self::session::{Session, Started};
+use self::shutdown::Closing;
+use crate::launch::{Launch, LaunchError};
+
+actions!(
+    abyss,
+    [
+        /// Our own quit (Cmd+Q), so shutdown can wait for core (plan section 5).
+        Quit
+    ]
+);
+
+/// App-level key bindings.
+pub(crate) fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-w", Quit, None),
+    ]
+}
+
+/// The app menu, so the menu bar's Quit goes through [`Quit`] too.
+pub(crate) fn menus() -> Vec<Menu> {
+    vec![Menu::new("abyss").items([MenuItem::action("Quit abyss", Quit)])]
+}
+
+/// Why abyss can't run; shown as a full-window explanation.
+#[derive(Debug)]
+pub(crate) enum Failure {
+    Launch(LaunchError),
+    Start(StartError),
+}
+
+enum State {
+    Failed(Failure),
+    Running(Box<Session>),
+}
+
+pub(crate) struct Root {
+    state: State,
+    _on_app_quit: Subscription,
+}
+
+impl Root {
+    fn new(
+        launch: Result<Launch, LaunchError>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let started = launch
+            .map_err(Failure::Launch)
+            .and_then(|l| session::start(l).map_err(Failure::Start));
+        Self::with_started(started, window, cx)
+    }
+
+    fn with_started(
+        started: Result<Started, Failure>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let state = match started {
+            Ok(started) => State::Running(Box::new(Session::new(started, window, cx))),
+            Err(failure) => {
+                tracing::warn!(?failure, "abyss cannot start");
+                State::Failed(failure)
+            }
+        };
+        let this = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            this.update(cx, |root, cx| root.request_close(window, cx))
+                .unwrap_or(true)
+        });
+        let on_app_quit = cx.on_app_quit(|root: &mut Root, _| {
+            if let State::Running(session) = &root.state {
+                session.cancel_core();
+            }
+            async {}
+        });
+        Self {
+            state,
+            _on_app_quit: on_app_quit,
+        }
+    }
+
+    /// Runs `f` on the session if core is running.
+    pub(crate) fn with_session<R>(
+        &mut self,
+        f: impl FnOnce(&mut Session, &mut Context<'_, Self>) -> R,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<R> {
+        match &mut self.state {
+            State::Running(session) => Some(f(session, cx)),
+            State::Failed(_) => None,
+        }
+    }
+
+    /// Whether the window may close now. While core runs, starts shutdown
+    /// instead and answers `false`; the ack handler quits.
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
+        let State::Running(session) = &mut self.state else {
+            return true;
+        };
+        match session.closing {
+            Closing::Open => {
+                session.begin_shutdown(window, cx);
+                false
+            }
+            Closing::Waiting => false,
+            Closing::Unconfirmed => true,
+        }
+    }
+}
+
+impl EventSink for Root {
+    fn apply(&mut self, events: Vec<Event>, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let State::Running(session) = &mut self.state {
+            for event in events {
+                session.apply_event(event, window, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn core_stopped(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let State::Running(session) = &mut self.state
+            && session.closing == Closing::Open
+        {
+            tracing::error!("core stopped unexpectedly");
+            session.show_notice(crate::ui::copy::CORE_STOPPED.into(), window, cx);
+        }
+    }
+}
+
+/// Opens the main window and routes the Quit action to its shutdown.
+pub(crate) fn open(launch: Result<Launch, LaunchError>, cx: &mut App) -> gpui::Result<()> {
+    let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some("abyss".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let handle = cx.open_window(options, |window, cx| {
+        cx.new(|cx| Root::new(launch, window, cx))
+    })?;
+    cx.on_action(move |_: &Quit, cx: &mut App| {
+        let quit_now = handle.update(cx, Root::request_close).unwrap_or(true);
+        if quit_now {
+            cx.quit();
+        }
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

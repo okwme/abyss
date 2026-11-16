@@ -524,6 +524,37 @@ Open for task 4:
 - Cancelling shutdown does not interrupt an `emit` that is blocked on a full event budget. It is unblocked once the UI drops its receiver.
 - No auth or logout handling: those commands return `Unsupported`.
 
+**Task 8 status (2026-11-16): done, pending manual IME testing.** `crates/app/src/ui/text_input.rs` vendors `Z/examples/input.rs` with an Apache-2.0 header and modification notice (NOTICE already lists it). The editing state lives in a GPUI-free `EditBuffer` (`text_input/edit.rs`): character filters (phone: ASCII digits and `+`; code: digits), UTF-16 length caps that never split a grapheme cluster, a line policy (single-line turns breaks into spaces, the composer normalizes CRLF), and marked-text handling. `text_input/element.rs` shapes through `shape_text` with soft wrap; the composer measures its height with `request_measured_layout`, grows to 8 rows, then scrolls to keep the caret visible (wheel scrolling too), and shows a `n / 4096` counter from 3,596 UTF-16 units. Enter emits `Submit`, Shift+Enter inserts a newline (single-line fields ignore it), Up/Down move by visual row. Key bindings are scoped to the `TextInput` key context. `PasswordInput` (`ui/password.rs`) is a separate element over `SecretBuf`, a `Box<[u8; 256]>` edited in place with `copy_within`, rejecting whole inserts that overflow, zeroing the stale tail on shrink, and wiping on submit (`take` hands core an exact-capacity `Zeroizing<Vec<u8>>`), Escape, leaving the password screen, shutdown and drop. Positions are chars, so the masked-layout byte offset is `3 × char` and the platform UTF-16 offset is the char index; `text_for_range` returns bullets only; copy and cut are not handled; paste is (the clipboard temporary is zeroized). `SecureInputGuard` wraps Carbon `EnableSecureEventInput`/`DisableSecureEventInput` and is held only while the field is focused *and* the window is active. Tests: 34 in `ui/` (mapping with é/ß/emoji/ZWJ, caps, filters, line policy, dead key and IME composition/cancel, no reallocation, stale-tail zeroing, wipe on take/clear/drop via a test-only drop hook, bullets-only platform APIs, secure-input pairing across focus/blur/deactivation/drop, composer key handling and height cap through `TestAppContext`).
+
+Deviations:
+- One bullet per **char**, not per grapheme, as the plan says; a ZWJ emoji shows several bullets and Backspace removes one char at a time.
+- Secure Event Input is also released while the window is inactive (the plan only said focus), because holding it in the background blocks keyboard monitoring system-wide.
+- Paste into the password field removes control characters; IME candidate geometry (`bounds_for_range`) is approximate on wrapped rows.
+
+Needs manual testing: Pinyin and Japanese IME in the composer (candidate window position, Enter committing a composition rather than submitting), dead keys in the password field with Secure Event Input on, and VoiceOver not reading the password.
+
+**Task 7 status (2026-11-16): done against the fake, with deviations.** `crates/app/src/shell/`:
+- **Bridge** (`bridge.rs`): one `spawn_in` loop awaits the next event, drains up to 256 with `try_recv`, and applies them in one `Root` update. The UI talks to core through a small `CoreLink` trait implemented by `CoreHandle` (and by a same-thread double in tests, because GPUI's test scheduler rejects wakeups from core's threads as non-determinism). A full queue shows a "busy" toast.
+- **Auth router** (`view.rs::auth_screen`): a single `match` on the auth state with one arm per state, each delegating to its own screen function (`connecting_screen`, `phone_screen`, `code_screen`, `password_screen`, `flood_wait_screen`, `chat_shell`). New states such as `NeedCredentials { error }`, `Welcome` or the credentials steps (section 17, task 6b) add a variant, an arm and a screen function without restructuring. Core's `AuthState` has only `SignedIn`, so the router matches a UI-side `AuthView` that mirrors section 4 and maps core states in with `From`.
+- **Copy**: all user-facing strings for the startup, auth and shutdown screens live in `crates/app/src/ui/copy.rs` (chat-shell placeholders stay inline until tasks 9–10).
+- **Missing credentials**: without `ABYSS_API_ID`/`ABYSS_API_HASH` and without `--fake`, a minimal full-window screen names the unset variables (onboarding replaces it in task 6b). An invalid id, `--fake` on a build without the feature, and `StartError::NotImplemented` (credentials set but no grammers backend yet) get their own screens. No panic; the process stays up.
+- **Shutdown**: our own `Quit` action is bound to Cmd+Q and Cmd+W and is the app menu's Quit; the window's should-close hook returns `false` while core runs. Both call `begin_shutdown`, show "Closing…", and await the ack against a 6 s UI timer: `Confirmed` or timeout quits, `Unconfirmed` (or a lost ack) shows the unconfirmed-save message with a Quit button. `on_app_quit` only cancels core.
+- **Logging**: `tracing` + `tracing-subscriber` to stderr, default `warn,abyss=info,abyss_core=info` (`RUST_LOG` overrides), and a per-layer filter drops every `grammers*` target regardless of `RUST_LOG` (lifted only by `ABYSS_DEBUG_PROTOCOL=1` in debug builds). The startup `eprintln` is gone.
+- Tests: 21 in `shell/`, `launch.rs` and `logging.rs` (credential resolution, grammers suppression, the 256 drain cap, fake login → chat list → `SendText`, busy toast, close → Closing → Unconfirmed → close allowed, the UI timeout, error screen closes freely, chat list bounds and ordering, phone masking, shutdown outcome mapping). Smoke-run: `abyss --fake` and `abyss` without credentials both stay up.
+
+Deviations:
+- **Login under `--fake` is simulated in the UI** (`auth::demo`): the fake backend has no auth and core answers login commands with `Unsupported`. Any phone with 5+ digits, any 5+ digit code (`00000` shows a 10 s flood-wait countdown), any non-empty password. Without `--fake`, submissions go to core as `SubmitPhone`/`SubmitCode`/`SubmitPassword`.
+- The `FaultyStore` stall can't be triggered from the app (core exposes no fault hook through `start`), so the unconfirmed-save path is covered by the GPUI test with a core double, not by `cargo dev`.
+- Cmd+W also quits (single-window app); after the window closes on the error or unconfirmed screen, the app quits.
+
+Core API gaps (for the core tasks):
+- `CoreHandle` has no way to split the event receiver from the command sender, so the UI shares it in an `Rc<RefCell<_>>` and polls a fresh `recv()` future per wake. A `split()` or `poll_recv` would remove that.
+- `AuthState` needs the section 4 states (and `NeedCredentials`/`Welcome` for task 6b); the UI's `AuthView` should then collapse into it.
+- No way to inject `FakeBackend` faults (or a `FaultyStore`) through `--fake` for the manual shutdown check.
+- `PasswordBuf` is still `Zeroizing<Vec<u8>>`; the UI hands over an exact-capacity copy.
+
+Needs manual testing: `cargo dev` login → chat list; Cmd+Q, Cmd+W and the close button showing "Closing…" then exiting (keystrokes could not be automated here without Accessibility permission).
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.

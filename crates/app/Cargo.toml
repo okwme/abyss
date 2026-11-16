@@ -9,6 +9,15 @@ publish.workspace = true
 abyss-core = { path = "../core" }
 gpui.workspace = true
 gpui_platform.workspace = true
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
+unicode-segmentation = "1"
+zeroize = "1"
+
+[dev-dependencies]
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+gpui = { workspace = true, features = ["test-support"] }
 
 [features]
 # Compile Metal shaders at runtime so dev builds don't need Xcode's Metal toolchain
