@@ -9,14 +9,16 @@
 //!
 //! Links are never opened (Stage 1): link text is styled, a hidden target is
 //! shown inline after the text it hides behind, and a click copies the target.
+//! Under a hidden spoiler a link is only spoiler: no target is shown and a
+//! click only reveals.
 
 use std::ops::Range;
 
 use abyss_core::rich_text::{LinkTarget, RichText, Style};
 use abyss_core::sanitize::clean;
 use gpui::{
-    Font, FontStyle, FontWeight, Hsla, SharedString, StrikethroughStyle, TextRun, UnderlineStyle,
-    px,
+    App, ElementId, Font, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
+    StrikethroughStyle, StyledText, TextRun, UnderlineStyle, Window, px,
 };
 
 /// Bytes of a hidden link target shown inline; the click copies all of it.
@@ -74,6 +76,15 @@ struct Builder<'a> {
     runs: Vec<TextRun>,
     links: Vec<(Range<usize>, SharedString)>,
     hidden: Vec<Range<usize>>,
+    /// The open link has text under a hidden spoiler.
+    link_hidden: Hiding,
+}
+
+/// Whether a link's text is (partly) under a hidden spoiler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hiding {
+    No,
+    Yes,
 }
 
 impl Builder<'_> {
@@ -86,6 +97,9 @@ impl Builder<'_> {
         self.out.push_str(piece);
         let look = if self.spoilers == Spoilers::Hidden && style.contains(Style::SPOILER) {
             self.hidden.push(start..self.out.len());
+            if link.is_some() {
+                self.link_hidden = Hiding::Yes;
+            }
             Look::HiddenSpoiler
         } else if link.is_some() {
             Look::Link
@@ -96,8 +110,15 @@ impl Builder<'_> {
         self.runs.push(run);
     }
 
-    /// Ends a link that started at display offset `start`.
+    /// Ends a link that started at display offset `start`. A link under a
+    /// hidden spoiler shows no target and copies nothing: its whole text
+    /// becomes one reveal range, so a click reveals and does nothing else.
     fn close_link(&mut self, target: Option<&LinkTarget>, start: usize) {
+        if std::mem::replace(&mut self.link_hidden, Hiding::No) == Hiding::Yes {
+            self.hidden.retain(|r| r.start < start);
+            self.hidden.push(start..self.out.len());
+            return;
+        }
         let url = match target {
             Some(LinkTarget::Visible(url)) => url,
             Some(LinkTarget::Hidden(url)) => {
@@ -188,6 +209,7 @@ pub(crate) fn style(rt: &RichText, fonts: &Fonts, palette: &Palette, spoilers: S
         runs: Vec::with_capacity(rt.runs().len() + 1),
         links: Vec::new(),
         hidden: Vec::new(),
+        link_hidden: Hiding::No,
     };
     let text = rt.text();
     let mut pos = 0usize;
@@ -212,6 +234,39 @@ pub(crate) fn style(rt: &RichText, fonts: &Fonts, palette: &Palette, spoilers: S
     }
     b.push(text.get(pos..).unwrap_or_default(), Style::default(), None);
     b.finish()
+}
+
+/// What a click on a message body asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Click {
+    /// Copy a link's exact target (links never open).
+    Copy(SharedString),
+    /// Reveal the message's spoilers.
+    Reveal,
+}
+
+impl Body {
+    /// The body as clickable text. Link and reveal ranges never overlap
+    /// (a link under a hidden spoiler is a reveal range only), so one click
+    /// asks for one thing.
+    pub(crate) fn interactive(
+        self,
+        id: impl Into<ElementId>,
+        on_click: impl Fn(Click, &mut Window, &mut App) + 'static,
+    ) -> InteractiveText {
+        let (mut ranges, targets): (Vec<Range<usize>>, Vec<SharedString>) =
+            self.links.into_iter().unzip();
+        ranges.extend(self.spoilers);
+        InteractiveText::new(id, StyledText::new(self.text).with_runs(self.runs)).on_click(
+            ranges,
+            move |range_ix, window, cx| {
+                let click = targets
+                    .get(range_ix)
+                    .map_or(Click::Reveal, |t| Click::Copy(t.clone()));
+                on_click(click, window, cx);
+            },
+        )
+    }
 }
 
 /// Plain text in the body style (echoes of own sends, service lines).

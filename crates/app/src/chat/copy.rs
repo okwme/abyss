@@ -1,9 +1,13 @@
 //! User-facing strings for the chat list and message view. Kept apart from
 //! `ui::copy` (auth and shutdown) so the two can change independently.
 
+use std::time::Instant;
+
 use abyss_core::api::{ConnState, SendState};
 use abyss_core::model::{ChatKind, MediaKind};
 use gpui::SharedString;
+
+use super::sends::Echo;
 
 pub(crate) const CHATS: &str = "Chats";
 pub(crate) const SELECT_CHAT: &str = "Select a chat";
@@ -87,7 +91,19 @@ pub(crate) fn byte_size(bytes: u64) -> String {
 }
 
 /// The status line under an outgoing message that has no server copy yet.
-pub(crate) fn send_label(state: SendState) -> SharedString {
+/// A flood-waiting send counts down to its resend.
+pub(crate) fn send_label(echo: &Echo, now: Instant) -> SharedString {
+    match echo.state {
+        SendState::FloodWait { .. } => match echo.wait_left(now) {
+            Some(0) => "Resending…".into(),
+            Some(left) => format!("Waiting {left} s (Telegram rate limit)").into(),
+            None => "Waiting (Telegram rate limit)".into(),
+        },
+        state => state_label(state),
+    }
+}
+
+fn state_label(state: SendState) -> SharedString {
     match state {
         SendState::Sending => "Sending…".into(),
         SendState::Sent { .. } => "Sent".into(),
@@ -99,6 +115,37 @@ pub(crate) fn send_label(state: SendState) -> SharedString {
         SendState::FloodWait { seconds } => {
             format!("Waiting {seconds} s (Telegram rate limit)").into()
         }
+    }
+}
+
+#[cfg(test)]
+mod send_label_tests {
+    use std::time::Duration;
+
+    use abyss_core::model::{ChatId, LocalId, PeerKind};
+
+    use super::*;
+    use crate::chat::sends::Echoes;
+
+    #[test]
+    fn flood_wait_counts_down_to_the_resend() {
+        let chat = ChatId {
+            kind: PeerKind::User,
+            id: 1,
+        };
+        let mut echoes = Echoes::default();
+        echoes
+            .push(Echo::new(LocalId(1), chat, "x".into(), 0))
+            .unwrap();
+        let now = Instant::now();
+        echoes.set_state(LocalId(1), SendState::FloodWait { seconds: 30 }, now);
+        let e = echoes.get(LocalId(1)).unwrap();
+        assert_eq!(send_label(e, now), "Waiting 30 s (Telegram rate limit)");
+        let later = now + Duration::from_secs(12);
+        assert_eq!(send_label(e, later), "Waiting 18 s (Telegram rate limit)");
+        let done = now + Duration::from_secs(31);
+        assert_eq!(send_label(e, done), "Resending…");
+        assert!(e.can_discard() && !e.can_retry());
     }
 }
 

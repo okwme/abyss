@@ -1,34 +1,49 @@
 //! Glue between the session and the chat shell (`crate::chat`): routes chat
-//! events in, sends the commands the shell decides on, and wires window focus,
-//! system wake and the message list's scroll handler to it.
+//! events in, lends the shell an admission function so its UI changes follow
+//! only admitted commands, wires window focus and system wake, and checks
+//! what the message list showed after each painted frame.
 
-use abyss_core::api::{Event, WindowState};
+use std::time::Duration;
+
+use abyss_core::SendError;
+use abyss_core::api::{Command, Event, SendState, UserError, WindowState};
 use abyss_core::model::{ChatId, LocalId};
-use gpui::{Context, Focusable, ListState, Subscription, Window};
+use gpui::{App, Context, Focusable, Subscription, WeakEntity, Window};
 
 use super::Root;
 use super::auth::AuthView;
+use super::bridge::SharedCore;
 use super::session::Session;
-use crate::chat::{Seen, format};
+use crate::chat::{ChatShell, Refused, format};
 use crate::ui::copy;
 
+/// How often a flood-wait countdown redraws.
+const COUNTDOWN_TICK: Duration = Duration::from_secs(1);
+
+/// What to do when core refuses a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnRefusal {
+    /// The user asked for it: say so.
+    Notice,
+    /// Driven by frames or rendering, and asked again on the next one. A
+    /// notice would redraw, and the redraw would ask again at frame rate.
+    Quiet,
+}
+
+/// Queues `cmd` with core without waiting.
+pub(super) fn admit(core: &SharedCore, cmd: Command) -> Result<(), Refused> {
+    let core = core.try_borrow().map_err(|_| Refused::Busy)?;
+    match core.send(cmd) {
+        Ok(()) => Ok(()),
+        // The rejected command is dropped here (a password in it is
+        // zeroized on drop).
+        Err(SendError::Full(_)) => Err(Refused::Busy),
+        Err(SendError::Closed(_)) => Err(Refused::Closed),
+    }
+}
+
 /// Subscriptions that feed the chat shell: window focus and system wake.
-pub(super) fn wire(
-    rows: &ListState,
-    window: &mut Window,
-    cx: &mut Context<'_, Root>,
-) -> [Subscription; 2] {
-    let this = cx.weak_entity();
-    rows.set_scroll_handler(move |_, window, _| {
-        // The list's state is borrowed while this runs: only schedule.
-        let this = this.clone();
-        window.on_next_frame(move |window, cx| {
-            this.update(cx, |root, cx| {
-                root.with_session(|s, cx| s.check_frame(window, cx), cx);
-            })
-            .ok();
-        });
-    });
+pub(super) fn wire(window: &mut Window, cx: &mut Context<'_, Root>) -> [Subscription; 2] {
     let activation = cx.observe_window_activation(window, |root, window, cx| {
         root.with_session(|s, cx| s.on_activation(window, cx), cx);
     });
@@ -42,60 +57,88 @@ pub(super) fn wire(
     [activation, wake]
 }
 
-/// What the last frame showed of the message list.
-fn seen(rows: &ListState, messages: usize) -> Seen {
-    let first_row = rows.logical_scroll_top().item_ix;
-    // From the bottom up, the first message row not entirely below the
-    // viewport. Rows that were never laid out answer `None` and are skipped.
-    let last_message = (0..messages)
-        .rev()
-        .find(|ix| rows.item_is_below_viewport(*ix) == Some(false));
-    Seen {
-        first_row,
-        last_message,
-    }
+/// Called from the message pane's paint: once this frame is drawn, check
+/// what the message list shows. Runs at the end of the frame's effect
+/// cycle, after layout and paint, so it reads the layout on screen.
+pub(super) fn after_paint(root: WeakEntity<Root>, window: &mut Window, cx: &mut App) {
+    window.defer(cx, move |window, cx| {
+        root.update(cx, |root, cx| {
+            root.with_session(|s, cx| s.check_frame(window, cx), cx);
+        })
+        .ok();
+    });
 }
 
 impl Session {
+    /// Runs `f` on the chat shell with an admission function, then reports
+    /// a refusal as `on_refusal` says.
+    fn drive<R>(
+        &mut self,
+        on_refusal: OnRefusal,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+        f: impl FnOnce(&mut ChatShell, crate::chat::Admit<'_>) -> Result<R, Refused>,
+    ) -> Option<R> {
+        let core = &self.core;
+        let mut admit = |cmd: Command| admit(core, cmd);
+        match f(&mut self.shell, &mut admit) {
+            Ok(r) => Some(r),
+            Err(refused) => {
+                tracing::debug!(?refused, "core refused a chat command");
+                if on_refusal == OnRefusal::Notice {
+                    self.show_refused(refused, window, cx);
+                }
+                None
+            }
+        }
+    }
+
+    pub(super) fn show_refused(
+        &mut self,
+        refused: Refused,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        let text = match refused {
+            Refused::Busy => copy::user_error(UserError::Busy),
+            Refused::Closed => copy::CORE_GONE.into(),
+        };
+        self.show_notice(text, window, cx);
+    }
+
     pub(super) fn apply_chat_event(
         &mut self,
         event: Event,
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        let rows_changed = matches!(
+        let flood = matches!(
             event,
-            Event::History { .. }
-                | Event::Edited(_)
-                | Event::Deleted { .. }
-                | Event::ChatInvalidated(_)
-                | Event::SendState { .. }
+            Event::SendState {
+                state: SendState::FloodWait { .. },
+                ..
+            }
         );
+        let paged = matches!(event, Event::DialogsPaging { .. });
         self.shell.apply(event);
-        if rows_changed {
-            self.schedule_frame_check(window, cx);
+        if flood {
+            self.start_countdown(window, cx);
+        }
+        // An empty list renders no rows, so nothing else would ask for the
+        // next page (a first page of broadcast channels only).
+        if paged && self.shell.list.is_empty() {
+            self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
+                s.request_dialogs(0, admit)
+            });
         }
     }
 
-    /// After the next frame, check what it showed (load more, mark read).
-    fn schedule_frame_check(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
-        if self.shell.window().is_none() {
-            return;
-        }
-        cx.on_next_frame(window, |root, window, cx| {
-            root.with_session(|s, cx| s.check_frame(window, cx), cx);
-        });
-    }
-
+    /// After a painted frame: load more, mark read, report the live tail.
     pub(super) fn check_frame(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
-        let messages = self
-            .shell
-            .window()
-            .map_or(0, crate::chat::messages::MessageWindow::len);
-        let seen = seen(self.shell.rows(), messages);
-        for cmd in self.shell.frame_seen(seen) {
-            self.send(cmd, window, cx);
-        }
+        let seen = self.shell.seen();
+        self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
+            s.frame_seen(seen, admit)
+        });
     }
 
     fn on_activation(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
@@ -104,12 +147,11 @@ impl Session {
         } else {
             WindowState::Inactive
         };
-        if let Some(cmd) = self.shell.set_focus(state) {
-            self.send(cmd, window, cx);
-        }
-        if state == WindowState::Active {
-            self.schedule_frame_check(window, cx);
-        }
+        self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
+            s.set_focus(state, admit)
+        });
+        // Redraw, so the frame check sees the active window.
+        cx.notify();
     }
 
     /// The Mac woke from sleep: core rebuilds rather than trust old sockets.
@@ -126,32 +168,36 @@ impl Session {
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        if let Some(cmd) = self.shell.select(chat) {
-            self.send(cmd, window, cx);
-        }
-        if self.auth == AuthView::SignedIn {
+        let opened = self.drive(OnRefusal::Notice, window, cx, |s, admit| {
+            s.select(chat, admit)
+        });
+        if opened.is_some() && self.auth == AuthView::SignedIn {
             window.focus(&self.composer.focus_handle(cx), cx);
         }
-        self.schedule_frame_check(window, cx);
         cx.notify();
     }
 
+    /// Enter in the composer. The text leaves the composer only once core
+    /// admitted the send, together with its echo.
     pub(super) fn submit_message(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
-        if self.auth != AuthView::SignedIn || self.composer.read(cx).text().trim().is_empty() {
+        if self.auth != AuthView::SignedIn {
             return;
         }
         let chat = match self.shell.send_target() {
             Ok(Some(chat)) => chat,
             Ok(None) => return,
             Err(error) => {
-                // The text stays in the composer.
                 self.show_notice(copy::user_error(error), window, cx);
                 return;
             }
         };
-        let text = self.composer.update(cx, |c, cx| c.take_text(window, cx));
-        if let Some(cmd) = self.shell.submit(chat, text, format::now()) {
-            self.send(cmd, window, cx);
+        let text = self.composer.read(cx).text().to_owned();
+        let sent = self.drive(OnRefusal::Notice, window, cx, |s, admit| {
+            s.submit(chat, &text, format::now(), admit)
+        });
+        if let Some(Some(_)) = sent {
+            self.composer
+                .update(cx, |c, cx| drop(c.take_text(window, cx)));
         }
         cx.notify();
     }
@@ -162,9 +208,9 @@ impl Session {
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        if let Some(cmd) = self.shell.retry(local_id) {
-            self.send(cmd, window, cx);
-        }
+        self.drive(OnRefusal::Notice, window, cx, |s, admit| {
+            s.retry(local_id, admit)
+        });
         cx.notify();
     }
 
@@ -174,31 +220,60 @@ impl Session {
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        if let Some(cmd) = self.shell.discard(local_id) {
-            self.send(cmd, window, cx);
-        }
+        self.drive(OnRefusal::Notice, window, cx, |s, admit| {
+            s.discard(local_id, admit)
+        });
         cx.notify();
     }
 
     pub(super) fn jump_to_latest(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
-        if let Some(cmd) = self.shell.jump_to_latest() {
-            self.send(cmd, window, cx);
-        }
+        self.drive(OnRefusal::Notice, window, cx, |s, admit| {
+            s.jump_to_latest(admit)
+        });
         cx.notify();
     }
 
     /// Chat list row `last_visible` was rendered: maybe load the next page.
-    /// Called during render, so the command goes out after it.
+    /// Called during render, so the request goes out after it.
     pub(super) fn dialogs_seen(
         &mut self,
         last_visible: usize,
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        if let Some(cmd) = self.shell.dialogs_seen(last_visible) {
-            cx.defer_in(window, move |root, window, cx| {
-                root.with_session(|s, cx| s.send(cmd, window, cx), cx);
-            });
+        if !self.shell.wants_dialogs(last_visible) {
+            return;
         }
+        cx.defer_in(window, move |root, window, cx| {
+            root.with_session(
+                |s, cx| {
+                    s.drive(OnRefusal::Quiet, window, cx, |s, admit| {
+                        s.request_dialogs(last_visible, admit)
+                    })
+                },
+                cx,
+            );
+        });
+    }
+
+    /// Redraws flood-wait countdowns every second while one is shown.
+    fn start_countdown(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if !self.shell.start_countdown() {
+            return; // already ticking
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(COUNTDOWN_TICK).await;
+                let more = this.update(cx, |root, cx| {
+                    let more = root.with_session(|s, _| s.shell.countdown_tick(), cx);
+                    cx.notify();
+                    more
+                });
+                if more.ok().flatten() != Some(true) {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 }

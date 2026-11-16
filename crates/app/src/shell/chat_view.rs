@@ -3,12 +3,13 @@
 //! State and decisions live in `crate::chat`; this only draws them.
 
 use std::ops::Range;
+use std::time::Instant;
 
 use abyss_core::model::{Body, ChatKind, ChatSummary, Message, MsgId};
 use abyss_core::rich_text::RichText;
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, FontWeight, Hsla,
-    InteractiveText, SharedString, Stateful, StyledText, WeakEntity, Window, div, font, hsla, list,
+    SharedString, Stateful, StyledText, WeakEntity, Window, canvas, div, font, hsla, list,
     prelude::*, px, rgb, rgba, uniform_list, white,
 };
 use jiff::tz::TimeZone;
@@ -17,7 +18,7 @@ use super::session::Session;
 use super::view::{ACCENT, BORDER, FG, MUTED, SELECTED, SURFACE, centered, field, muted};
 use super::{Root, State};
 use crate::chat::messages::MessageWindow;
-use crate::chat::rich::{self, Fonts, Palette, Spoilers};
+use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
 use crate::chat::{Row, copy, format, list as chat_list};
 
@@ -231,6 +232,15 @@ fn chat_pane(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
             .into_any_element()
     };
     let detached = window.is_some_and(MessageWindow::has_newer);
+    // Once this pane is painted, check what the list shows (mark read,
+    // load more, live tail): the layout is then the one on screen.
+    let this = cx.weak_entity();
+    let after_paint = canvas(
+        |_, _, _| {},
+        move |_, (), window, cx| super::chats::after_paint(this, window, cx),
+    )
+    .absolute()
+    .size_0();
     div()
         .flex_1()
         .h_full()
@@ -244,7 +254,8 @@ fn chat_pane(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
                 .min_h_0()
                 .relative()
                 .child(body)
-                .children(detached.then(|| jump_button(cx))),
+                .children(detached.then(|| jump_button(cx)))
+                .child(after_paint),
         )
         .child(composer_area(session, chat))
         .into_any_element()
@@ -341,7 +352,7 @@ fn message_row(
         }
         Row::Echo(e) => echo_row(e, cx),
     };
-    div()
+    let row = div()
         .w_full()
         .px_4()
         .py_1()
@@ -349,8 +360,9 @@ fn message_row(
         .flex_col()
         .children(start)
         .children(separator)
-        .child(content)
-        .into_any_element()
+        .child(content);
+    // Painted bounds feed the after-paint check (mark read, live tail).
+    shell.painted().track(ix, row).w_full().into_any_element()
 }
 
 fn day_separator(label: SharedString) -> Div {
@@ -496,21 +508,12 @@ impl RowCtx {
     /// Formatted text: a link click copies its target (links never open), a
     /// spoiler click reveals the message's spoilers.
     fn rich(&self, id: MsgId, rt: &RichText, spoilers: Spoilers) -> AnyElement {
-        let rich::Body {
-            text,
-            runs,
-            links,
-            spoilers: hidden,
-        } = rich::style(rt, &fonts(), &palette(), spoilers);
-        let (mut ranges, targets): (Vec<Range<usize>>, Vec<SharedString>) =
-            links.into_iter().unzip();
-        ranges.extend(hidden);
         let this = self.this.clone();
         let element_id =
             ElementId::NamedInteger("msg".into(), u64::try_from(id.0).unwrap_or_default());
-        InteractiveText::new(element_id, StyledText::new(text).with_runs(runs))
-            .on_click(ranges, move |range_ix, window, cx| {
-                on_text_click(&this, id, targets.get(range_ix), window, cx);
+        rich::style(rt, &fonts(), &palette(), spoilers)
+            .interactive(element_id, move |click, window, cx| {
+                on_text_click(&this, id, &click, window, cx);
             })
             .into_any_element()
     }
@@ -525,20 +528,20 @@ fn echo_row(e: &Echo, cx: &mut Context<'_, Root>) -> AnyElement {
         .gap_2()
         .items_center()
         .justify_end()
-        .child(muted(copy::send_label(e.state)).text_xs());
-    let status = if e.actionable() {
+        .child(muted(copy::send_label(e, Instant::now())).text_xs());
+    let retry = e.can_retry().then(|| {
         let retry = cx.listener(move |root, _: &ClickEvent, window, cx| {
             root.with_session(|s, cx| s.retry_send(local_id, window, cx), cx);
         });
+        pill(("retry", local_id.0), copy::RETRY).on_click(retry)
+    });
+    let discard = e.can_discard().then(|| {
         let discard = cx.listener(move |root, _: &ClickEvent, window, cx| {
             root.with_session(|s, cx| s.discard_send(local_id, window, cx), cx);
         });
-        status
-            .child(pill(("retry", local_id.0), copy::RETRY).on_click(retry))
-            .child(pill(("discard", local_id.0), copy::DISCARD).on_click(discard))
-    } else {
-        status
-    };
+        pill(("discard", local_id.0), copy::DISCARD).on_click(discard)
+    });
+    let status = status.children(retry).children(discard);
     let text = rich::plain(&e.text, &fonts(), &palette());
     let body = StyledText::new(text.text).with_runs(text.runs);
     in_bubble(
@@ -550,18 +553,18 @@ fn echo_row(e: &Echo, cx: &mut Context<'_, Root>) -> AnyElement {
 fn on_text_click(
     this: &WeakEntity<Root>,
     id: MsgId,
-    target: Option<&SharedString>,
+    click: &Click,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if let Some(target) = target {
+    if let Click::Copy(target) = click {
         cx.write_to_clipboard(ClipboardItem::new_string(target.to_string()));
     }
     this.update(cx, |root, cx| {
         root.with_session(
-            |s, cx| match target {
-                Some(_) => s.show_notice(copy::LINK_COPIED.into(), window, cx),
-                None => s.shell.reveal(id),
+            |s, cx| match click {
+                Click::Copy(_) => s.show_notice(copy::LINK_COPIED.into(), window, cx),
+                Click::Reveal => s.shell.reveal(id),
             },
             cx,
         );

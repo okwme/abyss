@@ -1,9 +1,10 @@
 //! Chat list, message view and sending (plan sections 7–9): the state the UI
 //! keeps and the decisions it makes (what to load, what to mark read, what a
 //! row shows), apart from rendering so they can be tested without a window.
-//! The shell (`shell::chats`) feeds it events and sends the commands it
-//! returns; `shell::chat_view` renders it.
+//! The shell (`shell::chats`) feeds it events and lends it an [`Admit`] to
+//! queue commands with core (`commands.rs`); `shell::chat_view` renders it.
 
+mod commands;
 pub(crate) mod copy;
 #[cfg(feature = "fake")]
 pub(crate) mod demo;
@@ -12,16 +13,21 @@ pub(crate) mod list;
 pub(crate) mod messages;
 pub(crate) mod rich;
 pub(crate) mod sends;
+pub(crate) mod viewport;
 
 use std::collections::HashSet;
+use std::time::Instant;
 
-use abyss_core::api::{Command, Event, UserError, WindowState};
-use abyss_core::model::{ChatId, ChatSummary, LocalId, Message, MsgId};
+use abyss_core::api::{Event, WindowState};
+use abyss_core::model::{ChatId, ChatSummary, Message, MsgId};
+use abyss_core::store::ViewGen;
 use gpui::{FollowMode, ListAlignment, ListState, px};
 
-use self::list::ChatList;
+pub(crate) use self::commands::{Admit, Refused};
+use self::list::{ChatList, Pages};
 use self::messages::{Applied, Batch, MessageWindow, RowOp};
-use self::sends::{Echo, Echoes, MAX_ECHOES};
+use self::sends::{Echo, Echoes};
+use self::viewport::Seen;
 
 /// Rows rendered beyond the viewport, so scrolling doesn't pop in.
 const OVERDRAW: f32 = 800.;
@@ -45,15 +51,6 @@ impl Row<'_> {
     }
 }
 
-/// What the last frame showed of the message list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Seen {
-    /// First row at least partly visible.
-    pub(crate) first_row: usize,
-    /// Last message row (not echo) at least partly visible.
-    pub(crate) last_message: Option<usize>,
-}
-
 pub(crate) struct ChatShell {
     pub(crate) list: ChatList,
     selected: Option<ChatId>,
@@ -63,10 +60,22 @@ pub(crate) struct ChatShell {
     rows: ListState,
     shown_echoes: usize,
     revealed: HashSet<MsgId>,
-    /// Highest id sent as read for the open chat.
+    /// Highest id core admitted as read for the open chat.
     read_sent: Option<MsgId>,
+    /// The chat core was last told shows its live tail (`ViewingTail`).
+    viewing: Option<ChatId>,
     next_local: u64,
     focus: WindowState,
+    countdown: Countdown,
+    /// Where the message rows were painted this frame.
+    painted: viewport::Painted,
+}
+
+/// Whether a flood-wait countdown ticker runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Countdown {
+    Idle,
+    Running,
 }
 
 impl Default for ChatShell {
@@ -82,8 +91,11 @@ impl Default for ChatShell {
             shown_echoes: 0,
             revealed: HashSet::new(),
             read_sent: None,
+            viewing: None,
             next_local: 1,
             focus: WindowState::Active,
+            countdown: Countdown::Idle,
+            painted: viewport::Painted::default(),
         }
     }
 }
@@ -94,6 +106,7 @@ impl std::fmt::Debug for ChatShell {
             .field("chats", &self.list.len())
             .field("selected", &self.selected)
             .field("rows", &self.rows.item_count())
+            .field("viewing", &self.viewing)
             .finish_non_exhaustive()
     }
 }
@@ -115,6 +128,17 @@ impl ChatShell {
         &self.rows
     }
 
+    /// Where message rows record their painted bounds.
+    pub(crate) fn painted(&self) -> &viewport::Painted {
+        &self.painted
+    }
+
+    /// What the frame just painted showed of the message list.
+    pub(crate) fn seen(&self) -> Option<Seen> {
+        let messages = self.window.as_ref().map_or(0, MessageWindow::len);
+        viewport::seen(&self.painted.take(), self.rows.viewport_bounds(), messages)
+    }
+
     pub(crate) fn row_count(&self) -> usize {
         self.window.as_ref().map_or(0, MessageWindow::len) + self.shown_echoes
     }
@@ -129,6 +153,33 @@ impl ChatShell {
                 .nth(ix.checked_sub(w.len())?)
                 .map(Row::Echo),
         }
+    }
+
+    /// The chat core was last told shows its live tail.
+    #[cfg(test)]
+    pub(crate) fn viewing(&self) -> Option<ChatId> {
+        self.viewing
+    }
+
+    /// Starts the flood-wait countdown ticker unless it runs. Returns
+    /// whether the caller should start one.
+    pub(crate) fn start_countdown(&mut self) -> bool {
+        let start = self.countdown == Countdown::Idle && self.echoes.any_waiting();
+        if start {
+            self.countdown = Countdown::Running;
+        }
+        start
+    }
+
+    /// One second passed: redraws the echo rows. Returns whether to keep
+    /// ticking (an echo still counts down).
+    pub(crate) fn countdown_tick(&mut self) -> bool {
+        self.remeasure_echoes();
+        let more = self.echoes.any_waiting();
+        if !more {
+            self.countdown = Countdown::Idle;
+        }
+        more
     }
 
     /// Whether the user revealed `id`'s spoilers.
@@ -160,6 +211,10 @@ impl ChatShell {
         match event {
             Event::DialogsReset(chats) => self.list.reset(chats),
             Event::DialogsAppended(chats) => self.list.upsert_page(chats),
+            Event::DialogsPaging { has_more } => {
+                self.list
+                    .paged(if has_more { Pages::More } else { Pages::Done });
+            }
             Event::ChatBumped(chat) => self.list.bump(chat),
             Event::History {
                 chat,
@@ -178,6 +233,7 @@ impl ChatShell {
                     has_more,
                 },
             ),
+            Event::Reconciled { chat, view, newest } => self.on_reconciled(chat, view, newest),
             Event::ChatInvalidated(chat) => {
                 let applied = self.open_window(chat).map(MessageWindow::invalidate);
                 self.sync_rows(applied);
@@ -191,17 +247,15 @@ impl ChatShell {
                 self.sync_rows(applied);
             }
             Event::SendState { local_id, state } => {
-                if self.echoes.set_state(local_id, state).is_some() {
+                if self
+                    .echoes
+                    .set_state(local_id, state, Instant::now())
+                    .is_some()
+                {
                     self.after_echo_change();
                 }
             }
-            // Task 10b consumes `Reconciled` (echo reconciliation) and
-            // `DialogsPaging` (pagination state).
-            Event::Auth(_)
-            | Event::Connection(_)
-            | Event::Error(_)
-            | Event::Reconciled { .. }
-            | Event::DialogsPaging { .. } => {}
+            Event::Auth(_) | Event::Connection(_) | Event::Error(_) => {}
         }
     }
 
@@ -209,18 +263,34 @@ impl ChatShell {
         self.window.as_mut().filter(|w| w.chat() == chat)
     }
 
+    /// A history event. A new view (a reopened chat's full `Tail`, a
+    /// reload) replaces the rows; echoes are reconciled only by
+    /// `Reconciled`, never by a view change.
     fn on_history(&mut self, chat: ChatId, batch: Batch) {
         let Some(w) = self.open_window(chat) else {
             return;
         };
         let applied = w.apply(batch);
-        let reloaded = applied == Applied::Reset;
         self.sync_rows(Some(applied));
-        if reloaded {
-            let newest = self.window.as_ref().and_then(MessageWindow::newest);
-            self.echoes.reconciled(chat, newest);
-        }
         self.after_echo_change();
+    }
+
+    /// Core merged the server's tail of `chat` into `view`.
+    fn on_reconciled(&mut self, chat: ChatId, view: ViewGen, newest: Option<MsgId>) {
+        let on_screen = self
+            .window
+            .as_ref()
+            .filter(|w| w.chat() == chat && w.view() == Some(view));
+        let changed = match on_screen {
+            Some(w) => {
+                let shown = |id: MsgId| w.contains(id);
+                self.echoes.reconciled(chat, newest, Some(&shown))
+            }
+            None => self.echoes.reconciled(chat, newest, None),
+        };
+        if changed {
+            self.sync_echoes();
+        }
     }
 
     /// Echoes changed: drop the ones whose server copy is shown, then
@@ -278,126 +348,21 @@ impl ChatShell {
         debug_assert_eq!(self.rows.item_count(), self.row_count());
     }
 
-    /// Opens `chat`. Core closes the previous one.
-    pub(crate) fn select(&mut self, chat: ChatId) -> Option<Command> {
-        if self.selected == Some(chat) {
-            return None;
+    /// Echo rows show a countdown that changed: redraw them.
+    fn remeasure_echoes(&self) {
+        let start = self.window.as_ref().map_or(0, MessageWindow::len);
+        if self.shown_echoes > 0 {
+            self.rows.remeasure_items(start..start + self.shown_echoes);
         }
-        self.selected = Some(chat);
-        self.window = Some(MessageWindow::new(chat));
-        self.revealed.clear();
-        self.read_sent = None;
-        self.shown_echoes = self.echo_count();
-        self.rows.reset(self.shown_echoes);
-        self.rows.set_follow_mode(FollowMode::Tail);
-        Some(Command::OpenChat(chat))
     }
 
-    /// Where a composer submission would go: `Ok(None)` when nothing is open
-    /// or the chat is read-only, `Busy` when the send table is full.
-    pub(crate) fn send_target(&self) -> Result<Option<ChatId>, UserError> {
-        let Some(chat) = self.selected_chat().filter(|c| c.can_send) else {
-            return Ok(None);
-        };
-        if self.echoes.count_all() >= MAX_ECHOES {
-            return Err(UserError::Busy);
-        }
-        Ok(Some(chat.id))
-    }
-
-    /// Sends `text` to `chat` (from [`Self::send_target`]) and shows its echo.
-    pub(crate) fn submit(&mut self, chat: ChatId, text: String, now: i64) -> Option<Command> {
-        if text.trim().is_empty() {
-            return None;
-        }
-        let local_id = LocalId(self.next_local);
-        let echo = Echo {
-            local_id,
-            chat,
-            text: text.clone(),
-            state: abyss_core::api::SendState::Sending,
-            date: now,
-        };
-        self.echoes.push(echo).ok()?;
-        self.next_local = self.next_local.wrapping_add(1);
-        self.sync_echoes();
-        self.rows.set_follow_mode(FollowMode::Tail);
-        Some(Command::SendText {
-            chat,
-            text,
-            local_id,
-        })
-    }
-
-    pub(crate) fn retry(&mut self, local_id: LocalId) -> Option<Command> {
-        let cmd = self.echoes.retry(local_id)?;
-        self.sync_echoes();
-        Some(cmd)
-    }
-
-    pub(crate) fn discard(&mut self, local_id: LocalId) -> Option<Command> {
-        let cmd = self.echoes.discard(local_id)?;
-        self.sync_echoes();
-        Some(cmd)
-    }
-
-    /// Back to the live tail from far up the history: core reopens the chat
-    /// at its tail.
-    pub(crate) fn jump_to_latest(&mut self) -> Option<Command> {
-        let chat = self.window.as_ref()?.chat();
-        self.rows.set_follow_mode(FollowMode::Tail);
-        Some(Command::OpenChat(chat))
-    }
-
-    /// Chat list row `last_visible` is on screen: maybe load the next page.
-    pub(crate) fn dialogs_seen(&mut self, last_visible: usize) -> Option<Command> {
-        self.list
-            .wants_more(last_visible)
-            .then_some(Command::LoadDialogs)
-    }
-
-    /// After a frame: load more history near either end, and mark read up to
-    /// the newest message actually displayed while the window has focus.
-    pub(crate) fn frame_seen(&mut self, seen: Seen) -> Vec<Command> {
-        let mut commands = Vec::new();
-        let focus = self.focus;
-        let Some(w) = self.window.as_mut() else {
-            return commands;
-        };
-        let chat = w.chat();
-        if w.wants_older(seen.first_row) {
-            commands.push(Command::LoadOlder(chat));
-        }
-        let Some(last) = seen.last_message else {
-            return commands;
-        };
-        if w.wants_newer(last) {
-            commands.push(Command::LoadNewer(chat));
-        }
-        let shown = w.get(last).map(|m| m.id);
-        if let Some(max_id) = shown.filter(|id| self.read_sent.is_none_or(|r| *id > r))
-            && focus == WindowState::Active
-        {
-            self.read_sent = Some(max_id);
-            commands.push(Command::MarkRead { chat, max_id });
-        }
-        commands
-    }
-
-    /// The window gained or lost focus.
-    pub(crate) fn set_focus(&mut self, state: WindowState) -> Option<Command> {
-        if self.focus == state {
-            return None;
-        }
-        self.focus = state;
-        Some(Command::Window(state))
-    }
-
-    /// A core error: an outstanding history load may never be answered.
+    /// A core error: an outstanding history or dialogs load may never be
+    /// answered.
     pub(crate) fn load_failed(&mut self) {
         if let Some(w) = self.window.as_mut() {
             w.clear_pending();
         }
+        self.list.load_failed();
     }
 }
 

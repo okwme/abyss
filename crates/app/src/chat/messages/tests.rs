@@ -192,6 +192,11 @@ fn scroll_loads_once_until_answered() {
     w.apply(batch(1, HistoryDir::Tail, 51..=100, More::Yes));
     assert!(!w.wants_older(LOAD_MARGIN), "not near the top");
     assert!(w.wants_older(3));
+    assert!(
+        w.wants_older(3),
+        "asking is free until core admits the load"
+    );
+    w.requested(HistoryDir::Older);
     assert!(!w.wants_older(0), "already asked");
     w.apply(batch(1, HistoryDir::Older, 1..=50, More::No));
     assert!(!w.wants_older(0), "start of history");
@@ -202,6 +207,7 @@ fn scroll_loads_once_until_answered() {
     w.apply(older);
     assert!(!w.wants_newer(10));
     assert!(w.wants_newer(95));
+    w.requested(HistoryDir::Newer);
     assert!(!w.wants_newer(98), "already asked");
     w.clear_pending();
     assert!(w.wants_newer(98), "a failed load can be retried");

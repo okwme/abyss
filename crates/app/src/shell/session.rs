@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use abyss_core::api::{AuthState, Command, ConnState, Event, PasswordBuf, UserError};
-use abyss_core::{BackendChoice, CoreConfig, SendError, StartError};
+use abyss_core::{BackendChoice, CoreConfig, StartError};
 use gpui::{AppContext, Context, Entity, Focusable, SharedString, Subscription, Task, Window};
 
 use super::Root;
@@ -124,7 +124,7 @@ impl Session {
         ];
         let pump = spawn_pump(started.events, window, cx);
         let shell = ChatShell::default();
-        let chat_wiring = super::chats::wire(shell.rows(), window, cx);
+        let chat_wiring = super::chats::wire(window, cx);
         let session = Self {
             core: shared,
             auth: AuthView::Connecting,
@@ -149,20 +149,11 @@ impl Session {
     }
 
     /// Queues a command. A full queue shows "busy"; the rejected command is
-    /// dropped (a password in it is zeroized on drop).
+    /// dropped (a password in it is zeroized on drop). Chat commands go
+    /// through `shell::chats`, which changes the UI only once one is admitted.
     pub(super) fn send(&mut self, cmd: Command, window: &mut Window, cx: &mut Context<'_, Root>) {
-        let result = match self.core.try_borrow() {
-            Ok(core) => core.send(cmd),
-            Err(_) => Err(SendError::Full(cmd)),
-        };
-        match result {
-            Ok(()) => {}
-            Err(SendError::Full(_)) => {
-                self.show_notice(copy::user_error(UserError::Busy), window, cx);
-            }
-            Err(SendError::Closed(_)) => {
-                self.show_notice(copy::CORE_GONE.into(), window, cx);
-            }
+        if let Err(refused) = super::chats::admit(&self.core, cmd) {
+            self.show_refused(refused, window, cx);
         }
     }
 

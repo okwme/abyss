@@ -1,7 +1,11 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use abyss_core::rich_text::{EntityKind, RawEntity};
 use gpui::{
-    AppContext, Context, FontStyle, FontWeight, InteractiveText, IntoElement, ParentElement,
-    Render, Styled, StyledText, TestAppContext, Window, black, div, font, point, px, size,
+    AppContext, Context, FontStyle, FontWeight, InteractiveText, IntoElement, Modifiers,
+    ParentElement, Render, Styled, StyledText, TestAppContext, Window, black, div, font, point, px,
+    size,
 };
 
 use super::*;
@@ -316,4 +320,90 @@ impl Render for Bodies {
                 .on_click(ranges.collect(), |_, _, _| {})
             }))
     }
+}
+
+#[test]
+fn spoiler_hides_a_link_target_until_revealed() {
+    let entities = [
+        entity(4, 6, EntityKind::Spoiler),
+        entity(4, 6, EntityKind::TextUrl("https://secret.example".into())),
+    ];
+    let hidden = styled("the secret word", &entities, Spoilers::Hidden);
+    assert_partition(&hidden);
+    assert_eq!(hidden.text, "the secret word", "no target suffix");
+    assert!(hidden.links.is_empty(), "nothing to copy while hidden");
+    assert_eq!(hidden.spoilers, vec![4..10]);
+    let shown = styled("the secret word", &entities, Spoilers::Revealed);
+    assert_eq!(shown.text, "the secret (https://secret.example) word");
+    assert_eq!(shown.links.len(), 1);
+}
+
+#[test]
+fn a_partly_hidden_link_is_one_reveal_range() {
+    // The spoiler covers only "ret" of the link "secret".
+    let entities = [
+        entity(4, 6, EntityKind::TextUrl("https://secret.example".into())),
+        entity(7, 3, EntityKind::Spoiler),
+    ];
+    let hidden = styled("the secret word", &entities, Spoilers::Hidden);
+    assert_partition(&hidden);
+    assert_eq!(hidden.text, "the secret word");
+    assert!(hidden.links.is_empty());
+    assert_eq!(hidden.spoilers, vec![4..10]);
+}
+
+/// One message body as clickable text, recording what each click asked for.
+struct Clickable {
+    text: RichText,
+    spoilers: Spoilers,
+    clicks: Rc<RefCell<Vec<Click>>>,
+}
+
+impl Render for Clickable {
+    fn render(&mut self, _: &mut Window, _: &mut Context<'_, Self>) -> impl IntoElement {
+        let clicks = Rc::clone(&self.clicks);
+        let body = style(&self.text, &fonts(), &palette(), self.spoilers);
+        div()
+            .size_full()
+            .child(body.interactive("body", move |click, _, _| clicks.borrow_mut().push(click)))
+    }
+}
+
+/// A spoiler and a link over the same text.
+fn spoiler_link() -> [RawEntity; 2] {
+    [
+        entity(0, 6, EntityKind::Spoiler),
+        entity(0, 6, EntityKind::TextUrl("https://secret.example".into())),
+    ]
+}
+
+/// Clicks the start of "secret" laid out at the window's top left.
+fn click_on(cx: &mut TestAppContext, spoilers: Spoilers) -> Vec<Click> {
+    let clicks: Rc<RefCell<Vec<Click>>> = Rc::default();
+    let shared = Rc::clone(&clicks);
+    let text = RichText::from_entities("secret", &spoiler_link());
+    let (_view, cx) = cx.add_window_view(|_, _| Clickable {
+        text,
+        spoilers,
+        clicks: shared,
+    });
+    cx.run_until_parked();
+    let at = point(px(2.), px(4.));
+    cx.simulate_mouse_move(at, None, Modifiers::none());
+    cx.simulate_click(at, Modifiers::none());
+    clicks.take()
+}
+
+/// While hidden, a real click on the laid-out text only reveals.
+#[gpui::test]
+fn clicking_a_hidden_spoiler_link_only_reveals(cx: &mut TestAppContext) {
+    assert_eq!(click_on(cx, Spoilers::Hidden), [Click::Reveal]);
+}
+
+#[gpui::test]
+fn clicking_a_revealed_spoiler_link_copies(cx: &mut TestAppContext) {
+    assert_eq!(
+        click_on(cx, Spoilers::Revealed),
+        [Click::Copy("https://secret.example".into())]
+    );
 }

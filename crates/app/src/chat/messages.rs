@@ -138,8 +138,14 @@ impl MessageWindow {
         self.messages.get(self.find(id).ok()?)
     }
 
+    #[cfg(test)]
     pub(crate) fn newest(&self) -> Option<MsgId> {
         self.messages.back().map(|m| m.id)
+    }
+
+    /// Core's view this window mirrors, once a tail arrived.
+    pub(crate) fn view(&self) -> Option<ViewGen> {
+        self.view
     }
 
     /// Whether core has answered with this chat's history at least once.
@@ -295,24 +301,26 @@ impl MessageWindow {
     }
 
     /// Whether to ask for older history with row `first_visible` on screen.
-    pub(crate) fn wants_older(&mut self, first_visible: usize) -> bool {
-        let want = self.is_loaded()
-            && self.has_older
-            && !self.pending.older
-            && first_visible < LOAD_MARGIN;
-        self.pending.older |= want;
-        want
+    pub(crate) fn wants_older(&self, first_visible: usize) -> bool {
+        self.is_loaded() && self.has_older && !self.pending.older && first_visible < LOAD_MARGIN
     }
 
     /// Whether to ask for newer history with message row `last_visible` on
     /// screen (only while detached from the live tail).
-    pub(crate) fn wants_newer(&mut self, last_visible: usize) -> bool {
-        let want = self.is_loaded()
+    pub(crate) fn wants_newer(&self, last_visible: usize) -> bool {
+        self.is_loaded()
             && self.has_newer
             && !self.pending.newer
-            && last_visible.saturating_add(LOAD_MARGIN) >= self.messages.len();
-        self.pending.newer |= want;
-        want
+            && last_visible.saturating_add(LOAD_MARGIN) >= self.messages.len()
+    }
+
+    /// Core admitted a load in `dir`; no other until it is answered.
+    pub(crate) fn requested(&mut self, dir: HistoryDir) {
+        match dir {
+            HistoryDir::Older => self.pending.older = true,
+            HistoryDir::Newer => self.pending.newer = true,
+            HistoryDir::Tail => {}
+        }
     }
 }
 

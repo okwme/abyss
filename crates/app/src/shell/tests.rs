@@ -386,10 +386,122 @@ mod fake {
         root.update_in(cx, |root, window, cx| {
             root.with_session(|s, cx| s.select_chat(chat, window, cx), cx);
         });
+        cx.run_until_parked();
+        assert_eq!(
+            read(&root, cx, |s| s.shell.selected()),
+            None,
+            "a refused OpenChat opens nothing"
+        );
+        harness.sent.borrow_mut().full = false;
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_chat(chat, window, cx), cx);
+        });
+        cx.run_until_parked();
+        harness.sent.borrow_mut().full = true;
         cx.simulate_input("hi");
         cx.simulate_keystrokes("enter");
         let notice = read(&root, cx, |s| s.notice.clone());
         assert_eq!(notice, Some(crate::ui::copy::user_error(UserError::Busy)));
+        let draft = root.read_with(cx, |root, cx| match &root.state {
+            State::Running(s) => s.composer.read(cx).text().to_owned(),
+            State::Failed(_) => String::new(),
+        });
+        assert_eq!(draft, "hi", "the draft stays in the composer");
+        assert_eq!(read(&root, cx, |s| s.shell.row_count()), 0, "no echo");
+        harness.sent.borrow_mut().full = false;
+        cx.simulate_keystrokes("enter");
+        assert_eq!(read(&root, cx, |s| s.shell.row_count()), 1, "sent now");
+        assert!(matches!(
+            harness.sent.borrow().commands.last(),
+            Some(Command::SendText { text, .. }) if text == "hi"
+        ));
+    }
+
+    fn commands_since(harness: &Harness, from: usize) -> Vec<String> {
+        harness
+            .sent
+            .borrow()
+            .commands
+            .iter()
+            .skip(from)
+            .map(|c| format!("{c:?}"))
+            .collect()
+    }
+
+    fn message(chat: ChatId, id: i32) -> abyss_core::model::Message {
+        abyss_core::backend::fake::text_message(chat, id, "m")
+    }
+
+    /// Finding 3 through the real window: the check runs after the frame
+    /// is painted and counts only rows inside the viewport.
+    #[gpui::test]
+    fn painted_rows_drive_mark_read_and_the_live_tail(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        sign_in(&root, cx, &harness);
+        cx.simulate_resize(gpui::size(gpui::px(800.), gpui::px(300.)));
+        let chat = ChatId {
+            kind: PeerKind::User,
+            id: 1,
+        };
+        let script = FakeScript::demo(1, 0);
+        harness
+            .events
+            .unbounded_send(Event::DialogsReset(script.dialogs))
+            .unwrap();
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_chat(chat, window, cx), cx);
+        });
+        cx.run_until_parked();
+        let from = harness.sent.borrow().commands.len();
+        harness
+            .events
+            .unbounded_send(Event::History {
+                chat,
+                view: abyss_core::store::ViewGen(1),
+                dir: abyss_core::api::HistoryDir::Tail,
+                messages: (1..=30).map(|id| message(chat, id)).collect(),
+                removed: Vec::new(),
+                has_more: false,
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let sent = commands_since(&harness, from);
+        assert!(
+            sent.iter()
+                .any(|c| c.contains("MarkRead") && c.contains("MsgId(30)"))
+        );
+        assert!(sent.iter().any(|c| c.starts_with("ViewingTail(Some")));
+
+        // Own sends fill the screen; a new incoming message lands above them.
+        for n in 0..12 {
+            cx.simulate_input(&format!("e{n}"));
+            cx.simulate_keystrokes("enter");
+        }
+        cx.run_until_parked();
+        let from = harness.sent.borrow().commands.len();
+        harness
+            .events
+            .unbounded_send(Event::History {
+                chat,
+                view: abyss_core::store::ViewGen(1),
+                dir: abyss_core::api::HistoryDir::Newer,
+                messages: vec![message(chat, 31)],
+                removed: Vec::new(),
+                has_more: false,
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let sent = commands_since(&harness, from);
+        assert!(
+            !sent.iter().any(|c| c.contains("MarkRead")),
+            "message 31 is above the viewport: {sent:?}"
+        );
+        assert_eq!(
+            read(&root, cx, |s| s.shell.viewing()),
+            None,
+            "the newest message is off screen: core counts it unread"
+        );
     }
 
     #[gpui::test]

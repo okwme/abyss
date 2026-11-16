@@ -12,12 +12,38 @@ const LOAD_MARGIN: usize = 20;
 /// Characters of the last message shown in a row.
 const PREVIEW_CHARS: usize = 100;
 
+/// What core's `DialogsPaging` said about further pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pages {
+    More,
+    Done,
+}
+
+/// Dialogs pagination, driven by core's `DialogsPaging` rather than by list
+/// length: a page whose chats were all filtered (broadcast channels) or
+/// already listed leaves the length unchanged, yet more pages may follow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Paging {
+    /// Core said more pages exist. Core loads the first page itself.
+    has_more: bool,
+    /// A `LoadDialogs` was admitted and core has not answered it yet.
+    in_flight: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ChatList {
     chats: Vec<ChatSummary>,
-    /// List length when the last page was requested; no new request until
-    /// the list changes length.
-    requested_at: Option<usize>,
+    paging: Paging,
+}
+
+/// Whether `new` describes a newer last message than `old`: by message id,
+/// or by date when either id is unknown. Same-second messages with the same
+/// preview still order by id.
+fn is_newer(new: &ChatSummary, old: &ChatSummary) -> bool {
+    match (new.last_id, old.last_id) {
+        (Some(n), Some(o)) => n > o,
+        _ => new.last_date > old.last_date,
+    }
 }
 
 impl ChatList {
@@ -27,6 +53,10 @@ impl ChatList {
 
     pub(crate) fn len(&self) -> usize {
         self.chats.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.chats.is_empty()
     }
 
     pub(crate) fn get(&self, id: ChatId) -> Option<&ChatSummary> {
@@ -50,9 +80,10 @@ impl ChatList {
         }
     }
 
-    /// A chat's summary changed. A new last message moves it to the top of its
-    /// section (pinned chats keep their place), as core does; anything else
-    /// (an unread count, read elsewhere) updates it in place.
+    /// A chat's summary changed. A newer last message (by `last_id`) moves
+    /// it to the top of its section (pinned chats keep their place), as core
+    /// does; anything else (an unread count, a read elsewhere, a repeated
+    /// bump) updates it in place.
     pub(crate) fn bump(&mut self, chat: ChatSummary) {
         let Some(pos) = self.chats.iter().position(|c| c.id == chat.id) else {
             if self.chats.len() < MAX_DIALOGS {
@@ -61,10 +92,7 @@ impl ChatList {
             }
             return;
         };
-        let moved = self
-            .chats
-            .get(pos)
-            .is_some_and(|old| old.last != chat.last || old.last_date != chat.last_date);
+        let moved = self.chats.get(pos).is_some_and(|old| is_newer(&chat, old));
         if !moved || chat.pinned {
             if let Some(slot) = self.chats.get_mut(pos) {
                 *slot = chat;
@@ -86,16 +114,30 @@ impl ChatList {
     }
 
     /// Whether to ask core for the next page now that row `last_visible` is
-    /// on screen. Asks at most once per list length; core answers nothing
-    /// when every page is loaded.
-    pub(crate) fn wants_more(&mut self, last_visible: usize) -> bool {
+    /// on screen (any row, for an empty list): core said more exist, none is
+    /// outstanding, and the cap is not reached.
+    pub(crate) fn wants_more(&self, last_visible: usize) -> bool {
         let len = self.chats.len();
-        let near_end = last_visible.saturating_add(LOAD_MARGIN) >= len;
-        if !near_end || len == 0 || len >= MAX_DIALOGS || self.requested_at == Some(len) {
-            return false;
-        }
-        self.requested_at = Some(len);
-        true
+        let near_end = len == 0 || last_visible.saturating_add(LOAD_MARGIN) >= len;
+        near_end && self.paging.has_more && !self.paging.in_flight && len < MAX_DIALOGS
+    }
+
+    /// Core admitted a `LoadDialogs`.
+    pub(crate) fn requested(&mut self) {
+        self.paging.in_flight = true;
+    }
+
+    /// Core applied a dialogs page (`DialogsPaging`).
+    pub(crate) fn paged(&mut self, pages: Pages) {
+        self.paging = Paging {
+            has_more: pages == Pages::More,
+            in_flight: false,
+        };
+    }
+
+    /// A core error: an outstanding page may never be answered.
+    pub(crate) fn load_failed(&mut self) {
+        self.paging.in_flight = false;
     }
 }
 
@@ -220,22 +262,69 @@ mod tests {
         );
     }
 
+    /// Same second, same preview: only the message id tells them apart.
+    fn with_id(n: i64, msg: i32) -> ChatSummary {
+        ChatSummary {
+            last_id: Some(abyss_core::model::MsgId(msg)),
+            ..with_message(n, 100)
+        }
+    }
+
     #[test]
-    fn pagination_asks_once_per_length_near_the_end() {
+    fn identical_previews_in_one_second_order_by_id() {
+        let mut list = ChatList::default();
+        list.reset(vec![with_id(1, 10), with_id(2, 20), with_id(3, 30)]);
+        list.bump(with_id(3, 31));
+        assert_eq!(ids(&list), [3, 1, 2]);
+        list.bump(with_id(2, 21));
+        assert_eq!(ids(&list), [2, 3, 1], "same date and preview, newer id");
+        let mut stale = with_id(3, 30);
+        stale.unread = 5;
+        list.bump(stale);
+        assert_eq!(ids(&list), [2, 3, 1], "an older id never moves a chat");
+        assert_eq!(list.get(id(3)).unwrap().unread, 5, "but updates it");
+        list.bump(with_id(2, 21));
+        assert_eq!(ids(&list), [2, 3, 1], "a repeated bump is deduped");
+    }
+
+    #[test]
+    fn pagination_follows_core_paging_not_list_length() {
         let mut list = ChatList::default();
         assert!(!list.wants_more(0), "nothing loaded yet: core loads page 1");
+        // A first page made only of broadcast channels: nothing listed, more
+        // pages exist.
+        list.reset(Vec::new());
+        list.paged(Pages::More);
+        assert!(list.wants_more(0), "an all-filtered page still paginates");
+        list.requested();
+        assert!(!list.wants_more(0), "one page at a time");
+        list.paged(Pages::More);
         list.reset((0..100).map(chat).collect());
         assert!(!list.wants_more(10));
         assert!(list.wants_more(85));
-        assert!(!list.wants_more(99), "already asked at this length");
-        list.upsert_page((100..200).map(chat).collect());
-        assert!(list.wants_more(199));
+        list.requested();
+        // Core answers a "load more" with a reset when the page reorders
+        // rows (4c): paging stays in flight until `DialogsPaging`.
+        list.reset((0..100).rev().map(chat).collect());
+        assert!(!list.wants_more(99), "the reset alone ends nothing");
+        list.paged(Pages::More);
+        list.requested();
+        // An overlapping page: the length does not change.
+        list.upsert_page((90..100).map(chat).collect());
+        list.paged(Pages::More);
+        assert!(list.wants_more(99), "the same length asks again");
+        list.requested();
+        list.load_failed();
+        assert!(list.wants_more(99), "a failed page can be asked again");
+        list.paged(Pages::Done);
+        assert!(!list.wants_more(99), "every page loaded");
     }
 
     #[test]
     fn bounded() {
         let mut list = ChatList::default();
         let max = i64::try_from(MAX_DIALOGS).unwrap();
+        list.paged(Pages::More);
         list.reset((0..max + 5).map(chat).collect());
         assert_eq!(list.len(), MAX_DIALOGS);
         list.upsert_page(vec![chat(-1)]);
