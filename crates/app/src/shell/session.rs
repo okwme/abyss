@@ -117,20 +117,7 @@ impl Session {
         let password = cx.new(|cx| PasswordInput::new(window, cx));
         let api_id = text_input(Limits::API_ID, copy::onboarding::API_ID_PLACEHOLDER, cx);
         let api_hash = cx.new(|cx| PasswordInput::api_hash(window, cx));
-        let id_sub = cx.subscribe_in(
-            &api_id,
-            window,
-            |root, _, _: &TextInputEvent, window, cx| {
-                root.with_session(|s, cx| s.submit_credentials(window, cx), cx);
-            },
-        );
-        let hash_sub = cx.subscribe_in(
-            &api_hash,
-            window,
-            |root, _, _: &PasswordEvent, window, cx| {
-                root.with_session(|s, cx| s.submit_credentials(window, cx), cx);
-            },
-        );
+        let [id_sub, hash_sub] = credential_subscriptions(&api_id, &api_hash, window, cx);
         let subscriptions = [
             id_sub,
             hash_sub,
@@ -456,6 +443,26 @@ impl Session {
 pub(crate) enum LogoutPrompt {
     Open,
     Closed,
+}
+
+/// Enter in either credential field submits both.
+fn credential_subscriptions(
+    api_id: &Entity<TextInput>,
+    api_hash: &Entity<PasswordInput>,
+    window: &mut Window,
+    cx: &mut Context<'_, Root>,
+) -> [Subscription; 2] {
+    let id_sub = cx.subscribe_in(api_id, window, |root, _, _: &TextInputEvent, window, cx| {
+        root.with_session(|s, cx| s.submit_credentials(window, cx), cx);
+    });
+    let hash_sub = cx.subscribe_in(
+        api_hash,
+        window,
+        |root, _, _: &PasswordEvent, window, cx| {
+            root.with_session(|s, cx| s.submit_credentials(window, cx), cx);
+        },
+    );
+    [id_sub, hash_sub]
 }
 
 /// Re-renders a countdown every second until it ends.

@@ -81,7 +81,7 @@ fn api_hash_never_reaches_the_platform(cx: &mut TestAppContext) {
         cx.simulate_keystrokes("cmd-a cmd-c");
         assert!(cx.read_from_clipboard().is_none());
     }
-    input.update(cx, |input, cx| input.clear(cx));
+    input.update(cx, PasswordInput::clear);
     input.update(cx, |input, _| assert!(input.secret().is_empty()));
 }
 
