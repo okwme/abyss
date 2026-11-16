@@ -89,7 +89,9 @@ impl Creds {
 /// `NeedCredentials` for an env resolution that is not a usable pair.
 fn env_error(env: &EnvResolution) -> Option<CredentialError> {
     match env {
-        EnvResolution::Partial { missing } => Some(CredentialError::EnvPartial { missing: *missing }),
+        EnvResolution::Partial { missing } => {
+            Some(CredentialError::EnvPartial { missing: *missing })
+        }
         EnvResolution::Malformed { var } => Some(CredentialError::EnvMalformed { var: *var }),
         EnvResolution::Absent | EnvResolution::Pair(_) => None,
     }
@@ -100,7 +102,9 @@ impl<B: Backend> Actor<B> {
     pub(super) async fn resolve_credentials(&mut self) {
         let env = self.backend.credentials().env().clone();
         if let Some(error) = env_error(&env) {
-            return self.need_credentials(Some(error), Some(CredentialSource::Env)).await;
+            return self
+                .need_credentials(Some(error), Some(CredentialSource::Env))
+                .await;
         }
         if let EnvResolution::Pair(creds) = env {
             self.use_credentials(creds, CredentialSource::Env).await;
@@ -177,12 +181,21 @@ impl<B: Backend> Actor<B> {
             self.auth.creds.running = Some(tokio::spawn(async move {
                 let err = |e: &crate::secret::StoreError| StorageError::from(e);
                 let done = match op {
-                    CredOp::Load => CredDone::Loaded(persist.load_api_credentials().await.map_err(|e| err(&e))),
+                    CredOp::Load => {
+                        CredDone::Loaded(persist.load_api_credentials().await.map_err(|e| err(&e)))
+                    }
                     CredOp::Save(creds) => {
                         let blob = credentials::encode(&creds);
-                        CredDone::Saved(persist.store_api_credentials(blob).await.map_err(|e| err(&e)))
+                        CredDone::Saved(
+                            persist
+                                .store_api_credentials(blob)
+                                .await
+                                .map_err(|e| err(&e)),
+                        )
                     }
-                    CredOp::Delete => CredDone::Deleted(persist.delete_api_credentials().await.map_err(|e| err(&e))),
+                    CredOp::Delete => CredDone::Deleted(
+                        persist.delete_api_credentials().await.map_err(|e| err(&e)),
+                    ),
                 };
                 let _ = tx.send(AuthMsg::Cred { attempt, done }).await;
             }));
@@ -230,7 +243,10 @@ impl<B: Backend> Actor<B> {
             Ok(None) => {
                 self.auth.creds.stored = false;
                 match credentials::embedded() {
-                    Some(creds) => self.use_credentials(creds, CredentialSource::Embedded).await,
+                    Some(creds) => {
+                        self.use_credentials(creds, CredentialSource::Embedded)
+                            .await;
+                    }
                     None => self.need_credentials(None, None).await,
                 }
             }
@@ -273,7 +289,9 @@ impl<B: Backend> Actor<B> {
             return self.emit_auth().await;
         }
         let entry_allowed = match &self.auth.state {
-            AuthState::NeedCredentials { error, .. } => error.is_none_or(CredentialError::allows_entry),
+            AuthState::NeedCredentials { error, .. } => {
+                error.is_none_or(CredentialError::allows_entry)
+            }
             _ => false,
         };
         if !entry_allowed || self.auth.reconcile.is_some() {
@@ -282,7 +300,9 @@ impl<B: Backend> Actor<B> {
         let Ok(api_id) = ApiId::new(api_id) else {
             let error = Some(CredentialError::InvalidApiId);
             let source = self.auth.creds.stored.then_some(CredentialSource::Stored);
-            return self.set_auth(AuthState::NeedCredentials { error, source }).await;
+            return self
+                .set_auth(AuthState::NeedCredentials { error, source })
+                .await;
         };
         self.auth.bump_attempt();
         self.auth.abort_task();
@@ -379,7 +399,8 @@ impl<B: Backend> Actor<B> {
             // Env and embedded pairs are untouched; only the item goes.
             if let AuthState::NeedCredentials { error, .. } = self.auth.state {
                 let source = self.auth.creds.source.filter(|_| error.is_some());
-                self.set_auth(AuthState::NeedCredentials { error, source }).await;
+                self.set_auth(AuthState::NeedCredentials { error, source })
+                    .await;
             }
             return;
         }

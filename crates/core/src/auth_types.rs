@@ -224,9 +224,7 @@ impl ApiId {
         if trimmed.len() > Self::MAX_DIGITS {
             return Err(ApiIdError::TooLong);
         }
-        let id = trimmed
-            .parse::<i32>()
-            .map_err(|_| ApiIdError::OutOfRange)?;
+        let id = trimmed.parse::<i32>().map_err(|_| ApiIdError::OutOfRange)?;
         Self::new(id)
     }
 

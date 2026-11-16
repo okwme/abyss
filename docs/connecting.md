@@ -1,0 +1,113 @@
+# Connecting abyss to Telegram
+
+This guide follows the screens abyss shows on first launch. The app's text
+lives in `crates/app/src/ui/copy/onboarding.rs`; a unit test checks that
+each step's key phrase below matches it.
+
+## 1. Welcome
+
+abyss is a small, auditable Telegram client for macOS. It reduces the
+client-side attack surface: there is less code that handles what strangers
+send you.
+
+It does not hide your chats from Telegram. Cloud chats are still readable by
+Telegram's servers. This version has no secret chats, calls, stickers,
+browser or Mini Apps.
+
+Press **Connect to Telegram**.
+
+## 2. Get your API credentials
+
+abyss connects with your own Telegram API credentials (`api_id` and
+`api_hash`). **Open my.telegram.org** opens
+<https://my.telegram.org/apps> in your browser. abyss opens no other URL
+during onboarding.
+
+0. You need an existing Telegram account signed in on an official app
+   (phone or desktop), and that session must stay available. Login codes
+   for my.telegram.org and for abyss arrive there.
+1. Log in with your phone number. The login code arrives in your Telegram
+   app, not by SMS.
+2. Open "API development tools".
+3. Fill App title `abyss`, a Short name of 5–32 letters or digits, and
+   Platform "Desktop". Leave URL empty.
+4. Copy `api_id` and `api_hash`.
+
+If something goes wrong:
+
+- If the form says "ERROR", retry later with VPN and ad blockers off and a
+  letters-only short name.
+- There is one app per phone number. If you already registered one, copy
+  its existing `api_id` and `api_hash`; don't try to create a second.
+- Never share your api_hash. Anyone who has it can pose as your app.
+- New `api_id`s can draw extra anti-spam scrutiny from Telegram.
+
+Press **I have my api_id and api_hash**.
+
+## 3. Enter your API credentials
+
+- `api_id` takes digits only, at most 10.
+- `api_hash` takes exactly 32 hex characters. It is masked; **Show** reveals
+  it. Pasted spaces and line breaks are dropped.
+
+**Continue** checks both fields, then asks Telegram for a login code. abyss
+saves the pair in your macOS Keychain (item `dev.abyss.apicreds`) only once
+Telegram has accepted it, i.e. after the first code request succeeds. If
+Telegram rejects the pair, you come back here with the reason.
+
+If a pair is already saved, you can use it, enter a new pair to replace it,
+or forget it. Forgetting is refused while you are signed in: log out first.
+
+### Environment override
+
+`ABYSS_API_ID` and `ABYSS_API_HASH` override the saved pair. Both must be
+set. They are never written to the Keychain. While they are set, the entry
+screen is disabled and abyss explains what is wrong with them; fix them, or
+unset both and restart abyss.
+
+If the Keychain cannot be read (for example, it is locked), abyss shows
+**Retry** instead of asking for a new pair.
+
+## 4. Phone
+
+Enter your phone number in international format with a leading `+`.
+Telegram sends the code to your other Telegram sessions first.
+
+## 5. Code
+
+The screen says where the code went (your Telegram app, SMS, a call, …) and,
+when Telegram offers another way, counts down until you can ask for it.
+
+Telegram and abyss will never ask for this code anywhere else.
+
+Your other devices will show a "new login" notice. That's expected.
+
+If Telegram asks for a step abyss does not support (for example, setting up
+a login email), it says: "Finish this step in an official Telegram app, then
+try again." If the number has no account, create one in an official app
+first.
+
+## 6. Password
+
+If your account has two-step verification, enter its password. The hint you
+set is shown.
+
+## 7. Done
+
+- The session shows as "abyss" under Settings › Devices in official apps,
+  where you can end it remotely.
+- If your account has no two-step verification password, abyss recommends
+  turning it on in an official app. abyss doesn't set it.
+
+## Going back and logging out
+
+**Back** works on every screen before you are signed in, except the welcome
+screen and the screens where abyss is waiting on something outside the form
+(checking a lost sign-in answer, an unusable environment override, a locked
+Keychain). From the phone screen, Back returns to the credential screens
+unless the pair comes from the environment.
+
+Once you are signed in, the only way back is **Log out** (top right of the
+chat list). It ends the session with Telegram, then deletes this account's
+session key and message cache from this Mac. If abyss quits before the
+deletion finishes, it says so; open abyss again and log out to finish.

@@ -5,9 +5,9 @@ use crate::store::ViewGen;
 
 pub use crate::auth_types::{
     ApiCredentials, ApiHash, ApiHashError, ApiId, ApiIdError, AuthState, CodeDelivery,
-    CredentialError, CredentialSource, EnvVar, LocalDeletion, LogoutStatus, NewLogin,
-    NextDelivery, PASSWORD_CAPACITY, PasswordBuf, PasswordTooLong, RemoteLogout, SaveStatus,
-    SentCodeInfo, StorageError, mask_phone,
+    CredentialError, CredentialSource, EnvVar, LocalDeletion, LogoutStatus, NewLogin, NextDelivery,
+    PASSWORD_CAPACITY, PasswordBuf, PasswordTooLong, RemoteLogout, SaveStatus, SentCodeInfo,
+    StorageError, mask_phone,
 };
 
 /// Generation of the client instance. Bumps on every rebuild, login and logout;

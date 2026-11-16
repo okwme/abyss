@@ -84,7 +84,9 @@ impl<B: Backend> Actor<B> {
                 self.auth.clear_login();
                 self.set_auth(AuthState::OfficialAppRequired).await;
             }
-            AuthFail::Auth(AuthError::PhoneInvalid | AuthError::PhoneBanned | AuthError::PhoneFlood) => {
+            AuthFail::Auth(
+                AuthError::PhoneInvalid | AuthError::PhoneBanned | AuthError::PhoneFlood,
+            ) => {
                 let error = Some(fail.user_error());
                 self.set_auth(AuthState::Phone { error }).await;
             }

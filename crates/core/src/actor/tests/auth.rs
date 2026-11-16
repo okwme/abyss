@@ -404,7 +404,11 @@ async fn inconclusive_probe_is_retried_not_read_as_signed_out() {
             )
         })
         .await;
-    assert!(!skipped.iter().any(|e| matches!(e, Event::Auth(s) if is_code(s))));
+    assert!(
+        !skipped
+            .iter()
+            .any(|e| matches!(e, Event::Auth(s) if is_code(s)))
+    );
     // A new sign-in is not accepted: the probe answers first.
     h.send(Command::SubmitCode(FAKE_CODE.into())).await;
     h.signed_in().await;
@@ -426,9 +430,7 @@ async fn flood_wait_on_the_probe_is_honored() {
         Fault::Error(BackendError::FloodWait { seconds: 30 }),
     );
     h.send(Command::SubmitCode(FAKE_CODE.into())).await;
-    let state = h
-        .auth(|s| matches!(s, AuthState::FloodWait { .. }))
-        .await;
+    let state = h.auth(|s| matches!(s, AuthState::FloodWait { .. })).await;
     let AuthState::FloodWait { resume, .. } = state else {
         unreachable!()
     };
@@ -503,9 +505,7 @@ async fn not_authorized_probe_is_not_a_revocation() {
     h.phone_to_code().await;
     h.fake.inject(Op::SignIn, Fault::Hang);
     h.send(Command::SubmitCode(FAKE_CODE.into())).await;
-    let (_, skipped) = h
-        .until(|e| matches!(e, Event::Auth(s) if is_code(s)))
-        .await;
+    let (_, skipped) = h.until(|e| matches!(e, Event::Auth(s) if is_code(s))).await;
     assert!(
         !skipped
             .iter()

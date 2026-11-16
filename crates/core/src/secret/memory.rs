@@ -128,12 +128,16 @@ impl FaultControl {
 
     /// Makes reading `item` fail (a locked Keychain) until [`Self::heal_item`].
     pub fn fail_get_of(&self, item: SecretItem) {
-        self.0.failing_gets.fetch_or(item_bit(item), Ordering::SeqCst);
+        self.0
+            .failing_gets
+            .fetch_or(item_bit(item), Ordering::SeqCst);
     }
 
     /// Makes writing `item` fail until [`Self::heal_item`].
     pub fn fail_set_of(&self, item: SecretItem) {
-        self.0.failing_sets.fetch_or(item_bit(item), Ordering::SeqCst);
+        self.0
+            .failing_sets
+            .fetch_or(item_bit(item), Ordering::SeqCst);
     }
 
     /// Ends every per-item failure of `item`.

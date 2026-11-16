@@ -199,7 +199,8 @@ async fn locked_keychain_is_not_absent() {
 async fn invalid_api_id_is_refused_locally() {
     let mut h = onboarding().await;
     h.send(submit(0)).await;
-    h.need_credentials(Some(CredentialError::InvalidApiId)).await;
+    h.need_credentials(Some(CredentialError::InvalidApiId))
+        .await;
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(h.fake.builds(), 0);
     h.stop().await;
@@ -409,7 +410,9 @@ async fn sent_code_types_and_unsupported_flows() {
     let mut h = signed_out_with(env, Setup::default()).await;
     h.auth(is_phone).await;
     h.send(Command::SubmitPhone("+998 1234567".into())).await;
-    let AuthState::Code { sent: Some(sent), .. } = h.auth(|s| matches!(s, AuthState::Code { .. })).await
+    let AuthState::Code {
+        sent: Some(sent), ..
+    } = h.auth(|s| matches!(s, AuthState::Code { .. })).await
     else {
         panic!("no sent-code info");
     };

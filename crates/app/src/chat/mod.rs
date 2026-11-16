@@ -198,6 +198,7 @@ impl ChatShell {
             // Task 10b consumes `Reconciled` (echo reconciliation) and
             // `DialogsPaging` (pagination state).
             Event::Auth(_)
+            | Event::CredentialSource(_)
             | Event::Connection(_)
             | Event::Error(_)
             | Event::Reconciled { .. }

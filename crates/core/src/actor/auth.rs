@@ -978,11 +978,16 @@ mod tests {
     #[test]
     fn phone_normalization() {
         assert_eq!(
-            normalize_phone(" +44 (7700) 900-123 ").as_deref().map(String::as_str),
+            normalize_phone(" +44 (7700) 900-123 ")
+                .as_deref()
+                .map(String::as_str),
             Some("+447700900123")
         );
         assert!(normalize_phone("+1234").is_none(), "four digits");
-        assert!(normalize_phone("+1234567890123456").is_none(), "sixteen digits");
+        assert!(
+            normalize_phone("+1234567890123456").is_none(),
+            "sixteen digits"
+        );
         assert!(normalize_phone("44+7700900123").is_none(), "plus not first");
         assert!(normalize_phone("+44 7700 abc").is_none());
     }

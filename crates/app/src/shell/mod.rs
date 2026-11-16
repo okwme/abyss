@@ -5,6 +5,7 @@ mod auth;
 mod bridge;
 mod chat_view;
 mod chats;
+mod onboarding;
 mod session;
 mod shutdown;
 mod view;
@@ -124,7 +125,7 @@ impl Root {
                 false
             }
             Closing::Waiting => false,
-            Closing::Unconfirmed => true,
+            Closing::Unconfirmed | Closing::LogoutUnfinished => true,
         }
     }
 }

@@ -104,7 +104,10 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
     }
     if let Some(creds) = &setup.stored_creds {
         store
-            .set(SecretItem::ApiCredentials, &crate::credentials::encode(creds))
+            .set(
+                SecretItem::ApiCredentials,
+                &crate::credentials::encode(creds),
+            )
             .unwrap();
     }
     let (wrapped, faults) = FaultyStore::new(store.clone());

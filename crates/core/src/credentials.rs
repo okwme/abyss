@@ -27,9 +27,13 @@ pub enum EnvResolution {
     Absent,
     Pair(ApiCredentials),
     /// One variable is set, the other is not.
-    Partial { missing: EnvVar },
+    Partial {
+        missing: EnvVar,
+    },
     /// A variable is set but malformed (the first one found).
-    Malformed { var: EnvVar },
+    Malformed {
+        var: EnvVar,
+    },
 }
 
 /// Reads the env pair through `lookup` (the process environment in

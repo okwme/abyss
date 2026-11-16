@@ -253,16 +253,17 @@ pub(crate) async fn resend_code<I: Invoke>(
         phone_code_hash: token.hash.clone(),
         reason: None,
     };
-    let sent = call(inv, RetryClass::Never, &request)
-        .await
-        .map_err(|e| match sign_in_failure(&e) {
-            // An expired code request: ask for a new code from the phone step.
-            SignInFailure::InvalidCode => AuthError::Backend(BackendError::Rejected),
-            SignInFailure::Other(e) => e,
-            SignInFailure::PasswordNeeded | SignInFailure::SignUpRequired => {
-                AuthError::Backend(BackendError::Rejected)
-            }
-        })?;
+    let sent =
+        call(inv, RetryClass::Never, &request)
+            .await
+            .map_err(|e| match sign_in_failure(&e) {
+                // An expired code request: ask for a new code from the phone step.
+                SignInFailure::InvalidCode => AuthError::Backend(BackendError::Rejected),
+                SignInFailure::Other(e) => e,
+                SignInFailure::PasswordNeeded | SignInFailure::SignUpRequired => {
+                    AuthError::Backend(BackendError::Rejected)
+                }
+            })?;
     let mapped = map_sent_code(sent)?;
     Ok(CodeRequest {
         token: GrammersLoginToken {
@@ -306,10 +307,13 @@ pub(crate) async fn sign_in<I: Invoke>(
 pub(crate) async fn password_challenge<I: Invoke>(
     inv: &I,
 ) -> Result<PasswordChallenge<GrammersPasswordToken>, AuthError> {
-    let tl::enums::account::Password::Password(password) =
-        call(inv, RetryClass::Never, &tl::functions::account::GetPassword {})
-            .await
-            .map_err(|e| auth_error(&e))?;
+    let tl::enums::account::Password::Password(password) = call(
+        inv,
+        RetryClass::Never,
+        &tl::functions::account::GetPassword {},
+    )
+    .await
+    .map_err(|e| auth_error(&e))?;
     let hint = password.hint.clone();
     Ok(PasswordChallenge {
         token: GrammersPasswordToken(Box::new(password)),

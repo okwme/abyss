@@ -45,9 +45,9 @@ pub use auth::{GrammersLoginToken, GrammersPasswordToken};
 pub use stream::GrammersUpdates;
 
 use super::{
-    Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest,
-    CredentialSlot, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance,
-    InstanceControl, PasswordChallenge, Seed, SessionSeed, SessionSnapshot, SignIn,
+    Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest, CredentialSlot,
+    DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl,
+    PasswordChallenge, Seed, SessionSeed, SessionSnapshot, SignIn,
 };
 use crate::api::{ApiCredentials, PasswordBuf};
 use crate::model::{ChatId, MsgId};
@@ -218,7 +218,14 @@ impl Client for GrammersClient {
             pool.disconnect_from_dc(dc);
         };
         let session = self.calls.session();
-        auth::send_code(self.calls.invoker(), session, &self.creds, phone, disconnect).await
+        auth::send_code(
+            self.calls.invoker(),
+            session,
+            &self.creds,
+            phone,
+            disconnect,
+        )
+        .await
     }
 
     async fn resend_login_code(

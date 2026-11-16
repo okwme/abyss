@@ -14,8 +14,7 @@ use grammers_client::tl::{self, Deserializable as _, Serializable as _};
 
 use crate::api::{ApiCredentials, CodeDelivery, CredentialError, NextDelivery};
 use crate::backend::grammers::auth::{
-    MappedCode, SignInFailure, auth_error, is_authorized, map_sent_code, send_code,
-    sign_in_failure,
+    MappedCode, SignInFailure, auth_error, is_authorized, map_sent_code, send_code, sign_in_failure,
 };
 use crate::backend::grammers::invoke::Invoke;
 use crate::backend::{AuthError, BackendError, SentCode, SessionSnapshot};
@@ -70,7 +69,11 @@ fn rpc(code: i32, name: &str, value: Option<u32>) -> InvocationError {
     })
 }
 
-fn code(r#type: T, next: Option<tl::enums::auth::CodeType>, timeout: Option<i32>) -> tl::enums::auth::SentCode {
+fn code(
+    r#type: T,
+    next: Option<tl::enums::auth::CodeType>,
+    timeout: Option<i32>,
+) -> tl::enums::auth::SentCode {
     tl::enums::auth::SentCode::Code(ty::SentCode {
         r#type,
         phone_code_hash: "h4sh".into(),
@@ -93,23 +96,50 @@ fn mapped(delivery: CodeDelivery, length: Option<u8>) -> MappedCode {
 
 #[test]
 fn every_sent_code_type_is_mapped() {
-    let official = Err(AuthError::OfficialAppRequired);
     let table: Vec<(T, Result<MappedCode, AuthError>)> = vec![
-        (T::App(ty::SentCodeTypeApp { length: 5 }), Ok(mapped(CodeDelivery::App, Some(5)))),
-        (T::Sms(ty::SentCodeTypeSms { length: 6 }), Ok(mapped(CodeDelivery::Sms, Some(6)))),
-        (T::Call(ty::SentCodeTypeCall { length: 5 }), Ok(mapped(CodeDelivery::Call, Some(5)))),
         (
-            T::FlashCall(ty::SentCodeTypeFlashCall { pattern: "+44*".into() }),
+            T::App(ty::SentCodeTypeApp { length: 5 }),
+            Ok(mapped(CodeDelivery::App, Some(5))),
+        ),
+        (
+            T::Sms(ty::SentCodeTypeSms { length: 6 }),
+            Ok(mapped(CodeDelivery::Sms, Some(6))),
+        ),
+        (
+            T::Call(ty::SentCodeTypeCall { length: 5 }),
+            Ok(mapped(CodeDelivery::Call, Some(5))),
+        ),
+        (
+            T::FlashCall(ty::SentCodeTypeFlashCall {
+                pattern: "+44*".into(),
+            }),
             Ok(mapped(CodeDelivery::FlashCall, None)),
         ),
         (
-            T::MissedCall(ty::SentCodeTypeMissedCall { prefix: "+44".into(), length: 4 }),
+            T::MissedCall(ty::SentCodeTypeMissedCall {
+                prefix: "+44".into(),
+                length: 4,
+            }),
             Ok(mapped(CodeDelivery::MissedCall, Some(4))),
         ),
         (
-            T::FragmentSms(ty::SentCodeTypeFragmentSms { url: "https://fragment.com".into(), length: 5 }),
+            T::FragmentSms(ty::SentCodeTypeFragmentSms {
+                url: "https://fragment.com".into(),
+                length: 5,
+            }),
             Ok(mapped(CodeDelivery::FragmentSms, Some(5))),
         ),
+    ];
+    for (t, want) in table {
+        assert_eq!(map_sent_code(code(t, None, None)), want);
+    }
+}
+
+/// Email, Firebase and word/phrase codes need an official app.
+#[test]
+fn unsupported_sent_code_types_need_an_official_app() {
+    let official = Err(AuthError::OfficialAppRequired);
+    let table: Vec<(T, Result<MappedCode, AuthError>)> = vec![
         (
             T::EmailCode(ty::SentCodeTypeEmailCode {
                 apple_signin_allowed: false,
@@ -139,8 +169,14 @@ fn every_sent_code_type_is_mapped() {
             }),
             official.clone(),
         ),
-        (T::SmsWord(ty::SentCodeTypeSmsWord { beginning: None }), official.clone()),
-        (T::SmsPhrase(ty::SentCodeTypeSmsPhrase { beginning: None }), official),
+        (
+            T::SmsWord(ty::SentCodeTypeSmsWord { beginning: None }),
+            official.clone(),
+        ),
+        (
+            T::SmsPhrase(ty::SentCodeTypeSmsPhrase { beginning: None }),
+            official,
+        ),
     ];
     for (t, want) in table {
         assert_eq!(map_sent_code(code(t, None, None)), want);
@@ -195,7 +231,12 @@ fn sent_code_success_and_payment_need_an_official_app() {
 #[test]
 fn auth_error_table() {
     let table: &[(i32, &str, Option<u32>, AuthError)] = &[
-        (400, "API_ID_INVALID", None, AuthError::Credentials(CredentialError::ApiIdInvalid)),
+        (
+            400,
+            "API_ID_INVALID",
+            None,
+            AuthError::Credentials(CredentialError::ApiIdInvalid),
+        ),
         (
             400,
             "API_ID_PUBLISHED_FLOOD",
@@ -218,9 +259,24 @@ fn auth_error_table() {
             None,
             AuthError::Backend(BackendError::Unauthorized),
         ),
-        (401, "SESSION_REVOKED", None, AuthError::Backend(BackendError::Unauthorized)),
-        (400, "PASSWORD_HASH_INVALID", None, AuthError::Backend(BackendError::Rejected)),
-        (500, "INTERNAL", None, AuthError::Backend(BackendError::Transient)),
+        (
+            401,
+            "SESSION_REVOKED",
+            None,
+            AuthError::Backend(BackendError::Unauthorized),
+        ),
+        (
+            400,
+            "PASSWORD_HASH_INVALID",
+            None,
+            AuthError::Backend(BackendError::Rejected),
+        ),
+        (
+            500,
+            "INTERNAL",
+            None,
+            AuthError::Backend(BackendError::Transient),
+        ),
     ];
     for (code, name, value, want) in table {
         assert_eq!(auth_error(&rpc(*code, name, *value)), *want, "{name}");
@@ -232,11 +288,19 @@ fn auth_error_table() {
 #[test]
 fn sign_in_failures() {
     let table: &[(i32, &str, SignInFailure)] = &[
-        (401, "SESSION_PASSWORD_NEEDED", SignInFailure::PasswordNeeded),
+        (
+            401,
+            "SESSION_PASSWORD_NEEDED",
+            SignInFailure::PasswordNeeded,
+        ),
         (400, "PHONE_CODE_INVALID", SignInFailure::InvalidCode),
         (400, "PHONE_CODE_EXPIRED", SignInFailure::InvalidCode),
         (400, "PHONE_CODE_EMPTY", SignInFailure::InvalidCode),
-        (400, "PHONE_NUMBER_UNOCCUPIED", SignInFailure::SignUpRequired),
+        (
+            400,
+            "PHONE_NUMBER_UNOCCUPIED",
+            SignInFailure::SignUpRequired,
+        ),
         (
             420,
             "FLOOD_WAIT",
@@ -289,7 +353,10 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[tokio::test]
 async fn send_code_uses_the_pair_and_follows_one_migration() {
     let sent = code(T::Sms(ty::SentCodeTypeSms { length: 5 }), None, Some(30));
-    let inv = mock(vec![Err(rpc(303, "PHONE_MIGRATE", Some(4))), Ok(sent.to_bytes())]);
+    let inv = mock(vec![
+        Err(rpc(303, "PHONE_MIGRATE", Some(4))),
+        Ok(sent.to_bytes()),
+    ]);
     let session = AbyssSession::from_snapshot(SessionSnapshot::detached()).unwrap();
     let old = session.home_dc_id().unwrap();
     let culled = Mutex::new(Vec::new());
