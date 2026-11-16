@@ -19,7 +19,7 @@ fn msg(c: ChatId, id: i32, text: &str) -> Message {
         },
         sender: None,
         date: 0,
-        edited: false,
+        edit_date: None,
         outgoing: false,
         reply_to: None,
         body: Body::Text(RichText::plain(text)),

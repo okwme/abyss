@@ -139,10 +139,24 @@ pub struct Message {
     pub sender: Option<Sender>,
     /// Unix seconds.
     pub date: i64,
-    pub edited: bool,
+    /// Unix seconds of the last edit; `None` if never edited. Orders a live edit
+    /// against a snapshot of the same message (plan section 2, bootstrap).
+    pub edit_date: Option<i64>,
     pub outgoing: bool,
     pub reply_to: Option<MsgId>,
     pub body: Body,
+}
+
+impl Message {
+    pub fn edited(&self) -> bool {
+        self.edit_date.is_some()
+    }
+
+    /// Ordering key between two copies of the same message: the later edit wins,
+    /// and an unedited copy never beats an edited one.
+    pub fn version(&self) -> i64 {
+        self.edit_date.unwrap_or(i64::MIN)
+    }
 }
 
 impl ChatSummary {

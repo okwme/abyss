@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{Actor, Internal};
+use crate::actor::{Actor, ActorInit, Internal};
 use crate::api::{Command, Event};
 use crate::backend::Backend;
 use crate::cache::{CacheError, CacheHandle, CacheKey};
@@ -95,11 +95,18 @@ pub struct CoreHandle {
     events: EventReceiver,
     cancel: CancellationToken,
     done: Option<oneshot::Receiver<ShutdownReport>>,
-    /// Task 4 drives client rebuilds through this.
-    _internal: mpsc::Sender<Internal>,
+    /// Control plane: never queued behind UI commands.
+    internal: mpsc::Sender<Internal>,
 }
 
 impl CoreHandle {
+    /// Tells core the system woke from sleep (`NSWorkspaceDidWakeNotification`).
+    /// Core rebuilds the client rather than trust sockets across sleep. Never
+    /// blocks; wakes that arrive while one is pending coalesce.
+    pub fn notify_wake(&self) {
+        let _ = self.internal.try_send(Internal::Wake);
+    }
+
     /// Queues a command without waiting.
     pub fn send(&self, cmd: Command) -> Result<(), SendError> {
         self.cmd.try_send(cmd).map_err(|e| match e {
@@ -171,20 +178,20 @@ fn start_with<B: Backend>(config: CoreConfig, backend: B) -> Result<CoreHandle, 
     let (events_tx, events_rx) = events::channel();
     let (done_tx, done_rx) = oneshot::channel();
     let cancel = CancellationToken::new();
-    let (actor, channels) = Actor::new(
-        Arc::new(backend),
-        events_tx,
-        cache.clone(),
-        cmd_rx,
-        internal_rx,
-    );
-    let token = cancel.clone();
+    let (actor, channels) = Actor::new(ActorInit {
+        backend: Arc::new(backend),
+        events: events_tx,
+        cache: cache.clone(),
+        commands: cmd_rx,
+        internal: internal_rx,
+        cancel: cancel.clone(),
+    });
     std::thread::Builder::new()
         .name("abyss-core".into())
         .spawn(move || {
             let report = runtime.block_on(async move {
                 // Spawned so a panic in the actor itself is contained and reported.
-                let joined = tokio::spawn(actor.run(channels, token)).await;
+                let joined = tokio::spawn(actor.run(channels)).await;
                 let flushed = match cache {
                     Some(c) => matches!(
                         tokio::time::timeout(CACHE_FLUSH, c.barrier()).await,
@@ -207,7 +214,7 @@ fn start_with<B: Backend>(config: CoreConfig, backend: B) -> Result<CoreHandle, 
         events: events_rx,
         cancel,
         done: Some(done_rx),
-        _internal: internal_tx,
+        internal: internal_tx,
     })
 }
 

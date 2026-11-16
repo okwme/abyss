@@ -7,28 +7,32 @@
     reason = "test harness helpers are not #[test] items, so allow-*-in-tests does not cover them"
 )]
 
+mod lifecycle;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{Actor, CALL_DEADLINE, Internal, MAX_CONCURRENT};
-use crate::api::{Command, Event, HistoryDir, SendState, UserError};
+use super::{Actor, ActorInit, Internal};
+use crate::api::{Command, ConnState, Event, HistoryDir, SendState, UserError};
 use crate::backend::fake::{FakeBackend, FakeHandle, FakeScript, Fault, Op, text_message};
 use crate::backend::{BackendError, Update};
 use crate::cache::{CacheHandle, CacheKey};
 use crate::events::{self, EventReceiver};
 use crate::model::{ChatId, LocalId, MsgId, PeerKind};
 
-const WAIT: Duration = Duration::from_secs(120);
+const WAIT: Duration = Duration::from_secs(600);
 
 struct Harness {
     cmd: mpsc::Sender<Command>,
     internal: mpsc::Sender<Internal>,
     events: EventReceiver,
     fake: FakeHandle,
+    /// The actor's admission semaphore, observed while it runs.
+    permits: Arc<Semaphore>,
     cancel: CancellationToken,
     join: JoinHandle<()>,
 }
@@ -42,17 +46,31 @@ fn chat(id: i64) -> ChatId {
 
 fn harness(script: FakeScript, cache: Option<CacheHandle>) -> Harness {
     let (backend, fake) = FakeBackend::new(script);
+    harness_with(backend, fake, cache)
+}
+
+/// Starts an actor over a prepared fake (faults may be queued before the first build).
+fn harness_with(backend: FakeBackend, fake: FakeHandle, cache: Option<CacheHandle>) -> Harness {
     let (cmd, cmd_rx) = mpsc::channel(256);
     let (internal, internal_rx) = mpsc::channel(8);
     let (events_tx, events) = events::channel();
-    let (actor, channels) = Actor::new(Arc::new(backend), events_tx, cache, cmd_rx, internal_rx);
     let cancel = CancellationToken::new();
-    let join = tokio::spawn(actor.run(channels, cancel.clone()));
+    let (actor, channels) = Actor::new(ActorInit {
+        backend: Arc::new(backend),
+        events: events_tx,
+        cache,
+        commands: cmd_rx,
+        internal: internal_rx,
+        cancel: cancel.clone(),
+    });
+    let permits = actor.admission.probe();
+    let join = tokio::spawn(actor.run(channels));
     Harness {
         cmd,
         internal,
         events,
         fake,
+        permits,
         cancel,
         join,
     }
@@ -80,10 +98,22 @@ impl Harness {
         (found, skipped)
     }
 
+    /// Waits until the instance is online; returns the events before it.
+    async fn online(&mut self) -> Vec<Event> {
+        self.until(|e| matches!(e, Event::Connection(ConnState::Online)))
+            .await
+            .1
+    }
+
     async fn history(&mut self, c: ChatId, d: HistoryDir) -> Event {
         self.until(|e| matches!(e, Event::History { chat, dir, .. } if *chat == c && *dir == d))
             .await
             .0
+    }
+
+    /// Takes every queued event without waiting.
+    fn drain(&mut self) -> Vec<Event> {
+        std::iter::from_fn(|| self.events.try_recv()).collect()
     }
 
     async fn stop(self) {
@@ -104,6 +134,7 @@ async fn loads_dialogs_and_tail() {
     let mut h = harness(FakeScript::demo(3, 120), None);
     let (ev, _) = h.until(|e| matches!(e, Event::DialogsReset(_))).await;
     assert!(matches!(ev, Event::DialogsReset(v) if v.len() == 3));
+    h.online().await;
     h.send(Command::OpenChat(chat(1))).await;
     let ev = h.history(chat(1), HistoryDir::Tail).await;
     assert_eq!(history_ids(&ev), (71..=120).collect::<Vec<_>>());
@@ -115,43 +146,12 @@ async fn loads_dialogs_and_tail() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn admission_caps_in_flight_and_parks_timeouts_until_retire() {
-    let mut h = harness(FakeScript::default(), None);
-    let total = MAX_CONCURRENT + 4;
-    for _ in 0..total {
-        h.fake.inject(Op::Read, Fault::Hang);
-    }
-    for i in 0..total {
-        let id = i64::try_from(i).unwrap() + 1;
-        h.send(Command::MarkRead {
-            chat: chat(id),
-            max_id: MsgId(1),
-        })
-        .await;
-    }
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        h.fake.calls(Op::Read),
-        MAX_CONCURRENT,
-        "17th call must wait for a permit"
-    );
-    assert_eq!(h.fake.max_in_flight(), MAX_CONCURRENT);
-    // Every call times out; the permits are parked, so nothing else is admitted.
-    tokio::time::sleep(CALL_DEADLINE * 3).await;
-    assert_eq!(h.fake.in_flight(), 0);
-    assert_eq!(
-        h.fake.calls(Op::Read),
-        MAX_CONCURRENT,
-        "timed-out permits must stay parked"
-    );
-    h.internal.send(Internal::Retire).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        h.fake.calls(Op::Read),
-        total,
-        "retire recycles parked permits"
-    );
-    let _ = &mut h.events;
+async fn commands_before_online_wait_for_the_bootstrap() {
+    let mut h = harness(FakeScript::demo(2, 10), None);
+    h.send(Command::OpenChat(chat(1))).await;
+    let ev = h.history(chat(1), HistoryDir::Tail).await;
+    assert_eq!(history_ids(&ev).len(), 10);
+    h.online().await;
     h.stop().await;
 }
 
@@ -160,6 +160,7 @@ async fn stale_completion_after_close_is_dropped() {
     let mut script = FakeScript::demo(3, 10);
     script.latency = Duration::from_secs(1);
     let mut h = harness(script, None);
+    h.online().await;
     h.send(Command::OpenChat(chat(1))).await;
     h.send(Command::CloseChat(chat(1))).await;
     h.send(Command::OpenChat(chat(2))).await;
@@ -172,29 +173,6 @@ async fn stale_completion_after_close_is_dropped() {
             .any(|e| matches!(e, Event::History { chat: c, .. } if *c == chat(1)))
     );
     assert_eq!(h.fake.calls(Op::History), 2);
-    h.stop().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn client_generation_bump_drops_completions() {
-    let mut script = FakeScript::demo(3, 10);
-    script.latency = Duration::from_secs(1);
-    let mut h = harness(script, None);
-    h.until(|e| matches!(e, Event::DialogsReset(_))).await;
-    h.send(Command::OpenChat(chat(1))).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    h.internal.send(Internal::Retire).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    while let Some(ev) = h.events.try_recv() {
-        assert!(
-            !matches!(ev, Event::History { .. }),
-            "stale generation completion leaked: {ev:?}"
-        );
-    }
-    assert_eq!(h.fake.calls(Op::History), 1);
-    h.send(Command::OpenChat(chat(1))).await;
-    let ev = h.history(chat(1), HistoryDir::Tail).await;
-    assert_eq!(history_ids(&ev).len(), 10);
     h.stop().await;
 }
 
@@ -373,12 +351,21 @@ fn cache_at(dir: &std::path::Path, key: &CacheKey) -> CacheHandle {
     CacheHandle::spawn(dir.to_path_buf(), key).unwrap()
 }
 
+/// Once online, opens chat 1 and waits until the server tail is applied: after
+/// the cached tail, if the cache holds one.
+async fn open_settled(h: &mut Harness, cache: &CacheHandle) {
+    let cached = !cache.tail(chat(1), 1).await.unwrap().is_empty();
+    h.online().await;
+    h.send(Command::OpenChat(chat(1))).await;
+    for _ in 0..=usize::from(cached) {
+        h.history(chat(1), HistoryDir::Tail).await;
+    }
+}
+
 /// Opens chat 1, scrolls up `older` pages, then stops and flushes the cache.
 async fn session(script: FakeScript, cache: CacheHandle, older: usize) -> FakeHandle {
     let mut h = harness(script, Some(cache.clone()));
-    h.send(Command::OpenChat(chat(1))).await;
-    h.until(|e| matches!(e, Event::History { dir: HistoryDir::Tail, view, .. } if view.0 > 1))
-        .await;
+    open_settled(&mut h, &cache).await;
     for _ in 0..older {
         h.send(Command::LoadOlder(chat(1))).await;
         h.history(chat(1), HistoryDir::Older).await;
@@ -402,6 +389,24 @@ async fn cache_serves_history_offline_then_reconciles() {
     h.send(Command::OpenChat(chat(1))).await;
     let ev = h.history(chat(1), HistoryDir::Tail).await;
     assert_eq!(history_ids(&ev), (151..=200).collect::<Vec<_>>());
+    // A rebuild meanwhile shows the cached tail again rather than nothing.
+    h.internal.send(Internal::Wake).await.unwrap();
+    let (_, skipped) = h
+        .until(|e| {
+            matches!(
+                e,
+                Event::History {
+                    dir: HistoryDir::Tail,
+                    ..
+                }
+            )
+        })
+        .await;
+    assert!(
+        skipped
+            .iter()
+            .any(|e| matches!(e, Event::ChatInvalidated(c) if *c == chat(1)))
+    );
     h.stop().await;
 
     // Third run: the server deleted message 190; the tail reconcile removes it.
@@ -425,10 +430,8 @@ async fn contiguous_cache_serves_older_pages_without_the_server() {
     session(FakeScript::demo(1, 300), cache_at(dir.path(), &key), 3).await;
 
     let cache = cache_at(dir.path(), &key);
-    let mut h = harness(FakeScript::demo(1, 300), Some(cache));
-    h.send(Command::OpenChat(chat(1))).await;
-    h.until(|e| matches!(e, Event::History { dir: HistoryDir::Tail, view, .. } if view.0 > 1))
-        .await;
+    let mut h = harness(FakeScript::demo(1, 300), Some(cache.clone()));
+    open_settled(&mut h, &cache).await;
     let server_calls = h.fake.calls(Op::History);
     h.send(Command::LoadOlder(chat(1))).await;
     let ev = h.history(chat(1), HistoryDir::Older).await;

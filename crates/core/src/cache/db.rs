@@ -13,7 +13,11 @@ use super::{CacheError, CacheKey, MAX_CACHE_BYTES, MAX_CACHED_PER_CHAT, MAX_ROW_
 use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerKind, group_by_chat};
 use crate::store::MAX_DIALOGS;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+/// Version 2 replaced `Message::edited` with `edit_date`; version 1 message rows
+/// cannot be decoded, so they are dropped (the cache is disposable).
+const MIGRATE_1_TO_2: &str =
+    "BEGIN; DELETE FROM messages; DELETE FROM cached_chats; PRAGMA user_version = 2; COMMIT;";
 /// Messages deleted per eviction step.
 const EVICT_BATCH: i64 = 1000;
 /// Upper bound on eviction steps per call; exceeding it is reported, not hidden.
@@ -171,6 +175,10 @@ impl Cache {
                 conn.execute_batch(&format!(
                     "BEGIN; {SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
                 ))?;
+                Ok(())
+            }
+            1 => {
+                conn.execute_batch(MIGRATE_1_TO_2)?;
                 Ok(())
             }
             SCHEMA_VERSION => Ok(()),

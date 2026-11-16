@@ -20,7 +20,7 @@ fn msg(c: ChatId, id: i32, text: &str) -> Message {
         },
         sender: None,
         date: 0,
-        edited: false,
+        edit_date: None,
         outgoing: false,
         reply_to: None,
         body: Body::Text(RichText::plain(text)),
@@ -216,6 +216,25 @@ fn unknown_schema_is_reported() {
         Cache::open(&dir, &key),
         Err(CacheError::UnknownSchema(99))
     ));
+}
+
+#[test]
+fn version_1_messages_are_dropped_on_upgrade() {
+    let (_t, dir, key) = setup();
+    let c = user(1);
+    {
+        let mut db = Cache::open(&dir, &key).unwrap();
+        db.put_messages(c, &[msg(c, 1, "old")]).unwrap();
+        db.conn().execute_batch("PRAGMA user_version = 1").unwrap();
+    }
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert!(db.tail(c, 10).unwrap().is_empty());
+    assert_eq!(db.total_bytes(), 0);
+    let version: i64 = db
+        .conn()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
 }
 
 #[test]

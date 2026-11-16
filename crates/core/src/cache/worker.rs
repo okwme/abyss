@@ -27,6 +27,12 @@ pub(crate) enum CacheCmd {
         hi: MsgId,
         messages: Vec<Message>,
     },
+    /// A server tail (ascending, plus any newer live messages); see `reconcile_tail`.
+    ReconcileTail {
+        chat: ChatId,
+        messages: Vec<Message>,
+        has_more: bool,
+    },
     Delete(ChatId, Vec<MsgId>),
     DeleteUnscoped(Vec<MsgId>),
     Touch(ChatId),
@@ -186,6 +192,33 @@ fn run(mut cache: Cache, dir: &Path, mut rx: mpsc::Receiver<CacheCmd>) {
     }
 }
 
+/// Applies a server tail. If it overlaps the cached history (or reaches the
+/// start of the chat), only the range it covers is reconciled. Otherwise there
+/// may be a gap between the cache and the tail, so the chat's cache is replaced.
+/// Decided here, against what the cache holds, because the actor's window may
+/// have been invalidated by a rebuild. `older` is the tail's first id when older
+/// history exists beyond it.
+fn reconcile_tail(
+    cache: &mut Cache,
+    chat: ChatId,
+    messages: &[Message],
+    older: Option<MsgId>,
+) -> Result<Vec<MsgId>, CacheError> {
+    const MIN: MsgId = MsgId(i32::MIN);
+    let lo = match older {
+        Some(first) => {
+            let newest = cache.tail(chat, 1)?.last().map(|m| m.id);
+            if newest.is_none_or(|n| first <= n) {
+                first
+            } else {
+                MIN
+            }
+        }
+        None => MIN,
+    };
+    cache.reconcile_range(chat, lo, MsgId(i32::MAX), messages)
+}
+
 /// Write errors are dropped deliberately: the cache is disposable, and a failed
 /// write only means a later read falls back to the server.
 fn handle(cache: &mut Cache, cmd: CacheCmd) {
@@ -199,6 +232,14 @@ fn handle(cache: &mut Cache, cmd: CacheCmd) {
             messages,
         } => {
             drop(cache.reconcile_range(chat, lo, hi, &messages));
+        }
+        CacheCmd::ReconcileTail {
+            chat,
+            messages,
+            has_more,
+        } => {
+            let older = messages.first().map(|m| m.id).filter(|_| has_more);
+            drop(reconcile_tail(cache, chat, &messages, older));
         }
         CacheCmd::Delete(chat, ids) => drop(cache.delete_messages(chat, &ids)),
         CacheCmd::DeleteUnscoped(ids) => drop(cache.delete_unscoped(&ids)),
