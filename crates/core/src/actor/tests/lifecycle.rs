@@ -103,7 +103,7 @@ async fn each_trigger_causes_exactly_one_rebuild_with_backoff() {
         Trigger::Stall,
         Trigger::Migrated,
     ] {
-        let mut h = harness(FakeScript::demo(2, 10), None);
+        let mut h = harness(FakeScript::demo(2, 10), None).await;
         h.online().await;
         fire(&mut h, trigger).await;
         assert_one_rebuild(&mut h, 1).await;
@@ -113,7 +113,7 @@ async fn each_trigger_causes_exactly_one_rebuild_with_backoff() {
 
 #[tokio::test(start_paused = true)]
 async fn recoverable_stream_errors_retry_on_the_same_stream() {
-    let mut h = harness(FakeScript::demo(2, 10), None);
+    let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.online().await;
     for _ in 0..3 {
         h.fake.stream_error(StreamError::Transient).await;
@@ -133,7 +133,7 @@ async fn recoverable_stream_errors_retry_on_the_same_stream() {
 async fn baseline_timeout_rebuilds() {
     let (backend, fake) = FakeBackend::new(FakeScript::demo(2, 10));
     fake.on_next_build(BuildFault::NoBaseline);
-    let mut h = harness_with(backend, fake, None);
+    let mut h = harness_with(backend, fake, None).await;
     let started = Instant::now();
     let (_, skipped) = h.until(rebuilding).await;
     assert!(started.elapsed() >= Duration::from_secs(10));
@@ -155,7 +155,7 @@ async fn failed_builds_go_offline_and_back_off() {
     let (backend, fake) = FakeBackend::new(FakeScript::demo(2, 10));
     fake.on_next_build(BuildFault::Fail(BackendError::Transient));
     fake.on_next_build(BuildFault::Fail(BackendError::Transient));
-    let mut h = harness_with(backend, fake, None);
+    let mut h = harness_with(backend, fake, None).await;
     let started = Instant::now();
     let skipped = h.online().await;
     let offline = skipped
@@ -170,7 +170,7 @@ async fn failed_builds_go_offline_and_back_off() {
 
 #[tokio::test(start_paused = true)]
 async fn second_migration_halts_offline() {
-    let mut h = harness(FakeScript::demo(2, 10), None);
+    let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.online().await;
     fire(&mut h, Trigger::Migrated).await;
     h.until(|e| matches!(e, Event::Error(UserError::AccountMigrated)))
@@ -192,7 +192,7 @@ async fn second_migration_halts_offline() {
 /// before it has.
 #[tokio::test(start_paused = true)]
 async fn parked_permits_recycle_only_after_the_runner_completes() {
-    let mut h = harness(FakeScript::default(), None);
+    let mut h = harness(FakeScript::default(), None).await;
     h.online().await;
     h.fake.set_quit(QuitBehavior::Slow(Duration::from_secs(4)));
     let total = MAX_CONCURRENT + 4;
@@ -235,7 +235,7 @@ async fn parked_permits_recycle_only_after_the_runner_completes() {
 
 #[tokio::test(start_paused = true)]
 async fn runner_ignoring_quit_is_aborted_and_awaited() {
-    let mut h = harness(FakeScript::demo(1, 1), None);
+    let mut h = harness(FakeScript::demo(1, 1), None).await;
     h.online().await;
     h.fake.set_quit(QuitBehavior::Ignore);
     h.internal.send(Internal::Wake).await.unwrap();
@@ -255,7 +255,7 @@ async fn runner_ignoring_quit_is_aborted_and_awaited() {
 
 #[tokio::test(start_paused = true)]
 async fn rebuild_carries_the_live_session_and_peers() {
-    let mut h = harness(FakeScript::demo(3, 10), None);
+    let mut h = harness(FakeScript::demo(3, 10), None).await;
     h.online().await;
     h.send(Command::OpenChat(chat(2))).await;
     h.history(chat(2), HistoryDir::Tail).await;
@@ -289,6 +289,8 @@ async fn stale_generation_completions_are_dropped() {
     let (_cmd, commands) = tokio::sync::mpsc::channel(1);
     let (_internal, internal) = tokio::sync::mpsc::channel(1);
     let (events_tx, mut events) = events::channel();
+    let persist = crate::session::PersistHandle::spawn(crate::secret::MemoryStore::new()).unwrap();
+    let account = persist.fresh_session();
     let (mut actor, _channels) = Actor::new(ActorInit {
         backend: Arc::new(backend),
         events: events_tx,
@@ -296,6 +298,9 @@ async fn stale_generation_completions_are_dropped() {
         commands,
         internal,
         cancel: tokio_util::sync::CancellationToken::new(),
+        persist,
+        account,
+        cache_parts: None,
     });
     let view = actor.windows.open(chat(1));
     let stale = ClientGen(actor.cgen.0 - 1);
@@ -342,7 +347,7 @@ async fn stale_generation_completions_are_dropped() {
 async fn in_flight_call_of_a_retired_instance_never_reaches_the_ui() {
     let mut script = FakeScript::demo(3, 10);
     script.latency = Duration::from_secs(1);
-    let mut h = harness(script, None);
+    let mut h = harness(script, None).await;
     h.online().await;
     h.send(Command::OpenChat(chat(1))).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -443,7 +448,7 @@ async fn open_with_slow_snapshots(h: &mut Harness) {
 /// never resurrected.
 #[tokio::test(start_paused = true)]
 async fn bootstrap_merges_updates_around_the_snapshots() {
-    let mut h = harness(FakeScript::demo(2, 10), None);
+    let mut h = harness(FakeScript::demo(2, 10), None).await;
     open_with_slow_snapshots(&mut h).await;
     h.internal.send(Internal::Wake).await.unwrap();
     h.until(rebuilding).await;
@@ -495,7 +500,7 @@ async fn bootstrap_merges_updates_around_the_snapshots() {
 
 #[tokio::test(start_paused = true)]
 async fn refresh_on_activation_and_every_five_minutes() {
-    let mut h = harness(FakeScript::demo(2, 10), None);
+    let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.online().await;
     h.send(Command::OpenChat(chat(1))).await;
     h.history(chat(1), HistoryDir::Tail).await;
@@ -562,7 +567,7 @@ fn send_settled(id: LocalId) -> impl Fn(&Event) -> bool {
 
 #[tokio::test(start_paused = true)]
 async fn pending_send_replays_with_the_same_random_id_across_a_rebuild() {
-    let mut h = harness(FakeScript::demo(1, 1), None);
+    let mut h = harness(FakeScript::demo(1, 1), None).await;
     h.online().await;
     h.fake.inject(Op::Send, Fault::Hang);
     h.send(Command::SendText {
@@ -592,7 +597,7 @@ async fn pending_send_replays_with_the_same_random_id_across_a_rebuild() {
 
 #[tokio::test(start_paused = true)]
 async fn discard_removes_failed_sends_but_not_in_flight_ones() {
-    let mut h = harness(FakeScript::demo(1, 1), None);
+    let mut h = harness(FakeScript::demo(1, 1), None).await;
     h.online().await;
     h.fake
         .inject(Op::Send, Fault::Error(BackendError::Rejected));
@@ -634,7 +639,7 @@ async fn discard_removes_failed_sends_but_not_in_flight_ones() {
 /// Cancellation must still stop it, including retiring the instance.
 #[tokio::test(start_paused = true)]
 async fn shutdown_completes_while_the_event_queue_is_full() {
-    let mut h = harness(FakeScript::demo(1, 1), None);
+    let mut h = harness(FakeScript::demo(1, 1), None).await;
     h.online().await;
     let fake = h.fake.clone();
     let pusher = tokio::spawn(async move {

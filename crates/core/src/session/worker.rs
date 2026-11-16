@@ -101,6 +101,10 @@ pub(crate) enum PersistMsg {
     DeleteCacheKey {
         reply: std::sync::mpsc::SyncSender<Result<(), StoreError>>,
     },
+    /// Async variant, for retrying a logout whose cache erase failed.
+    ForgetCacheKey {
+        reply: Reply<Result<(), StoreError>>,
+    },
 }
 
 impl std::fmt::Debug for PersistMsg {
@@ -234,6 +238,14 @@ impl PersistHandle {
             .unwrap_or(Err(CacheKeyError::Store(StoreError::Stopped)))
     }
 
+    /// Deletes the cache key from an async context (a logout retry after the
+    /// cache worker is gone). Succeeds when no key exists.
+    pub async fn delete_cache_key(&self) -> Result<(), StoreError> {
+        self.ask(|reply| PersistMsg::ForgetCacheKey { reply })
+            .await
+            .unwrap_or(Err(StoreError::Stopped))
+    }
+
     /// A `DeleteKey` callback for `CacheHandle::erase`. It runs on the cache
     /// worker thread and blocks it until this worker has deleted the key.
     /// Called on an async runtime thread it fails instead of blocking.
@@ -309,6 +321,9 @@ impl Worker {
                 drop(reply.send(result));
             }
             PersistMsg::DeleteCacheKey { reply } => {
+                drop(reply.send(delete_cache_key(&*self.store)));
+            }
+            PersistMsg::ForgetCacheKey { reply } => {
                 drop(reply.send(delete_cache_key(&*self.store)));
             }
         }

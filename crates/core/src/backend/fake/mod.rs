@@ -15,12 +15,16 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 
 use super::{
-    Backend, BackendError, Client, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance,
-    InstanceControl, Seed, SessionSeed, SessionSnapshot, StreamError, StreamItem, Update,
-    UpdateStream,
+    Account, AuthError, Backend, BackendError, CheckPassword, Client, DialogsCursor, DialogsPage,
+    HistoryPage, HistoryQuery, Instance, InstanceControl, PasswordChallenge, Seed, SessionSeed,
+    SessionSnapshot, SignIn, StreamError, StreamItem, Update, UpdateStream,
 };
+use crate::api::PasswordBuf;
 use crate::model::{Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey};
 use crate::rich_text::RichText;
+use crate::session::{AbyssSession, SessionSnapshot as AccountSnapshot};
+
+mod auth;
 
 /// Maximum faults queued per operation.
 const MAX_FAULTS: usize = 1024;
@@ -35,13 +39,25 @@ pub enum Op {
     History,
     Send,
     Read,
+    IsAuthorized,
+    RequestCode,
+    SignIn,
+    CheckPassword,
+    PasswordChallenge,
+    FetchSelf,
+    SignOut,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum Fault {
     Error(BackendError),
+    /// A login-specific error (data calls see it as `Rejected`).
+    Auth(AuthError),
     /// Never completes (a stalled transport).
     Hang,
+    /// The server applies the call, but the answer never arrives (an
+    /// ambiguous completion). Data calls just hang.
+    CompleteThenHang,
     /// Panics inside the call (a bug in the Telegram library).
     Panic,
     /// Succeeds after the given extra delay.
@@ -74,12 +90,52 @@ pub struct FakeScript {
     /// Per chat, ascending by id.
     pub history: HashMap<ChatId, Vec<Message>>,
     pub latency: Duration,
+    pub login: FakeLogin,
 }
 
+/// How the fake server answers a login.
+#[derive(Clone, Debug)]
+pub struct FakeLogin {
+    /// The code every `request_login_code` "sends".
+    pub code: String,
+    /// The 2FA password, if the account has one.
+    pub password: Option<String>,
+    pub hint: Option<String>,
+    /// The number has no account: `sign_in` answers `SignUpRequired`.
+    pub sign_up_required: bool,
+    pub display_name: String,
+}
+
+impl Default for FakeLogin {
+    fn default() -> Self {
+        Self {
+            code: FAKE_CODE.into(),
+            password: None,
+            hint: None,
+            sign_up_required: false,
+            display_name: "Fake User".into(),
+        }
+    }
+}
+
+/// The fake's login code.
+pub const FAKE_CODE: &str = "12345";
+/// The demo account's 2FA password (`FakeScript::demo`).
+pub const DEMO_PASSWORD: &str = "abyss";
+
 impl FakeScript {
-    /// A small demo account for running the app without credentials.
+    /// A small demo account for running the app without credentials. Its
+    /// login code is [`FAKE_CODE`] and its 2FA password [`DEMO_PASSWORD`].
     pub fn demo(chats: u32, messages_per_chat: u32) -> Self {
-        let mut script = FakeScript::default();
+        let mut script = FakeScript {
+            login: FakeLogin {
+                password: Some(DEMO_PASSWORD.into()),
+                hint: Some(format!("demo: {DEMO_PASSWORD}")),
+                display_name: "Demo User".into(),
+                ..FakeLogin::default()
+            },
+            ..FakeScript::default()
+        };
         for i in 1..=i64::from(chats) {
             let id = ChatId {
                 kind: if i % 3 == 0 {
@@ -166,6 +222,9 @@ struct State {
     seeds: Vec<Seed>,
     quit: Option<QuitBehavior>,
     runner: Option<mpsc::Sender<RunnerCmd>>,
+    /// The account's critical state, from `Backend::use_account`.
+    account: Option<crate::session::SessionSnapshot>,
+    auth: auth::ServerAuth,
 }
 
 #[derive(Debug)]
@@ -176,6 +235,7 @@ struct Shared {
     max_in_flight: AtomicUsize,
     runners_finished: AtomicUsize,
     retired: AtomicUsize,
+    revoked: AtomicUsize,
 }
 
 /// Test-side control of a running [`FakeBackend`].
@@ -198,6 +258,7 @@ impl FakeBackend {
             state: Mutex::new(State {
                 dialogs: script.dialogs,
                 history: script.history,
+                auth: auth::ServerAuth::new(script.login),
                 ..State::default()
             }),
             latency: script.latency,
@@ -205,6 +266,7 @@ impl FakeBackend {
             max_in_flight: AtomicUsize::new(0),
             runners_finished: AtomicUsize::new(0),
             retired: AtomicUsize::new(0),
+            revoked: AtomicUsize::new(0),
         });
         let handle = FakeHandle {
             shared: Arc::clone(&shared),
@@ -366,6 +428,11 @@ impl FakeHandle {
         self.shared.retired.load(Ordering::SeqCst)
     }
 
+    /// Instances whose session write token was revoked at retirement.
+    pub fn revoked(&self) -> usize {
+        self.shared.revoked.load(Ordering::SeqCst)
+    }
+
     /// `(chat, random_id)` of every send that reached the backend and succeeded.
     pub fn sent(&self) -> Vec<(ChatId, i64)> {
         self.shared.with(|s| s.sent.clone())
@@ -393,6 +460,10 @@ impl Backend for FakeBackend {
     type Updates = FakeUpdates;
     type Control = FakeControl;
 
+    fn use_account(&self, account: AccountSnapshot) {
+        self.shared.with(|s| s.account = Some(account));
+    }
+
     fn build(
         &self,
         seed: Seed,
@@ -408,20 +479,26 @@ impl FakeBackend {
             SessionSeed::Live(snapshot) => snapshot.rev(),
         };
         let (runner_tx, runner_rx) = mpsc::channel(4);
-        let fault = self.shared.with(|s| {
+        let (fault, account) = self.shared.with(|s| {
             push_capped(&mut s.seeds, seed);
             s.runner = Some(runner_tx);
-            s.build_faults.pop_front()
+            (s.build_faults.pop_front(), s.account.clone())
         });
         let baseline = match fault {
             Some(BuildFault::Fail(e)) => return Err(e),
             Some(BuildFault::NoBaseline) => false,
             None => true,
         };
+        // Like the real backend: a fresh session object over the account's
+        // critical cell, taking its write token.
+        let session = account
+            .and_then(|a| AbyssSession::from_snapshot(a).ok())
+            .map(Arc::new);
         let quit = Arc::new(Notify::new());
         Ok(Instance {
             client: FakeClient {
                 shared: Arc::clone(&self.shared),
+                session: session.clone(),
             },
             updates: FakeUpdates {
                 stream: Arc::clone(&self.stream),
@@ -436,6 +513,7 @@ impl FakeBackend {
                 shared: Arc::clone(&self.shared),
                 quit,
                 rev,
+                session,
             },
         })
     }
@@ -466,6 +544,7 @@ pub struct FakeControl {
     shared: Arc<Shared>,
     quit: Arc<Notify>,
     rev: u64,
+    session: Option<Arc<AbyssSession>>,
 }
 
 impl InstanceControl for FakeControl {
@@ -475,6 +554,11 @@ impl InstanceControl for FakeControl {
 
     fn retire(self) -> SessionSnapshot {
         self.shared.retired.fetch_add(1, Ordering::SeqCst);
+        if let Some(session) = &self.session
+            && session.revoke().is_ok()
+        {
+            self.shared.revoked.fetch_add(1, Ordering::SeqCst);
+        }
         // Simulates a critical write (e.g. a DC option) during the instance's life.
         SessionSnapshot::new(self.rev.saturating_add(1))
     }
@@ -507,28 +591,39 @@ impl UpdateStream for FakeUpdates {
 #[derive(Debug)]
 pub struct FakeClient {
     shared: Arc<Shared>,
+    /// This instance's session, when core provided an account.
+    session: Option<Arc<AbyssSession>>,
 }
 
 impl FakeClient {
-    /// Counts the call, applies latency, then any injected fault.
-    async fn enter(&self, op: Op) -> Result<InFlight<'_>, BackendError> {
-        let fault = self.shared.with(|s| {
+    /// Counts the call and takes its next injected fault.
+    fn take_fault(&self, op: Op) -> Option<Fault> {
+        self.shared.with(|s| {
             *s.calls.entry(op).or_default() += 1;
             s.faults.get_mut(&op).and_then(VecDeque::pop_front)
-        });
+        })
+    }
+
+    /// Counts the call, applies latency, then any injected fault. A revoked
+    /// session gets `Unauthorized`.
+    async fn enter(&self, op: Op) -> Result<InFlight<'_>, BackendError> {
+        let fault = self.take_fault(op);
         let guard = InFlight::new(&self.shared);
         if !self.shared.latency.is_zero() {
             tokio::time::sleep(self.shared.latency).await;
         }
         match fault {
-            None => Ok(guard),
-            Some(Fault::Delay(d)) => {
-                tokio::time::sleep(d).await;
-                Ok(guard)
-            }
-            Some(Fault::Error(e)) => Err(e),
-            Some(Fault::Hang) => std::future::pending().await,
+            None => {}
+            Some(Fault::Delay(d)) => tokio::time::sleep(d).await,
+            Some(Fault::Error(e)) => return Err(e),
+            Some(Fault::Auth(_)) => return Err(BackendError::Rejected),
+            Some(Fault::Hang | Fault::CompleteThenHang) => std::future::pending().await,
             Some(Fault::Panic) => injected_panic("call"),
+        }
+        if self.shared.with(|s| s.auth.authorized) {
+            Ok(guard)
+        } else {
+            Err(BackendError::Unauthorized)
         }
     }
 }
@@ -557,6 +652,47 @@ fn page(all: &[Message], query: HistoryQuery, limit: usize) -> HistoryPage {
 }
 
 impl Client for FakeClient {
+    type LoginToken = auth::FakeLoginToken;
+    type PasswordToken = auth::FakePasswordToken;
+
+    async fn is_authorized(&self) -> Result<bool, BackendError> {
+        self.auth_is_authorized().await
+    }
+
+    async fn request_login_code(&self, phone: &str) -> Result<Self::LoginToken, AuthError> {
+        self.auth_request_code(phone).await
+    }
+
+    async fn sign_in(
+        &self,
+        token: &Self::LoginToken,
+        code: &str,
+    ) -> Result<SignIn<Self::PasswordToken>, AuthError> {
+        self.auth_sign_in(token, code).await
+    }
+
+    async fn check_password(
+        &self,
+        token: Self::PasswordToken,
+        password: PasswordBuf,
+    ) -> Result<CheckPassword<Self::PasswordToken>, AuthError> {
+        self.auth_check_password(token, password).await
+    }
+
+    async fn password_challenge(
+        &self,
+    ) -> Result<PasswordChallenge<Self::PasswordToken>, AuthError> {
+        self.auth_challenge().await
+    }
+
+    async fn fetch_self(&self) -> Result<Account, BackendError> {
+        self.auth_fetch_self().await
+    }
+
+    async fn sign_out(&self) -> Result<(), BackendError> {
+        self.auth_sign_out().await
+    }
+
     async fn dialogs(
         &self,
         cursor: Option<DialogsCursor>,

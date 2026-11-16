@@ -70,6 +70,11 @@ impl EventReceiver {
         self.rx.recv().await.map(|(event, _permit)| event)
     }
 
+    /// Polls for the next event; `Ready(None)` once core has stopped.
+    pub fn poll_recv(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Event>> {
+        self.rx.poll_recv(cx).map(|item| item.map(|(event, _permit)| event))
+    }
+
     /// Takes an event if one is queued, without waiting.
     pub fn try_recv(&mut self) -> Option<Event> {
         self.rx.try_recv().ok().map(|(event, _permit)| event)

@@ -7,8 +7,11 @@
     reason = "test harness helpers are not #[test] items, so allow-*-in-tests does not cover them"
 )]
 
+mod auth;
 mod lifecycle;
+mod logout;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,8 +19,11 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{Actor, ActorInit, Internal};
-use crate::api::{Command, ConnState, Event, HistoryDir, SendState, UserError};
+use super::{Actor, ActorInit, CacheParts, Internal, open_cache};
+use crate::ShutdownReport;
+use crate::api::{AuthState, Command, ConnState, Event, HistoryDir, SendState, UserError};
+use crate::secret::{FaultControl, FaultyStore, MemoryStore, SecretItem, SecretStore};
+use crate::session::{PersistHandle, signed_in_blob};
 use crate::backend::fake::{FakeBackend, FakeHandle, FakeScript, Fault, Op, text_message};
 use crate::backend::{BackendError, Update};
 use crate::cache::{CacheHandle, CacheKey};
@@ -34,8 +40,14 @@ struct Harness {
     /// The actor's admission semaphore, observed while it runs.
     permits: Arc<Semaphore>,
     cancel: CancellationToken,
-    join: JoinHandle<()>,
+    join: JoinHandle<ShutdownReport>,
+    /// Shares storage with the persistence worker's store.
+    store: MemoryStore,
+    faults: FaultControl,
 }
+
+/// The self user of the seeded session (matches the fake server's).
+const SELF_ID: i64 = 777_000;
 
 fn chat(id: i64) -> ChatId {
     ChatId {
@@ -44,13 +56,61 @@ fn chat(id: i64) -> ChatId {
     }
 }
 
-fn harness(script: FakeScript, cache: Option<CacheHandle>) -> Harness {
+/// How the harness prepares storage before the actor starts.
+#[derive(Default)]
+struct Setup {
+    /// No stored session: the actor starts signed out.
+    signed_out: bool,
+    /// A cache handle opened by the test (no key bookkeeping).
+    cache: Option<CacheHandle>,
+    /// Open the cache here through the startup path (key from the store).
+    cache_dir: Option<PathBuf>,
+    /// Hold the store after the startup reads: every later write stalls.
+    hold_store: bool,
+}
+
+async fn harness(script: FakeScript, cache: Option<CacheHandle>) -> Harness {
     let (backend, fake) = FakeBackend::new(script);
-    harness_with(backend, fake, cache)
+    harness_with(backend, fake, cache).await
 }
 
 /// Starts an actor over a prepared fake (faults may be queued before the first build).
-fn harness_with(backend: FakeBackend, fake: FakeHandle, cache: Option<CacheHandle>) -> Harness {
+async fn harness_with(
+    backend: FakeBackend,
+    fake: FakeHandle,
+    cache: Option<CacheHandle>,
+) -> Harness {
+    let setup = Setup {
+        cache,
+        ..Setup::default()
+    };
+    start(backend, fake, setup).await
+}
+
+async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness {
+    let store = MemoryStore::new();
+    if !setup.signed_out {
+        store
+            .set(SecretItem::Session, &signed_in_blob(SELF_ID))
+            .unwrap();
+    }
+    let (faulty, faults) = FaultyStore::new(store.clone());
+    let persist = PersistHandle::spawn(faulty).unwrap();
+    let account = persist.load_session().await.unwrap().snapshot;
+    let (cache, cache_parts) = match setup.cache_dir {
+        Some(dir) => {
+            let (handle, key) = open_cache(&persist, dir.clone()).await.unwrap();
+            let parts = CacheParts {
+                dir,
+                key: Some(key),
+            };
+            (Some(handle), Some(parts))
+        }
+        None => (setup.cache, None),
+    };
+    if setup.hold_store {
+        faults.hold();
+    }
     let (cmd, cmd_rx) = mpsc::channel(256);
     let (internal, internal_rx) = mpsc::channel(8);
     let (events_tx, events) = events::channel();
@@ -62,6 +122,9 @@ fn harness_with(backend: FakeBackend, fake: FakeHandle, cache: Option<CacheHandl
         commands: cmd_rx,
         internal: internal_rx,
         cancel: cancel.clone(),
+        persist,
+        account,
+        cache_parts,
     });
     let permits = actor.admission.probe();
     let join = tokio::spawn(actor.run(channels));
@@ -73,6 +136,8 @@ fn harness_with(backend: FakeBackend, fake: FakeHandle, cache: Option<CacheHandl
         permits,
         cancel,
         join,
+        store,
+        faults,
     }
 }
 
@@ -116,9 +181,21 @@ impl Harness {
         std::iter::from_fn(|| self.events.try_recv()).collect()
     }
 
-    async fn stop(self) {
+    async fn stop(self) -> ShutdownReport {
         self.cancel.cancel();
-        self.join.await.unwrap();
+        self.join.await.unwrap()
+    }
+
+    /// Waits for an auth state matching `pred`.
+    async fn auth(&mut self, pred: impl Fn(&AuthState) -> bool) -> AuthState {
+        match self
+            .until(|e| matches!(e, Event::Auth(s) if pred(s)))
+            .await
+            .0
+        {
+            Event::Auth(s) => s,
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -131,7 +208,7 @@ fn history_ids(ev: &Event) -> Vec<i32> {
 
 #[tokio::test(start_paused = true)]
 async fn loads_dialogs_and_tail() {
-    let mut h = harness(FakeScript::demo(3, 120), None);
+    let mut h = harness(FakeScript::demo(3, 120), None).await;
     let (ev, _) = h.until(|e| matches!(e, Event::DialogsReset(_))).await;
     assert!(matches!(ev, Event::DialogsReset(v) if v.len() == 3));
     h.online().await;
@@ -147,7 +224,7 @@ async fn loads_dialogs_and_tail() {
 
 #[tokio::test(start_paused = true)]
 async fn commands_before_online_wait_for_the_bootstrap() {
-    let mut h = harness(FakeScript::demo(2, 10), None);
+    let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.send(Command::OpenChat(chat(1))).await;
     let ev = h.history(chat(1), HistoryDir::Tail).await;
     assert_eq!(history_ids(&ev).len(), 10);
@@ -159,7 +236,7 @@ async fn commands_before_online_wait_for_the_bootstrap() {
 async fn stale_completion_after_close_is_dropped() {
     let mut script = FakeScript::demo(3, 10);
     script.latency = Duration::from_secs(1);
-    let mut h = harness(script, None);
+    let mut h = harness(script, None).await;
     h.online().await;
     h.send(Command::OpenChat(chat(1))).await;
     h.send(Command::CloseChat(chat(1))).await;
@@ -178,7 +255,7 @@ async fn stale_completion_after_close_is_dropped() {
 
 #[tokio::test(start_paused = true)]
 async fn panic_in_backend_is_contained() {
-    let mut h = harness(FakeScript::demo(2, 10), None);
+    let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.fake.inject(Op::History, Fault::Panic);
     h.send(Command::OpenChat(chat(1))).await;
     h.until(|e| matches!(e, Event::Error(UserError::Internal)))
@@ -195,7 +272,7 @@ fn send_state(id: LocalId) -> impl Fn(&Event) -> bool {
 
 #[tokio::test(start_paused = true)]
 async fn send_retries_transient_with_same_random_id() {
-    let mut h = harness(FakeScript::demo(1, 1), None);
+    let mut h = harness(FakeScript::demo(1, 1), None).await;
     for _ in 0..2 {
         h.fake
             .inject(Op::Send, Fault::Error(BackendError::Transient));
@@ -222,7 +299,7 @@ async fn send_retries_transient_with_same_random_id() {
 
 #[tokio::test(start_paused = true)]
 async fn send_unknown_after_retries_then_manual_retry() {
-    let mut h = harness(FakeScript::demo(1, 1), None);
+    let mut h = harness(FakeScript::demo(1, 1), None).await;
     for _ in 0..3 {
         h.fake.inject(Op::Send, Fault::Hang);
     }
@@ -257,7 +334,7 @@ async fn send_unknown_after_retries_then_manual_retry() {
 
 #[tokio::test(start_paused = true)]
 async fn rejected_send_fails_and_empty_text_is_refused() {
-    let mut h = harness(FakeScript::demo(1, 1), None);
+    let mut h = harness(FakeScript::demo(1, 1), None).await;
     h.fake
         .inject(Op::Send, Fault::Error(BackendError::Rejected));
     h.send(Command::SendText {
@@ -294,7 +371,7 @@ async fn rejected_send_fails_and_empty_text_is_refused() {
 
 #[tokio::test(start_paused = true)]
 async fn live_messages_extend_open_window_and_bump_others() {
-    let mut h = harness(FakeScript::demo(2, 10), None);
+    let mut h = harness(FakeScript::demo(2, 10), None).await;
     h.until(|e| matches!(e, Event::DialogsReset(_))).await;
     h.send(Command::OpenChat(chat(1))).await;
     h.history(chat(1), HistoryDir::Tail).await;
@@ -323,7 +400,7 @@ async fn live_messages_extend_open_window_and_bump_others() {
 
 #[tokio::test(start_paused = true)]
 async fn mark_read_coalesces_per_flush() {
-    let h = harness(FakeScript::demo(1, 10), None);
+    let h = harness(FakeScript::demo(1, 10), None).await;
     for id in [3, 7, 5] {
         h.send(Command::MarkRead {
             chat: chat(1),
@@ -333,15 +410,6 @@ async fn mark_read_coalesces_per_flush() {
     }
     tokio::time::sleep(super::READ_FLUSH * 3).await;
     assert_eq!(h.fake.read_calls(), vec![(chat(1), MsgId(7))]);
-    h.stop().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn auth_commands_are_unsupported_for_now() {
-    let mut h = harness(FakeScript::default(), None);
-    h.send(Command::Logout).await;
-    h.until(|e| matches!(e, Event::Error(UserError::Unsupported)))
-        .await;
     h.stop().await;
 }
 
@@ -364,7 +432,7 @@ async fn open_settled(h: &mut Harness, cache: &CacheHandle) {
 
 /// Opens chat 1, scrolls up `older` pages, then stops and flushes the cache.
 async fn session(script: FakeScript, cache: CacheHandle, older: usize) -> FakeHandle {
-    let mut h = harness(script, Some(cache.clone()));
+    let mut h = harness(script, Some(cache.clone())).await;
     open_settled(&mut h, &cache).await;
     for _ in 0..older {
         h.send(Command::LoadOlder(chat(1))).await;
@@ -384,7 +452,7 @@ async fn cache_serves_history_offline_then_reconciles() {
 
     // Second run: the server hangs, so only the cache can answer.
     let cache = cache_at(dir.path(), &key);
-    let mut h = harness(FakeScript::demo(1, 200), Some(cache.clone()));
+    let mut h = harness(FakeScript::demo(1, 200), Some(cache.clone())).await;
     h.fake.inject(Op::History, Fault::Hang);
     h.send(Command::OpenChat(chat(1))).await;
     let ev = h.history(chat(1), HistoryDir::Tail).await;
@@ -430,7 +498,7 @@ async fn contiguous_cache_serves_older_pages_without_the_server() {
     session(FakeScript::demo(1, 300), cache_at(dir.path(), &key), 3).await;
 
     let cache = cache_at(dir.path(), &key);
-    let mut h = harness(FakeScript::demo(1, 300), Some(cache.clone()));
+    let mut h = harness(FakeScript::demo(1, 300), Some(cache.clone())).await;
     open_settled(&mut h, &cache).await;
     let server_calls = h.fake.calls(Op::History);
     h.send(Command::LoadOlder(chat(1))).await;
@@ -495,7 +563,7 @@ async fn cached_chat_list_keeps_every_loaded_page() {
     let dir = tempfile::tempdir().unwrap();
     let key = CacheKey::generate().unwrap();
     let cache = cache_at(dir.path(), &key);
-    let mut h = harness(FakeScript::demo(150, 1), Some(cache.clone()));
+    let mut h = harness(FakeScript::demo(150, 1), Some(cache.clone())).await;
     h.until(|e| matches!(e, Event::DialogsReset(_))).await;
     h.send(Command::LoadDialogs).await;
     let (ev, _) = h.until(|e| matches!(e, Event::DialogsAppended(_))).await;

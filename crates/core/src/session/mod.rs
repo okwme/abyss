@@ -35,6 +35,19 @@ use cell::Cell;
 use critical::Refused;
 use peers::PeerMap;
 
+/// An encoded critical state of a signed-in account (self user `self_id`, no
+/// auth keys), for seeding a store in tests and fake runs.
+#[cfg(any(test, feature = "fake"))]
+pub fn signed_in_blob(self_id: i64) -> zeroize::Zeroizing<Vec<u8>> {
+    let mut state = critical::CriticalState::default();
+    state.self_user = Some(critical::SelfUser {
+        id: self_id,
+        access_hash: 1,
+        bot: false,
+    });
+    critical::encode(&state).unwrap_or_default()
+}
+
 /// Error returned to grammers from session calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionError {
