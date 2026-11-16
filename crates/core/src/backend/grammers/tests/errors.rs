@@ -47,18 +47,8 @@ fn rpc_error_table() {
             B::FloodWait { seconds: 10 },
             S::Transient,
         ),
-        (303, "USER_MIGRATE", Some(4), B::Migrated, S::Fatal),
-        (303, "NETWORK_MIGRATE", Some(2), B::Migrated, S::Fatal),
-        (
-            401,
-            "AUTH_KEY_UNREGISTERED",
-            None,
-            B::Unauthorized,
-            S::Fatal,
-        ),
-        (401, "SESSION_REVOKED", None, B::Unauthorized, S::Fatal),
-        (401, "USER_DEACTIVATED_BAN", None, B::Unauthorized, S::Fatal),
-        (406, "AUTH_KEY_DUPLICATED", None, B::Unauthorized, S::Fatal),
+        (303, "USER_MIGRATE", Some(4), B::Migrated, S::Migrated),
+        (303, "NETWORK_MIGRATE", Some(2), B::Migrated, S::Migrated),
         (500, "RPC_CALL_FAIL", None, B::Transient, S::Transient),
         (
             500,
@@ -81,6 +71,24 @@ fn rpc_error_table() {
     ];
     for &(code, name, value, backend, stream) in table {
         check(&rpc(code, name, value), backend, stream);
+    }
+}
+
+/// Auth loss keeps its cause across the stream boundary, so core runs the
+/// local logout instead of rebuilding.
+#[test]
+fn auth_loss_error_table() {
+    for (code, name) in [
+        (401, "AUTH_KEY_UNREGISTERED"),
+        (401, "SESSION_REVOKED"),
+        (401, "USER_DEACTIVATED_BAN"),
+        (406, "AUTH_KEY_DUPLICATED"),
+    ] {
+        check(
+            &rpc(code, name, None),
+            BackendError::Unauthorized,
+            StreamError::Unauthorized,
+        );
     }
 }
 

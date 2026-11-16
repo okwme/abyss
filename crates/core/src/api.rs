@@ -49,6 +49,12 @@ pub enum Command {
         chat: ChatId,
         max_id: MsgId,
     },
+    /// The chat whose live tail is on screen: the open chat, scrolled to its
+    /// newest message. `None` when scrolled up or no chat is shown. Together
+    /// with `Window(Active)`, this alone suppresses the unread increment for
+    /// incoming messages; until the app sends it, every incoming message
+    /// counts as unread and is cleared by `MarkRead`.
+    ViewingTail(Option<ChatId>),
     /// Signs out: remote `auth.logOut`, then local deletion of the session
     /// item and the cache (plan sections 5, 16). While signed out, it retries
     /// the local deletion only.
@@ -81,6 +87,7 @@ impl std::fmt::Debug for Command {
                 .field("chat", chat)
                 .field("max_id", max_id)
                 .finish(),
+            Self::ViewingTail(c) => f.debug_tuple("ViewingTail").field(c).finish(),
             Self::Logout => f.write_str("Logout"),
         }
     }
@@ -120,6 +127,12 @@ pub enum SendState {
         attempts: u8,
     },
     Failed,
+    /// The server asked to wait (`FLOOD_WAIT`): not sent. Core resends it with
+    /// the same `random_id` once `seconds` (counted from this event) have
+    /// passed; it can be discarded meanwhile.
+    FloodWait {
+        seconds: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,7 +195,15 @@ pub enum Event {
     /// Chats a later page added or changed: the UI updates listed chats in
     /// place and appends new ones.
     DialogsAppended(Vec<ChatSummary>),
-    /// A chat's summary changed (new message, unread count).
+    /// Whether more dialogs pages can be loaded (`LoadDialogs`), after every
+    /// applied dialogs page. A refreshed first page restarts pagination, so
+    /// this can turn `true` again after a `false`.
+    DialogsPaging {
+        has_more: bool,
+    },
+    /// A chat's summary changed (new message, unread count). A new message
+    /// moves an unpinned chat to the top of the unpinned section exactly when
+    /// `last_id` grew; read-state changes keep `last_id`.
     ChatBumped(ChatSummary),
     History {
         chat: ChatId,
@@ -196,6 +217,16 @@ pub enum Event {
         has_more: bool,
     },
     ChatInvalidated(ChatId),
+    /// The server's tail of `chat` was applied to `view` (open, bootstrap,
+    /// gap or light refresh), after the `History`/`Deleted`/`Edited` events
+    /// it caused. Everything in the window up to `newest` is now the server's
+    /// truth: echoes of sends at or below `newest` are in it (or were
+    /// deleted), and `SentUnconfirmed` echoes of this chat can be dropped.
+    Reconciled {
+        chat: ChatId,
+        view: ViewGen,
+        newest: Option<MsgId>,
+    },
     Edited(Message),
     Deleted {
         chat: ChatId,

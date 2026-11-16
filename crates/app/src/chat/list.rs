@@ -157,6 +157,7 @@ mod tests {
             unread_mentions: 0,
             last: None,
             last_date: 0,
+            last_id: None,
             can_send: true,
         }
     }
@@ -172,6 +173,7 @@ mod tests {
         ChatSummary {
             last: Some(Preview::Text("hi".into())),
             last_date: date,
+            last_id: None,
             ..chat(n)
         }
     }

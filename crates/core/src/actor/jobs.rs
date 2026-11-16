@@ -30,6 +30,21 @@ pub(super) const STREAM_RETRY: [Duration; 3] = [
     Duration::from_secs(2),
 ];
 
+/// Identity of one history load, unique per actor. A bootstrap snapshot is
+/// tracked by `(chat, ReqId)`, independent of the view it fills, so it always
+/// completes even when its view went stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ReqId(pub(super) u64);
+
+/// One history load (cache read and/or server call): its chat, the view it
+/// fills, and its identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Load {
+    pub(super) chat: ChatId,
+    pub(super) view: ViewGen,
+    pub(super) req: ReqId,
+}
+
 /// A backend call waiting for admission.
 #[derive(Debug)]
 pub(super) enum Job {
@@ -37,10 +52,13 @@ pub(super) enum Job {
         cursor: Option<DialogsCursor>,
     },
     History {
-        chat: ChatId,
-        view: ViewGen,
+        load: Load,
         dir: HistoryDir,
         query: HistoryQuery,
+        /// For tails: the newest id the window held when the request was
+        /// made. The server's answer is authoritative up to it; anything
+        /// newer in the window arrived later (a live update).
+        floor: Option<MsgId>,
     },
     Send {
         local_id: LocalId,
@@ -89,10 +107,10 @@ pub(super) enum Outcome {
         res: CallResult<DialogsPage>,
     },
     History {
-        chat: ChatId,
-        view: ViewGen,
+        load: Load,
         dir: HistoryDir,
         query: HistoryQuery,
+        floor: Option<MsgId>,
         res: CallResult<HistoryPage>,
     },
     Send {
@@ -102,8 +120,7 @@ pub(super) enum Outcome {
     Read(CallResult<()>),
     CacheChats(Option<Vec<ChatSummary>>),
     CacheHistory {
-        chat: ChatId,
-        view: ViewGen,
+        load: Load,
         dir: HistoryDir,
         anchor: Option<MsgId>,
         messages: Option<Vec<Message>>,
@@ -123,7 +140,7 @@ pub(super) struct Done {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TaskKind {
     Dialogs,
-    History(ChatId),
+    History(Load),
     Send(LocalId),
     Read,
     CacheChats,
@@ -208,20 +225,20 @@ pub(super) fn job_future<C: Client>(
             (TaskKind::Dialogs, Box::pin(fut))
         }
         Job::History {
-            chat,
-            view,
+            load,
             dir,
             query,
+            floor,
         } => {
-            let call = async move { client.history(chat, query, PAGE).await };
+            let call = async move { client.history(load.chat, query, PAGE).await };
             let fut = admitted.run(call, move |res| Outcome::History {
-                chat,
-                view,
+                load,
                 dir,
                 query,
+                floor,
                 res,
             });
-            (TaskKind::History(chat), Box::pin(fut))
+            (TaskKind::History(load), Box::pin(fut))
         }
         Job::Send {
             local_id,
@@ -246,11 +263,11 @@ pub(super) fn job_future<C: Client>(
 pub(super) async fn cache_history(
     cache: CacheHandle,
     cgen: ClientGen,
-    chat: ChatId,
-    view: ViewGen,
+    load: Load,
     dir: HistoryDir,
     anchor: Option<MsgId>,
 ) -> Done {
+    let chat = load.chat;
     let res = match (dir, anchor) {
         (HistoryDir::Older, Some(id)) => cache.before(chat, id, PAGE).await,
         (HistoryDir::Newer, Some(id)) => cache.after(chat, id, PAGE).await,
@@ -260,8 +277,7 @@ pub(super) async fn cache_history(
         cgen,
         parked: None,
         outcome: Outcome::CacheHistory {
-            chat,
-            view,
+            load,
             dir,
             anchor,
             messages: res.ok(),

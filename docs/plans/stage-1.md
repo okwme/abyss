@@ -707,6 +707,49 @@ Open items:
 - **11:** a signed-out grammers instance must not need an update consumer (core consumes updates only after login); confirm grammers creates the stream lazily.
 - **12:** live checks of login (2FA, flood, expired code), logout ordering against the real Keychain, and shutdown reports.
 
+**Task 4b status (2026-11-16): review fixes to the core actor, done against the fake.** Regression tests are in `crates/core/src/actor/tests/review4b.rs` unless noted; each fails on the old code.
+1. **Bootstrap deadlock on reopening the tail chat (HIGH).** History loads now carry `Load { chat, view, req: ReqId }`. Boot tail snapshots are keyed by `(chat, ReqId)`, not by view, so reopening the chat during bootstrap claims the new load and drops the superseded queued job. `accepts_tail` bounds the claimed set to `MAX_WINDOWS`. Test: `reopening_the_tail_chat_during_bootstrap_still_goes_online`.
+2. **Refresh never removed deleted newest messages.** A tail request records a floor (the window's newest id at request time). The reply's authoritative top is `max(page newest, floor)`, and `tail_diff` deletes every window id in `[page oldest, top]` that the page lacks. An empty page against a non-empty window now deletes everything up to the floor; only an empty window counts as a gap. The cached bootstrap (cache tail first, then server tail) goes through the same path. Tests: `refresh_removes_a_deleted_newest_message_and_empty_history`, `cached_newest_message_deleted_on_the_server_is_dropped`, plus `merge.rs` unit tests `deleted_newest_message_is_removed` and `empty_server_history_removes_everything_requested`.
+3. **Replay suppression keyed on timestamps.** `ChatSummary` gained `last_id` (grammers: `top_message`). The boot snapshot records each chat's top id, and replay drops a buffered message only if its id is at most that top. `Dialogs::bump` takes a `Last { id, date, preview }` and returns `Bump::Reflected` when the known `last_id` is not older. Cache schema bumped to 3 (the `chats` table is dropped on upgrade, since rows lack `last_id`). Tests: `same_second_message_during_bootstrap_still_bumps_and_counts`, `dialogs::same_second_messages_are_ordered_by_id`, `cache::version_2_chat_list_is_dropped_on_upgrade`.
+4. **`contiguous` grew unbounded.** The set is gone. Cache contiguity is a flag on each `Window` (`cache_contiguous`), cleared on open, close and invalidation, so it is bounded by `MAX_WINDOWS`. Test: `windows::cache_contiguity_is_bounded_by_the_windows`.
+5. **Migrated and FloodWait sends stranded as Failed.** FloodWait refunds the attempt, holds the send with a `retry_at` deadline (new `SendState::FloodWait { seconds }`), and the run loop resends it when due with the same `random_id`. Migrated refunds the attempt, keeps the send `Sending`, emits `Error(AccountMigrated)`, and replays it once the rebuilt instance is online. Tests: `flood_wait_send_is_held_then_resent_with_the_same_random_id`, `migrated_send_replays_after_the_rebuild`.
+6. **Lost answers.** The fake now dedups sends by `random_id` (a resend of an accepted id answers `SentUnconfirmed`), and `Fault::CompleteThenHang` on a send accepts it and then hangs. Test `lost_answer_gives_one_message_and_the_cap_holds_across_rebuilds` asserts exactly one server message and the 3-attempt cap across rebuilds.
+7. **Untyped stream errors.** `StreamError` gained `Unauthorized` (core runs the local logout, as for any `Unauthorized`) and `Migrated` (core applies the migration policy: `Error(AccountMigrated)`, then a rebuild with `Reason::Migrated`). Mapped in grammers `errors.rs` (303 → `Migrated`; 401 and `AUTH_KEY_DUPLICATED` → `Unauthorized`) and injectable in the fake. Tests: `stream_auth_loss_runs_the_local_logout`, `stream_migration_applies_the_migration_policy`, grammers `auth_loss_error_table`.
+8. **`updateMessageID` not correlated.** New `Update::MessageId { random_id, id }` (grammers maps `UpdateMessageId` with a non-zero id and random id). Core resolves it against the pending-send table, or against a bounded ring (256) of `SentUnconfirmed` sends, and emits `Sent { id }`. Whichever of the stream or the RPC answer arrives first wins; the other is a no-op. Tests: `stream_message_id_confirms_a_send_before_its_answer`, `stream_message_id_resolves_a_sent_unconfirmed_send`.
+9. **Stale terminal dialogs cursor.** A refreshed first page always replaces the cursor, so pages loaded after a refresh continue from the server's current list. Rewritten test: `refresh_merges_the_first_page_into_loaded_pages` (a newcomer inserted mid-list is found on the next pages).
+10. **Unread suppression ignored visibility.** A message counts as unread unless the tail is on screen: the window is active, attached and open, and the app has said `ViewingTail(Some(chat))`. Test: `unread_counts_unless_the_tail_is_on_screen`.
+11. **A reopened view started empty.** `OpenChat` on a retained window emits the whole window as a `Tail` under the new view before any load. Test: `reopening_a_retained_chat_shows_it_at_once`.
+12. **A short cache page declared the live tail.** Cache pages always report `has_more: true`. A short page (Older empty, Newer below a full page) chains a server fetch from its edge and does not mark the window contiguous with the server. Test: `short_cached_newer_page_does_not_claim_the_live_tail`.
+13. **App signals.** `Event::Reconciled { chat, view, newest }` after every authoritative tail merge, and `ChatSummary::last_id` in `DialogsReset`/`DialogsAppended`/`ChatBumped`.
+
+**Peer retention (add-on).** `Client::retain_peers(&self, required: &[ChatId])`, a default no-op. Core calls it after each pump, only when the account instance changed or the inputs changed (revision counters on sends, windows and dialogs), and only when the resulting set differs. Order: chats with pending sends (by `LocalId`), then open windows (most recent first), then retained dialogs in list order; deduplicated and bounded by `MAX_PINNED_PEERS` (1264). The fake records the last set (`FakeHandle::retained_peers`). Test: `retained_peers_follow_sends_windows_and_dialogs_at_capacity`. `backend/grammers/pins.rs` is unchanged; **11c** should make the grammers pin tracker pin exactly this set.
+
+API and event changes (all additive):
+- `Command::ViewingTail(Option<ChatId>)`.
+- `SendState::FloodWait { seconds }`.
+- `Event::Reconciled { chat, view, newest: Option<MsgId> }`.
+- `Event::DialogsPaging { has_more }`, after every dialogs page.
+- `ChatSummary::last_id: Option<MsgId>`; the `ChatBumped` doc now says a chat moves exactly when `last_id` grew.
+- Backend: `Update::MessageId`, `StreamError::{Unauthorized, Migrated}`, `Client::retain_peers`.
+- Store: `Last`, `Bump::Reflected`, `Window::cache_contiguous`, and `rev()` on `Dialogs` and `Windows`.
+- Fake: dedup by `random_id`, `CompleteThenHang` for sends, and `FakeHandle::{accepted, server_history, retained_peers, edit_dialogs}`.
+
+App obligations for **10b** (the app currently compiles, ignores `Reconciled` and `DialogsPaging`, and labels `FloodWait`):
+- Send `ViewingTail(Some(chat))` while the open chat is scrolled to its newest message, and `ViewingTail(None)` when it scrolls away, loses the window's focus, or closes. Without it, every incoming message counts as unread.
+- Reconcile optimistic echoes on `Reconciled` for the current view, not on view resets. A `Sending`/`SentUnconfirmed` echo whose id is at most `newest` and is not in the window was lost or deleted.
+- Order and compare dialogs by `last_id` (fall back to `last_date` when `None`), not by date alone.
+- Drive the "load more dialogs" state from `DialogsPaging { has_more }` instead of list length.
+- Show `FloodWait { seconds }` as a waiting echo, keep Discard enabled for it, and expect `Sending`/`Sent` to follow without user action.
+- Expect a full `Tail` right after `OpenChat` of a retained chat; replace the view rather than appending.
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (240 core, 3 ignored; 97 app), the actor tests repeated 10 times without a failure. The repeats exposed a race in the task 6 test `logout::shutdown_reports_confirmed_when_saved` (the startup session check could emit its signed-in state before `Online`, and the test waited for it only afterwards, so it hung); the test now accepts either order. No gpui in `cargo tree -p abyss-core`.
+
+Open items:
+- Logout resets `Windows` to default, which restarts the `ViewGen` counters. Views from before the logout are stale anyway, but a monotonic counter would be safer.
+- **11c:** switch the grammers pin tracker to `retain_peers`.
+- An echo in `SentUnconfirmed` can be dropped by a `Reconciled` whose tail was requested before the send was accepted. 10b should keep `SentUnconfirmed` echoes until a later `Reconciled` or a `Sent`.
+- The fake does not push `updateMessageID` on its own; tests inject it. 12 should check the ordering against a live server.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.

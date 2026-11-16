@@ -287,3 +287,31 @@ fn byte_accounting_is_exact_after_mixed_ops() {
         .sum();
     assert_eq!(w.total_bytes(), expected);
 }
+
+/// Cache contiguity lives on the window: it is bounded by `MAX_WINDOWS` and
+/// gone with eviction, close, reopen and invalidation (it used to be an
+/// unbounded per-chat set in the actor).
+#[test]
+fn cache_contiguity_is_bounded_by_the_windows() {
+    let mut w = Windows::default();
+    let max = i64::try_from(MAX_WINDOWS).unwrap();
+    for id in 1..=max * 4 {
+        w.open(user(id));
+        w.set_cache_contiguous(user(id));
+    }
+    let marked = (1..=max * 4)
+        .filter(|id| w.is_cache_contiguous(user(*id)))
+        .count();
+    assert_eq!(marked, MAX_WINDOWS, "evicted windows took their flag along");
+    let c = user(max * 4);
+    w.close(c);
+    assert!(!w.is_cache_contiguous(c));
+    w.set_cache_contiguous(c);
+    w.open(c);
+    assert!(!w.is_cache_contiguous(c), "a reopen re-establishes it");
+    w.set_cache_contiguous(c);
+    w.invalidate(c);
+    assert!(!w.is_cache_contiguous(c));
+    w.set_cache_contiguous(user(1));
+    assert!(!w.is_cache_contiguous(user(1)), "no window, no flag");
+}

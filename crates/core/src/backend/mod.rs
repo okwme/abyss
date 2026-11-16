@@ -77,6 +77,12 @@ pub enum Update {
         chat: ChatId,
         still_unread: u32,
     },
+    /// `updateMessageID`: the server assigned `id` to the send carrying
+    /// `random_id` (plan section 9). Correlated with the pending-send table.
+    MessageId {
+        random_id: i64,
+        id: MsgId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +125,12 @@ pub enum StreamError {
     Transient,
     /// The stream is unusable; core rebuilds the instance.
     Fatal,
+    /// The authorization is gone (`AUTH_KEY_UNREGISTERED`, `SESSION_REVOKED`):
+    /// core runs the local logout instead of rebuilding.
+    Unauthorized,
+    /// An authenticated `303`: core applies the migration policy (rebuild
+    /// once, then ask for a new sign-in; plan section 2, risk 6).
+    Migrated,
 }
 
 /// Why a login call failed (plan section 4, "Error mapping").
@@ -261,6 +273,15 @@ pub trait Client: Send + Sync + 'static {
         chat: ChatId,
         max_id: MsgId,
     ) -> impl Future<Output = Result<(), BackendError>> + Send;
+
+    /// The chats whose peer data (access hashes) core still needs: pending
+    /// sends first, then open windows, then the retained dialogs in list
+    /// order; deduplicated and at most `session::MAX_PINNED_PEERS`. Core calls
+    /// it, coalesced, whenever that set changes and once per new instance; a
+    /// backend keeps exactly these peers pinned. Must not block.
+    fn retain_peers(&self, required: &[ChatId]) {
+        let _ = required;
+    }
 }
 
 /// An instance's live updates. The first `next` call must start establishing

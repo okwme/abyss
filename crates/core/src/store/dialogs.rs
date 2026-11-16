@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::model::{ChatId, ChatSummary, Preview};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview};
 
 /// Maximum number of dialogs held.
 pub const MAX_DIALOGS: usize = 1000;
@@ -12,6 +12,8 @@ pub const MAX_DIALOGS: usize = 1000;
 #[derive(Debug, Default)]
 pub struct Dialogs {
     list: Vec<ChatSummary>,
+    /// Bumped by every call that can change which chats are listed.
+    rev: u64,
 }
 
 /// What a new message did to the chat list.
@@ -21,6 +23,27 @@ pub enum Bump {
     Updated(ChatSummary),
     /// The chat is not in the loaded list. Callers decide whether to fetch it.
     Unknown,
+    /// The chat already reflects this message (its `last_id` is not older).
+    Reflected,
+}
+
+/// The newest message of a chat, as a bump records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Last {
+    pub id: MsgId,
+    /// Unix seconds.
+    pub date: i64,
+    pub preview: Preview,
+}
+
+impl Last {
+    pub fn of(m: &Message) -> Self {
+        Self {
+            id: m.id,
+            date: m.date,
+            preview: Preview::of(m),
+        }
+    }
 }
 
 /// Whether more dialogs pages follow the one being applied.
@@ -100,6 +123,7 @@ impl Dialogs {
     /// Applies a later page in server order: chats already listed are updated
     /// in place, new ones are appended. Returns the chats added or changed.
     pub fn append(&mut self, chats: Vec<ChatSummary>) -> Vec<ChatSummary> {
+        self.rev = self.rev.wrapping_add(1);
         let mut changed = Vec::new();
         for chat in chats {
             if let Some(slot) = self.list.iter_mut().find(|c| c.id == chat.id) {
@@ -115,7 +139,14 @@ impl Dialogs {
         changed
     }
 
+    /// Changes whenever the set of listed chats may have changed (not on
+    /// bumps or unread changes, which only reorder or update rows).
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
     fn extend(&mut self, chats: Vec<ChatSummary>) {
+        self.rev = self.rev.wrapping_add(1);
         for chat in chats {
             if self.list.len() >= MAX_DIALOGS {
                 break;
@@ -126,15 +157,26 @@ impl Dialogs {
         }
     }
 
-    /// Records a new message in `chat`: updates the preview, date and unread
-    /// count, and moves an unpinned chat to the top of the unpinned section.
-    pub fn bump(&mut self, chat: ChatId, preview: Preview, date: i64, unread: Unread) -> Bump {
+    /// Records a new message in `chat`: updates the preview, date, last id and
+    /// unread count, and moves an unpinned chat to the top of the unpinned
+    /// section. A message not newer than the chat's known `last_id` (already
+    /// reflected, by id rather than by timestamp) changes nothing.
+    pub fn bump(&mut self, chat: ChatId, last: Last, unread: Unread) -> Bump {
         let Some(pos) = self.list.iter().position(|c| c.id == chat) else {
             return Bump::Unknown;
         };
+        if self
+            .list
+            .get(pos)
+            .and_then(|c| c.last_id)
+            .is_some_and(|known| known >= last.id)
+        {
+            return Bump::Reflected;
+        }
         let mut summary = self.list.remove(pos);
-        summary.last = Some(preview);
-        summary.last_date = summary.last_date.max(date);
+        summary.last = Some(last.preview);
+        summary.last_date = summary.last_date.max(last.date);
+        summary.last_id = Some(last.id);
         if unread == Unread::Increment {
             summary.unread = summary.unread.saturating_add(1);
         }
@@ -177,6 +219,7 @@ mod tests {
             unread_mentions: 0,
             last: None,
             last_date: 0,
+            last_id: None,
             can_send: true,
         }
     }
@@ -192,11 +235,38 @@ mod tests {
         d.as_slice().iter().map(|c| c.id.id).collect()
     }
 
+    /// A message with id `n` sent at second 0 (dates collide on purpose).
+    fn last(n: i32) -> Last {
+        Last {
+            id: MsgId(n),
+            date: 0,
+            preview: Preview::Service,
+        }
+    }
+
+    #[test]
+    fn same_second_messages_are_ordered_by_id() {
+        let mut d = Dialogs::default();
+        d.reset(vec![chat(1), chat(2)]);
+        assert!(matches!(
+            d.bump(id(2), last(10), Unread::Increment),
+            Bump::Updated(ref s) if s.last_id == Some(MsgId(10))
+        ));
+        // Same timestamp, newer id: a new message, counted.
+        assert!(matches!(
+            d.bump(id(2), last(11), Unread::Increment),
+            Bump::Updated(ref s) if s.unread == 2 && s.last_id == Some(MsgId(11))
+        ));
+        // Already reflected: nothing changes, nothing is counted twice.
+        assert_eq!(d.bump(id(2), last(11), Unread::Increment), Bump::Reflected);
+        assert_eq!(d.get(id(2)).map(|c| c.unread), Some(2));
+    }
+
     #[test]
     fn bump_moves_unpinned_below_pinned() {
         let mut d = Dialogs::default();
         d.reset(vec![pinned(1), pinned(2), chat(3), chat(4)]);
-        let r = d.bump(id(4), Preview::Service, 10, Unread::Increment);
+        let r = d.bump(id(4), last(10), Unread::Increment);
         assert!(matches!(r, Bump::Updated(ref s) if s.unread == 1));
         assert_eq!(ids(&d), vec![1, 2, 4, 3]);
     }
@@ -205,17 +275,14 @@ mod tests {
     fn bump_keeps_pinned_position() {
         let mut d = Dialogs::default();
         d.reset(vec![pinned(1), pinned(2), chat(3)]);
-        d.bump(id(2), Preview::Service, 10, Unread::Unchanged);
+        d.bump(id(2), last(10), Unread::Unchanged);
         assert_eq!(ids(&d), vec![1, 2, 3]);
     }
 
     #[test]
     fn unknown_chat_is_reported() {
         let mut d = Dialogs::default();
-        assert_eq!(
-            d.bump(id(9), Preview::Service, 0, Unread::Increment),
-            Bump::Unknown
-        );
+        assert_eq!(d.bump(id(9), last(0), Unread::Increment), Bump::Unknown);
     }
 
     #[test]
@@ -290,7 +357,7 @@ mod tests {
         let mut c = chat(1);
         c.unread = u32::MAX;
         d.reset(vec![c]);
-        d.bump(id(1), Preview::Service, 0, Unread::Increment);
+        d.bump(id(1), last(0), Unread::Increment);
         assert_eq!(d.as_slice()[0].unread, u32::MAX);
     }
 }

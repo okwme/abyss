@@ -43,6 +43,11 @@ pub struct Window {
     /// Newer history exists outside the window: the window does not reach the
     /// live tail, so live messages are not appended to it.
     has_newer: bool,
+    /// The chat's disk cache is known to be contiguous with the live tail
+    /// (set once a server tail was written through), so older and newer pages
+    /// may be served from it. Lives and dies with the window, so it is bounded
+    /// by [`MAX_WINDOWS`]; cleared on reopen and invalidation.
+    cache_contiguous: bool,
 }
 
 impl Window {
@@ -53,7 +58,12 @@ impl Window {
             bytes: 0,
             has_older: true,
             has_newer: false,
+            cache_contiguous: false,
         }
+    }
+
+    pub fn cache_contiguous(&self) -> bool {
+        self.cache_contiguous
     }
 
     fn reset(&mut self, view_gen: ViewGen) {
@@ -127,9 +137,16 @@ pub struct Windows {
     next_gen: u64,
     bytes: usize,
     account_index: HashMap<MsgId, ChatId>,
+    /// Bumped whenever the set or recency order of windowed chats changes.
+    rev: u64,
 }
 
 impl Windows {
+    /// Changes whenever [`Windows::chats`] may have changed.
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
     pub fn get(&self, chat: ChatId) -> Option<&Window> {
         self.by_chat.get(&chat)
     }
@@ -147,12 +164,16 @@ impl Windows {
     /// generation that history completions for this view must carry.
     pub fn open(&mut self, chat: ChatId) -> ViewGen {
         let view_gen = self.bump_gen();
-        self.by_chat
+        let w = self
+            .by_chat
             .entry(chat)
-            .or_insert_with(|| Window::new(view_gen))
-            .view_gen = view_gen;
+            .or_insert_with(|| Window::new(view_gen));
+        w.view_gen = view_gen;
+        // Re-established by the tail this opening fetches.
+        w.cache_contiguous = false;
         self.lru.retain(|c| *c != chat);
         self.lru.push(chat);
+        self.rev = self.rev.wrapping_add(1);
         while self.lru.len() > MAX_WINDOWS {
             let evicted = self.lru.remove(0);
             self.drop_window(evicted);
@@ -166,7 +187,23 @@ impl Windows {
         let view_gen = self.bump_gen();
         if let Some(w) = self.by_chat.get_mut(&chat) {
             w.view_gen = view_gen;
+            w.cache_contiguous = false;
         }
+    }
+
+    /// Marks `chat`'s disk cache as contiguous with the live tail (see
+    /// [`Window::cache_contiguous`]). No-op without a window.
+    pub fn set_cache_contiguous(&mut self, chat: ChatId) {
+        if let Some(w) = self.by_chat.get_mut(&chat) {
+            w.cache_contiguous = true;
+        }
+    }
+
+    /// Whether `chat` has a window whose disk cache is contiguous.
+    pub fn is_cache_contiguous(&self, chat: ChatId) -> bool {
+        self.by_chat
+            .get(&chat)
+            .is_some_and(Window::cache_contiguous)
     }
 
     /// Clears all messages of `chat` in place (keeping its LRU position) and
@@ -198,6 +235,7 @@ impl Windows {
     }
 
     fn drop_window(&mut self, chat: ChatId) {
+        self.rev = self.rev.wrapping_add(1);
         if let Some(w) = self.by_chat.remove(&chat) {
             self.bytes = self.bytes.saturating_sub(w.bytes);
             for m in &w.messages {

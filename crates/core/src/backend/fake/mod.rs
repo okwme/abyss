@@ -58,7 +58,8 @@ pub enum Fault {
     /// Never completes (a stalled transport).
     Hang,
     /// The server applies the call, but the answer never arrives (an
-    /// ambiguous completion). Data calls just hang.
+    /// ambiguous completion). Sends are accepted (a message exists on the
+    /// server) and then hang; other data calls just hang.
     CompleteThenHang,
     /// Panics inside the call (a bug in the Telegram library).
     Panic,
@@ -175,6 +176,7 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
         unread_mentions: 0,
         last: None,
         last_date: 0,
+        last_id: None,
         can_send: true,
     }
 }
@@ -219,7 +221,12 @@ struct State {
     build_faults: VecDeque<BuildFault>,
     calls: HashMap<Op, usize>,
     sent: Vec<(ChatId, i64)>,
+    /// Server-side dedup: every `random_id` the server accepted, with the
+    /// message it created. Telegram deduplicates by `random_id` per sender.
+    accepted: HashMap<i64, (ChatId, MsgId)>,
     attempted: Vec<(ChatId, i64)>,
+    /// The last `Client::retain_peers` set.
+    retained: Option<Vec<ChatId>>,
     read: Vec<(ChatId, MsgId)>,
     seeds: Vec<Seed>,
     /// The most recently retired instance's session, for late-write tests.
@@ -447,6 +454,23 @@ impl FakeHandle {
         self.shared.with(|s| s.attempted.clone())
     }
 
+    /// The server message created for `random_id`, if the server accepted it
+    /// (including sends whose answer was lost).
+    pub fn accepted(&self, random_id: i64) -> Option<(ChatId, MsgId)> {
+        self.shared.with(|s| s.accepted.get(&random_id).copied())
+    }
+
+    /// Server messages in `chat` (own sends included).
+    pub fn server_history(&self, chat: ChatId) -> Vec<Message> {
+        self.shared
+            .with(|s| s.history.get(&chat).cloned().unwrap_or_default())
+    }
+
+    /// The last peer set core asked an instance to retain.
+    pub fn retained_peers(&self) -> Option<Vec<ChatId>> {
+        self.shared.with(|s| s.retained.clone())
+    }
+
     pub fn read_calls(&self) -> Vec<(ChatId, MsgId)> {
         self.shared.with(|s| s.read.clone())
     }
@@ -460,6 +484,11 @@ impl FakeHandle {
         };
         let next = next_home_dc(&session);
         session.set_home_dc_id(next).await.is_ok()
+    }
+
+    /// Edits the server's dialog list (server order).
+    pub fn edit_dialogs(&self, f: impl FnOnce(&mut Vec<ChatSummary>)) {
+        self.shared.with(|s| f(&mut s.dialogs));
     }
 
     /// Replaces a chat's server-side history (e.g. simulate deletions).
@@ -638,6 +667,11 @@ impl FakeClient {
     /// session gets `Unauthorized`.
     async fn enter(&self, op: Op) -> Result<InFlight<'_>, BackendError> {
         let fault = self.take_fault(op);
+        self.enter_with(fault).await
+    }
+
+    /// [`Self::enter`] with the fault already taken.
+    async fn enter_with(&self, fault: Option<Fault>) -> Result<InFlight<'_>, BackendError> {
         let guard = InFlight::new(&self.shared);
         if !self.shared.latency.is_zero() {
             tokio::time::sleep(self.shared.latency).await;
@@ -766,27 +800,23 @@ impl Client for FakeClient {
     ) -> Result<MsgId, BackendError> {
         self.shared
             .with(|s| push_capped(&mut s.attempted, (chat, random_id)));
-        let _g = self.enter(Op::Send).await?;
-        // Telegram deduplicates by `random_id` and answers a repeat with
-        // `RANDOM_ID_DUPLICATE`, which carries no message id.
-        if self
-            .shared
-            .with(|s| s.sent.iter().any(|&(c, r)| c == chat && r == random_id))
-        {
+        let fault = self.take_fault(Op::Send);
+        let lost = matches!(fault, Some(Fault::CompleteThenHang));
+        let _g = self.enter_with(fault.filter(|_| !lost)).await?;
+        // Telegram deduplicates by `random_id` (per sender, whatever the
+        // peer) and answers a repeat with `RANDOM_ID_DUPLICATE`, which
+        // carries no message id: no second message is created.
+        if self.shared.with(|s| s.accepted.contains_key(&random_id)) {
             return Err(BackendError::SentUnconfirmed);
+        }
+        if lost {
+            // Accepted, but the answer is lost: the server holds the message.
+            self.accept(chat, &text, random_id);
+            return std::future::pending().await;
         }
         // The real server also echoes own sends as updates; the fake does not, so tests
         // control update ordering explicitly with `FakeHandle::push_update`.
-        let id = self.shared.with(|s| {
-            push_capped(&mut s.sent, (chat, random_id));
-            let history = s.history.entry(chat).or_default();
-            let id = history.last().map_or(1, |m| m.id.0.saturating_add(1));
-            let mut msg = text_message(chat, id, &text);
-            msg.outgoing = true;
-            history.push(msg);
-            MsgId(id)
-        });
-        Ok(id)
+        Ok(self.accept(chat, &text, random_id))
     }
 
     async fn read_history(&self, chat: ChatId, max_id: MsgId) -> Result<(), BackendError> {
@@ -794,6 +824,28 @@ impl Client for FakeClient {
         self.shared
             .with(|s| push_capped(&mut s.read, (chat, max_id)));
         Ok(())
+    }
+
+    fn retain_peers(&self, required: &[ChatId]) {
+        self.shared.with(|s| s.retained = Some(required.to_vec()));
+    }
+}
+
+impl FakeClient {
+    /// The server accepts a send: one new message, remembered by `random_id`.
+    fn accept(&self, chat: ChatId, text: &str, random_id: i64) -> MsgId {
+        self.shared.with(|s| {
+            push_capped(&mut s.sent, (chat, random_id));
+            let history = s.history.entry(chat).or_default();
+            let id = MsgId(history.last().map_or(1, |m| m.id.0.saturating_add(1)));
+            let mut msg = text_message(chat, id.0, text);
+            msg.outgoing = true;
+            history.push(msg);
+            if s.accepted.len() < MAX_LOG {
+                s.accepted.insert(random_id, (chat, id));
+            }
+            id
+        })
     }
 }
 

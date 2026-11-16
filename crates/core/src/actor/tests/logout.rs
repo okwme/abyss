@@ -199,8 +199,15 @@ async fn shutdown_during_a_stalled_local_logout_is_incomplete() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_reports_confirmed_when_saved() {
     let mut h = harness(FakeScript::demo(2, 5), None).await;
-    h.online().await;
-    h.auth(AuthState::is_signed_in).await;
+    // The startup check can confirm the session before or after the bootstrap
+    // goes online; waiting for it only after `online` hung when it came first.
+    let before = h.online().await;
+    if !before
+        .iter()
+        .any(|e| matches!(e, Event::Auth(s) if s.is_signed_in()))
+    {
+        h.auth(AuthState::is_signed_in).await;
+    }
     let report = h.stop().await;
     assert_eq!(report.save, SaveStatus::Confirmed);
     assert_eq!(report.logout, None);
