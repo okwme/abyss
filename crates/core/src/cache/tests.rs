@@ -37,6 +37,7 @@ fn summary(c: ChatId, title: &str) -> ChatSummary {
         unread_mentions: 0,
         last: None,
         last_date: 0,
+        last_id: None,
         can_send: true,
     }
 }
@@ -234,7 +235,22 @@ fn version_1_messages_are_dropped_on_upgrade() {
         .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
+}
+
+#[test]
+fn version_2_chat_list_is_dropped_on_upgrade() {
+    let (_t, dir, key) = setup();
+    let c = user(1);
+    {
+        let mut db = Cache::open(&dir, &key).unwrap();
+        db.put_chats(&[summary(c, "c")]).unwrap();
+        db.put_messages(c, &[msg(c, 1, "kept")]).unwrap();
+        db.conn().execute_batch("PRAGMA user_version = 2").unwrap();
+    }
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert!(db.chats().unwrap().is_empty());
+    assert_eq!(ids(&db.tail(c, 10).unwrap()), [1]);
 }
 
 #[test]

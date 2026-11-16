@@ -70,7 +70,7 @@ async fn consume(mut updates: impl UpdateStream) {
                 assert!(m.is_valid());
             }
             Ok(StreamItem::Update(_)) => {}
-            Err(StreamError::Fatal) => return,
+            Err(StreamError::Fatal | StreamError::Unauthorized | StreamError::Migrated) => return,
             Err(StreamError::Transient) => {
                 errors += 1;
                 if errors >= MAX_STREAM_ERRORS {

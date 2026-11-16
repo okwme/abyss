@@ -20,6 +20,7 @@ fn summary() -> ChatSummary {
         unread_mentions: 0,
         last: None,
         last_date: 0,
+        last_id: None,
         can_send: true,
     }
 }

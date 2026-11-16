@@ -321,7 +321,7 @@ impl<B: Backend> Actor<B> {
         self.dialogs = crate::store::Dialogs::default();
         self.windows = crate::store::Windows::default();
         self.open = None;
-        self.contiguous.clear();
+        self.viewing = None;
         self.reads.clear();
         self.sends = super::sends::PendingSends::default();
         self.queue.clear();

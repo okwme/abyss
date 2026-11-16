@@ -922,6 +922,17 @@ fn live_updates_map_to_domain_updates() {
         lists::update(&read, &dir),
         Some(Update::ReadInbox { chat, still_unread: 2 }) if chat == cid(10)
     ));
+    let id_map = U::MessageId(tl::types::UpdateMessageId {
+        id: 41,
+        random_id: -7,
+    });
+    assert!(matches!(
+        lists::update(&id_map, &dir),
+        Some(Update::MessageId {
+            random_id: -7,
+            id: MsgId(41)
+        })
+    ));
 }
 
 #[test]
@@ -937,11 +948,11 @@ fn ignored_and_excluded_updates_map_to_nothing() {
         pts_count: 1,
     });
     assert!(lists::update(&topic_read, &Directory::default()).is_none());
-    let id_map = U::MessageId(tl::types::UpdateMessageId {
-        id: 1,
+    let bad_id = U::MessageId(tl::types::UpdateMessageId {
+        id: 0,
         random_id: 2,
     });
-    assert!(lists::update(&id_map, &Directory::default()).is_none());
+    assert!(lists::update(&bad_id, &Directory::default()).is_none());
     let mut bc = channel(10, "news");
     bc.broadcast = true;
     let dir = Directory::from_lists(&[], &[tl::enums::Chat::Channel(bc)]);

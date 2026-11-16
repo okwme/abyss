@@ -96,6 +96,9 @@ pub(crate) fn send_label(state: SendState) -> SharedString {
             format!("Not sure it was sent ({attempts} attempts)").into()
         }
         SendState::Failed => "Not sent".into(),
+        SendState::FloodWait { seconds } => {
+            format!("Waiting {seconds} s (Telegram rate limit)").into()
+        }
     }
 }
 

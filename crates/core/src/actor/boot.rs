@@ -18,12 +18,12 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::Actor;
-use super::jobs::{self, Job, TaskKind};
+use super::jobs::{self, Job, Load, ReqId, TaskKind};
 use super::lifecycle::{Phase, Reason};
 use crate::api::{Event, HistoryDir, WindowState};
 use crate::backend::{Backend, HistoryQuery, StreamItem, Update};
 use crate::model::{ChatId, ChatSummary, MsgId};
-use crate::store::ViewGen;
+use crate::store::MAX_WINDOWS;
 
 /// How long a new instance may take to establish its update baseline.
 pub(super) const BASELINE_WAIT: Duration = Duration::from_secs(10);
@@ -46,7 +46,16 @@ pub(super) enum BootKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Snapshot {
     Dialogs,
-    Tail(ChatId),
+    /// A tail load; it counts only if it is the chat's current snapshot.
+    Tail(Load),
+}
+
+/// Where a tail load starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TailVia {
+    /// The cached tail first (if there is a cache), then the server's.
+    Cache,
+    Server,
 }
 
 /// Too many updates or deletions arrived while snapshots were pending.
@@ -61,9 +70,12 @@ pub(super) struct Boot {
     buffer: Vec<Update>,
     tombstones: HashSet<(Option<ChatId>, MsgId)>,
     dialogs_pending: bool,
-    tails_pending: HashSet<ChatId>,
-    /// `last_date` per chat in the dialogs snapshot (at most one page).
-    dates: HashMap<ChatId, i64>,
+    /// Pending tail snapshots, by `(chat, request)`: a snapshot completes (or
+    /// fails) by its own identity, even after its view went stale, so it can
+    /// never be orphaned. At most [`MAX_WINDOWS`] chats.
+    tails: HashMap<ChatId, ReqId>,
+    /// The top message id per chat in the dialogs snapshot (at most one page).
+    tops: HashMap<ChatId, MsgId>,
 }
 
 impl Boot {
@@ -74,8 +86,8 @@ impl Boot {
             buffer: Vec::new(),
             tombstones: HashSet::new(),
             dialogs_pending: false,
-            tails_pending: HashSet::new(),
-            dates: HashMap::new(),
+            tails: HashMap::new(),
+            tops: HashMap::new(),
         }
     }
 
@@ -114,18 +126,29 @@ impl Boot {
             || (chat.kind.has_account_unique_ids() && self.tombstones.contains(&(None, id)))
     }
 
-    /// Whether the tail of `chat` is one of this boot's snapshots.
-    pub(super) fn awaits_tail(&self, chat: ChatId) -> bool {
-        self.tails_pending.contains(&chat)
+    /// Whether `load` is this boot's current tail snapshot of its chat.
+    pub(super) fn awaits_tail(&self, load: Load) -> bool {
+        self.tails.get(&load.chat) == Some(&load.req)
+    }
+
+    /// Whether a chat opened now gets its tail as a snapshot of this boot: a
+    /// full bootstrap past its baseline, so the open is not stuck behind
+    /// `Online` (UI jobs wait for it) and keeps the boot from finishing
+    /// before its window is current.
+    fn accepts_tail(&self, chat: ChatId) -> bool {
+        self.kind == BootKind::Full
+            && self.baseline_by.is_none()
+            && (self.tails.contains_key(&chat) || self.tails.len() < MAX_WINDOWS)
     }
 
     /// Records what the dialogs snapshot says about each chat's last message.
     pub(super) fn note_dialogs(&mut self, chats: &[ChatSummary]) {
-        self.dates.extend(chats.iter().map(|c| (c.id, c.last_date)));
+        self.tops
+            .extend(chats.iter().filter_map(|c| Some((c.id, c.last_id?))));
     }
 
     fn snapshots_done(&self) -> bool {
-        self.baseline_by.is_none() && !self.dialogs_pending && self.tails_pending.is_empty()
+        self.baseline_by.is_none() && !self.dialogs_pending && self.tails.is_empty()
     }
 }
 
@@ -134,8 +157,8 @@ impl Boot {
 pub(super) enum Origin<'a> {
     Live,
     /// Buffered during snapshots and merged over them; carries the dialogs
-    /// snapshot's `last_date` per chat.
-    Replay(&'a HashMap<ChatId, i64>),
+    /// snapshot's top message id per chat.
+    Replay(&'a HashMap<ChatId, MsgId>),
 }
 
 impl<B: Backend> Actor<B> {
@@ -193,7 +216,6 @@ impl<B: Backend> Actor<B> {
     async fn start_snapshots(&mut self, kind: BootKind) {
         if kind == BootKind::Full {
             self.purge_queued();
-            self.contiguous.clear();
             for (chat, _) in self.windows.invalidate_all() {
                 self.emit(Event::ChatInvalidated(chat)).await;
             }
@@ -203,57 +225,97 @@ impl<B: Backend> Actor<B> {
             self.dialogs_busy = true;
             self.priority.push_back(Job::Dialogs { cursor: None });
         }
+        if let Some(boot) = self.boot.as_mut() {
+            boot.dialogs_pending = dialogs;
+        }
         // A full bootstrap always refetches the open tail (any older load was
         // for a window that is now invalidated); a refresh never doubles a load.
         let tail = self
             .open
             .filter(|c| kind == BootKind::Full || !self.history_busy.contains_key(c))
             .and_then(|c| Some((c, self.windows.get(c)?.view_gen())));
-        if let Some(boot) = self.boot.as_mut() {
-            boot.dialogs_pending = dialogs;
-            boot.tails_pending.extend(tail.map(|(c, _)| c));
-        }
         if let Some((chat, view)) = tail {
-            self.history_busy.insert(chat, view);
-            match self.cache.clone().filter(|_| kind == BootKind::Full) {
-                // Show the cached tail again right away (it may be all there is
-                // while offline); the server tail is chained after it.
-                Some(cache) => {
-                    let cgen = self.cgen;
-                    let fut = jobs::cache_history(cache, cgen, chat, view, HistoryDir::Tail, None);
-                    self.spawn_local(TaskKind::History(chat), fut);
-                }
-                None => self.push_tail_snapshot(chat, view),
-            }
+            let load = self.begin_load(chat, view);
+            self.claim_tail_snapshot(load);
+            // A full bootstrap shows the cached tail again right away (it may
+            // be all there is while offline); the server tail is chained after.
+            let via = match kind {
+                BootKind::Full => TailVia::Cache,
+                BootKind::Refresh => TailVia::Server,
+            };
+            self.start_tail(load, via).await;
         }
         self.maybe_finish_boot().await;
     }
 
-    /// Queues the server tail of `chat` as a snapshot of the running boot.
-    pub(super) fn push_tail_snapshot(&mut self, chat: ChatId, view: ViewGen) {
+    /// Makes `load` the running boot's tail snapshot of its chat. A snapshot
+    /// it replaces (the chat was reopened) leaves the priority queue; if it
+    /// is already running, its completion is an ordinary stale load.
+    fn claim_tail_snapshot(&mut self, load: Load) {
+        let Some(boot) = self.boot.as_mut() else {
+            return;
+        };
+        if boot.tails.insert(load.chat, load.req).is_some() {
+            self.priority
+                .retain(|j| !matches!(j, Job::History { load: l, .. } if l.chat == load.chat));
+        }
+    }
+
+    /// Whether a tail opened now for `chat` becomes a boot snapshot (see
+    /// [`Boot::accepts_tail`]); claims it if so.
+    pub(super) fn claim_if_booting(&mut self, load: Load) {
+        if self
+            .boot
+            .as_ref()
+            .is_some_and(|b| b.accepts_tail(load.chat))
+        {
+            self.claim_tail_snapshot(load);
+        }
+    }
+
+    /// Starts the tail load `load`: the cached tail first when `via` says so
+    /// and there is a cache (the server tail is chained after it), else the
+    /// server tail, as a boot snapshot if `load` is one.
+    pub(super) async fn start_tail(&mut self, load: Load, via: TailVia) {
+        match self.cache.clone().filter(|_| via == TailVia::Cache) {
+            Some(cache) => {
+                let cgen = self.cgen;
+                let fut = jobs::cache_history(cache, cgen, load, HistoryDir::Tail, None);
+                self.spawn_local(TaskKind::History(load), fut);
+            }
+            None if self.is_tail_snapshot(load) => self.push_tail_snapshot(load),
+            None => self.request_tail(load).await,
+        }
+    }
+
+    /// Queues the server tail of `load` as a snapshot of the running boot.
+    pub(super) fn push_tail_snapshot(&mut self, load: Load) {
+        let floor = self.tail_floor(load.chat);
         self.priority.push_back(Job::History {
-            chat,
-            view,
+            load,
             dir: HistoryDir::Tail,
             query: HistoryQuery::Tail,
+            floor,
         });
     }
 
-    /// Whether the history load `(chat, view)` is the running boot's tail snapshot.
-    pub(super) fn is_tail_snapshot(&self, chat: ChatId, view: ViewGen) -> bool {
-        self.boot.as_ref().is_some_and(|b| b.awaits_tail(chat))
-            && self.history_busy.get(&chat) == Some(&view)
+    /// Whether `load` is the running boot's tail snapshot of its chat.
+    pub(super) fn is_tail_snapshot(&self, load: Load) -> bool {
+        self.boot.as_ref().is_some_and(|b| b.awaits_tail(load))
     }
 
-    /// Records a finished snapshot (successful or not).
+    /// Records a finished snapshot (successful or not). A tail load that is
+    /// no longer its chat's snapshot (replaced by a reopen) changes nothing.
     pub(super) async fn snapshot_done(&mut self, snapshot: Snapshot) {
         let Some(boot) = self.boot.as_mut() else {
             return;
         };
         match snapshot {
             Snapshot::Dialogs => boot.dialogs_pending = false,
-            Snapshot::Tail(chat) => {
-                boot.tails_pending.remove(&chat);
+            Snapshot::Tail(load) => {
+                if boot.awaits_tail(load) {
+                    boot.tails.remove(&load.chat);
+                }
             }
         }
         self.maybe_finish_boot().await;
@@ -267,7 +329,7 @@ impl<B: Backend> Actor<B> {
             return;
         };
         for update in boot.buffer {
-            self.on_update(update, Origin::Replay(&boot.dates)).await;
+            self.on_update(update, Origin::Replay(&boot.tops)).await;
         }
         self.last_refresh = Instant::now();
         if boot.kind == BootKind::Full {

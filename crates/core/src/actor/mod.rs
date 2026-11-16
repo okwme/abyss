@@ -12,11 +12,12 @@ mod lifecycle;
 mod logout;
 mod merge;
 mod onboarding;
+mod peers;
 mod sends;
 #[cfg(all(test, feature = "fake"))]
 mod tests;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ use admission::Admission;
 pub use admission::MAX_CONCURRENT;
 use auth::AuthMachine;
 use boot::Boot;
-use jobs::{CallCtx, Done, Job, TaskKind};
+use jobs::{CallCtx, Done, Job, Load, ReqId, TaskKind};
 use lifecycle::{Lifecycle, Live, LiveEvent, Phase, Reason};
 pub(crate) use logout::{CacheParts, open_cache};
 
@@ -43,7 +44,7 @@ use crate::core::ShutdownReport;
 use crate::events::EventSender;
 use crate::model::{ChatId, MsgId};
 use crate::session::{PersistHandle, SessionSnapshot};
-use crate::store::{Dialogs, MAX_DIALOGS, ViewGen, Windows};
+use crate::store::{Dialogs, MAX_DIALOGS, ViewGen, Window, Windows};
 
 /// Shutdown's deadline for retirement and the persistence seal, counted from
 /// its start (plan section 5).
@@ -90,16 +91,21 @@ pub(crate) struct Actor<B: Backend> {
     boot: Option<Boot>,
     window: WindowState,
     last_refresh: Instant,
-    /// Chats with a history load (cache or server) in flight, and its view.
-    history_busy: HashMap<ChatId, ViewGen>,
+    /// Chats with a history load (cache or server) in flight, and that load.
+    /// At most one per window chat.
+    history_busy: HashMap<ChatId, Load>,
+    /// Source of [`jobs::ReqId`]s.
+    next_req: u64,
     dialogs_busy: bool,
     dialogs_queued: bool,
     dialogs_loaded: bool,
     dialogs_next: Option<DialogsCursor>,
     open: Option<ChatId>,
-    /// Chats whose disk cache is known to be contiguous with the live tail this
-    /// session, so older/newer pages may be served from it.
-    contiguous: HashSet<ChatId>,
+    /// The chat whose live tail the UI reports on screen
+    /// (`Command::ViewingTail`).
+    viewing: Option<ChatId>,
+    /// The peer set last handed to the instance (`Client::retain_peers`).
+    peers: peers::PeerSync,
     /// Highest displayed id per chat, flushed every `READ_FLUSH`.
     reads: HashMap<ChatId, MsgId>,
     sends: sends::PendingSends,
@@ -166,12 +172,14 @@ impl<B: Backend> Actor<B> {
             window: WindowState::Active,
             last_refresh: Instant::now(),
             history_busy: HashMap::new(),
+            next_req: 0,
             dialogs_busy: false,
             dialogs_queued: false,
             dialogs_loaded: false,
             dialogs_next: None,
             open: None,
-            contiguous: HashSet::new(),
+            viewing: None,
+            peers: peers::PeerSync::default(),
             reads: HashMap::new(),
             sends: sends::PendingSends::default(),
             deadline: CALL_DEADLINE,
@@ -201,6 +209,7 @@ impl<B: Backend> Actor<B> {
             let baseline_by = self.boot.as_ref().and_then(Boot::baseline_deadline);
             let refresh_at = self.refresh_due();
             let flood_over = self.auth.flood_deadline();
+            let send_due = self.sends.next_due();
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
@@ -223,9 +232,11 @@ impl<B: Backend> Actor<B> {
                 () = sleep_until(baseline_by) => self.rebuild(Reason::NoBaseline).await,
                 () = sleep_until(refresh_at) => self.refresh().await,
                 () = sleep_until(flood_over) => self.flood_over().await,
+                () = sleep_until(send_due) => self.resume_flooded_sends().await,
                 _ = flush.tick() => self.flush_reads().await,
             }
             self.pump();
+            self.sync_peers();
         }
         self.shut_down().await
     }
@@ -356,7 +367,7 @@ impl<B: Backend> Actor<B> {
         for job in purged {
             match job {
                 Job::Dialogs { .. } => self.dialogs_busy = false,
-                Job::History { chat, view, .. } => self.release_history(chat, view),
+                Job::History { load, .. } => self.release_history(load),
                 Job::Send { .. } | Job::Read { .. } => {}
             }
         }
@@ -409,9 +420,9 @@ impl<B: Backend> Actor<B> {
                 self.dialogs_busy = false;
                 self.snapshot_done(boot::Snapshot::Dialogs).await;
             }
-            Some(TaskKind::History(chat)) => {
-                self.history_busy.remove(&chat);
-                self.snapshot_done(boot::Snapshot::Tail(chat)).await;
+            Some(TaskKind::History(load)) => {
+                self.release_history(load);
+                self.snapshot_done(boot::Snapshot::Tail(load)).await;
             }
             Some(TaskKind::Send(local_id)) => {
                 if let Some(state) = self.sends.mark_unknown(local_id) {
@@ -444,6 +455,7 @@ impl<B: Backend> Actor<B> {
             Command::DiscardSend(local_id) => self.discard_send(local_id).await,
             Command::Window(state) => self.on_window(state).await,
             Command::MarkRead { chat, max_id } => self.mark_read(chat, max_id).await,
+            Command::ViewingTail(chat) => self.viewing = chat,
             Command::SubmitPhone(phone) => {
                 let phone = zeroize::Zeroizing::new(phone);
                 self.submit_phone(&phone).await;
@@ -481,41 +493,83 @@ impl<B: Backend> Actor<B> {
         }
     }
 
+    /// Opens `chat`: the retained window (if attached to the live tail) is
+    /// shown at once as a complete `Tail` snapshot of the new view, then the
+    /// cached and server tails follow. During a full bootstrap the tail is a
+    /// boot snapshot, replacing any earlier one of the same chat.
     async fn open_chat(&mut self, chat: ChatId) {
         if let Some(prev) = self.open.filter(|p| *p != chat) {
             self.windows.close(prev);
         }
+        // A detached window is not what the user asked for: start from the tail.
+        if self.windows.get(chat).is_some_and(Window::has_newer) {
+            self.windows.invalidate(chat);
+        }
         let view = self.windows.open(chat);
         self.open = Some(chat);
-        self.contiguous.remove(&chat);
-        self.history_busy.insert(chat, view);
-        match self.cache.clone() {
-            // The server tail is requested once the cache tail is shown.
-            Some(cache) => {
-                cache.write(crate::cache::CacheCmd::Touch(chat)).await;
-                let cgen = self.cgen;
-                let fut = jobs::cache_history(cache, cgen, chat, view, HistoryDir::Tail, None);
-                self.spawn_local(TaskKind::History(chat), fut);
-            }
-            None => self.request_tail(chat, view).await,
+        self.seed_view(chat, view).await;
+        let load = self.begin_load(chat, view);
+        self.claim_if_booting(load);
+        if let Some(cache) = &self.cache {
+            cache.write(crate::cache::CacheCmd::Touch(chat)).await;
         }
+        // The server tail is requested once the cache tail is shown.
+        self.start_tail(load, boot::TailVia::Cache).await;
     }
 
-    async fn request_tail(&mut self, chat: ChatId, view: ViewGen) {
-        let job = Job::History {
+    /// Emits the window `chat` retains as a complete `Tail` of `view`, so a
+    /// newly opened view never starts empty while its tail loads.
+    async fn seed_view(&self, chat: ChatId, view: ViewGen) {
+        let Some(w) = self.windows.get(chat).filter(|w| !w.messages().is_empty()) else {
+            return;
+        };
+        self.emit(Event::History {
             chat,
             view,
             dir: HistoryDir::Tail,
+            messages: w.messages().iter().cloned().collect(),
+            removed: Vec::new(),
+            has_more: w.has_older(),
+        })
+        .await;
+    }
+
+    /// Starts a history load for `chat`'s `view`, making it the chat's
+    /// single-flight load.
+    fn begin_load(&mut self, chat: ChatId, view: ViewGen) -> Load {
+        self.next_req = self.next_req.wrapping_add(1);
+        let load = Load {
+            chat,
+            view,
+            req: ReqId(self.next_req),
+        };
+        self.history_busy.insert(chat, load);
+        load
+    }
+
+    /// The newest id `chat`'s window holds now: what a tail requested now
+    /// is authoritative up to.
+    fn tail_floor(&self, chat: ChatId) -> Option<MsgId> {
+        self.windows
+            .get(chat)
+            .and_then(|w| w.messages().back())
+            .map(|m| m.id)
+    }
+
+    async fn request_tail(&mut self, load: Load) {
+        let job = Job::History {
+            load,
+            dir: HistoryDir::Tail,
             query: HistoryQuery::Tail,
+            floor: self.tail_floor(load.chat),
         };
         if !self.enqueue(job).await {
-            self.release_history(chat, view);
+            self.release_history(load);
         }
     }
 
     fn close_chat(&mut self, chat: ChatId) {
         self.windows.close(chat);
-        self.contiguous.remove(&chat);
         if self.open == Some(chat) {
             self.open = None;
         }
@@ -538,38 +592,36 @@ impl<B: Backend> Actor<B> {
         let Some(edge) = edge.filter(|_| more).map(|m| m.id) else {
             return;
         };
-        self.history_busy.insert(chat, view);
+        let load = self.begin_load(chat, view);
         if let Some(cache) = self
             .cache
             .clone()
-            .filter(|_| self.contiguous.contains(&chat))
+            .filter(|_| self.windows.is_cache_contiguous(chat))
         {
             let cgen = self.cgen;
             self.spawn_local(
-                TaskKind::History(chat),
-                jobs::cache_history(cache, cgen, chat, view, dir, Some(edge)),
+                TaskKind::History(load),
+                jobs::cache_history(cache, cgen, load, dir, Some(edge)),
             );
             return;
         }
-        self.fetch_more(chat, view, dir, edge).await;
+        self.fetch_more(load, dir, edge).await;
     }
 
-    async fn fetch_more(&mut self, chat: ChatId, view: ViewGen, dir: HistoryDir, edge: MsgId) {
+    async fn fetch_more(&mut self, load: Load, dir: HistoryDir, edge: MsgId) {
         let query = if dir == HistoryDir::Older {
             HistoryQuery::Before(edge)
         } else {
             HistoryQuery::After(edge)
         };
-        if !self
-            .enqueue(Job::History {
-                chat,
-                view,
-                dir,
-                query,
-            })
-            .await
-        {
-            self.release_history(chat, view);
+        let job = Job::History {
+            load,
+            dir,
+            query,
+            floor: None,
+        };
+        if !self.enqueue(job).await {
+            self.release_history(load);
         }
     }
 

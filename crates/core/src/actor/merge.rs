@@ -26,14 +26,21 @@ pub(super) struct TailDiff {
 }
 
 /// Compares a tail `page` with an attached `window`, both ascending by id. An
-/// empty window or page is reported as a gap: replace instead of merging.
-pub(super) fn tail_diff(window: &VecDeque<Message>, page: &HistoryPage) -> TailDiff {
+/// empty window is reported as a gap: replace instead of merging.
+///
+/// The page is authoritative from its oldest id (or the start of history)
+/// up to `top` ([`HistoryReply::authoritative_top`]): window messages in
+/// that range that the page lacks were deleted, including the newest ones and
+/// all of them when the server's history is empty. Window messages above
+/// `top` arrived after the request and are left alone.
+pub(super) fn tail_diff(
+    window: &VecDeque<Message>,
+    page: &HistoryPage,
+    top: Option<MsgId>,
+) -> TailDiff {
     let mut diff = TailDiff::default();
-    let (Some(oldest), Some(newest), Some(hi)) = (
-        window.front().map(|m| m.id),
-        window.back().map(|m| m.id),
-        page.messages.last().map(|m| m.id),
-    ) else {
+    let (Some(oldest), Some(newest)) = (window.front().map(|m| m.id), window.back().map(|m| m.id))
+    else {
         diff.gap = true;
         return diff;
     };
@@ -56,11 +63,13 @@ pub(super) fn tail_diff(window: &VecDeque<Message>, page: &HistoryPage) -> TailD
     }
     let mut ids: Vec<MsgId> = page.messages.iter().map(|m| m.id).collect();
     ids.sort_unstable();
-    diff.deleted = window
-        .iter()
-        .map(|w| w.id)
-        .filter(|id| (lo..=hi).contains(id) && ids.binary_search(id).is_err())
-        .collect();
+    if let Some(top) = top {
+        diff.deleted = window
+            .iter()
+            .map(|w| w.id)
+            .filter(|id| (lo..=top).contains(id) && ids.binary_search(id).is_err())
+            .collect();
+    }
     diff
 }
 
@@ -73,17 +82,18 @@ impl<B: Backend> Actor<B> {
         if w.has_newer() {
             return; // detached: scrolling back down loads current pages
         }
-        let diff = tail_diff(w.messages(), &p.page);
+        let top = p.authoritative_top();
+        let diff = tail_diff(w.messages(), &p.page, top);
         if diff.gap {
             return self.on_tail(p).await;
         }
         let (chat, view) = (p.chat, p.view);
-        if let Some(hi) = p.page.messages.last().map(|m| m.id) {
+        if let Some(top) = top {
             let lo = match p.page.messages.first() {
                 Some(first) if p.page.has_more => first.id,
                 _ => MIN_ID,
             };
-            self.reconcile(chat, lo, hi, &p.page.messages).await;
+            self.reconcile(chat, lo, top, &p.page.messages).await;
         }
         let removed = self.windows.delete(chat, &diff.deleted);
         if !removed.is_empty() {
@@ -104,6 +114,7 @@ impl<B: Backend> Actor<B> {
             self.emit_history(chat, view, HistoryDir::Newer, change)
                 .await;
         }
+        self.emit_reconciled(chat, view).await;
     }
 }
 
@@ -137,6 +148,7 @@ mod tests {
                 messages: page,
                 has_more: true,
             },
+            Some(MsgId(6)),
         );
         assert!(!diff.gap);
         assert_eq!(diff.deleted, vec![MsgId(4)], "1 and 2 are below the page");
@@ -151,6 +163,36 @@ mod tests {
             messages: msgs(&[1, 2, 3, 5]),
             has_more: false,
         };
-        assert!(tail_diff(&window, &page).gap);
+        assert!(tail_diff(&window, &page, Some(MsgId(5))).gap);
+    }
+
+    #[test]
+    fn deleted_newest_message_is_removed() {
+        // The window held 1..=10 when the tail was requested; 10 was deleted
+        // and the deletion missed, 11 arrived live after the request.
+        let window: VecDeque<Message> = msgs(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]).into();
+        let page = HistoryPage {
+            messages: msgs(&[1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            has_more: false,
+        };
+        let diff = tail_diff(&window, &page, Some(MsgId(10)));
+        assert!(!diff.gap);
+        assert_eq!(
+            diff.deleted,
+            vec![MsgId(10)],
+            "11 arrived after the request"
+        );
+    }
+
+    #[test]
+    fn empty_server_history_removes_everything_requested() {
+        let window: VecDeque<Message> = msgs(&[3, 4, 7]).into();
+        let page = HistoryPage {
+            messages: Vec::new(),
+            has_more: false,
+        };
+        let diff = tail_diff(&window, &page, Some(MsgId(4)));
+        assert!(!diff.gap);
+        assert_eq!(diff.deleted, vec![MsgId(3), MsgId(4)]);
     }
 }
