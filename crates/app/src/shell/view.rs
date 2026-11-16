@@ -258,6 +258,7 @@ fn conn_label(conn: Option<ConnState>) -> SharedString {
         Some(ConnState::Rebuilding { attempt }) => {
             format!("Reconnecting (attempt {attempt})…").into()
         }
+        Some(ConnState::Offline) => "Offline. Retrying…".into(),
     }
 }
 

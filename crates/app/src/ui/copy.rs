@@ -64,6 +64,9 @@ pub(crate) fn user_error(error: UserError) -> SharedString {
         UserError::ShuttingDown => "abyss is closing.".into(),
         UserError::Unsupported => "Not available in this build yet.".into(),
         UserError::Internal => "Something went wrong inside abyss.".into(),
+        UserError::AccountMigrated => {
+            "Telegram moved this account to another data center. Sign in again.".into()
+        }
     }
 }
 
