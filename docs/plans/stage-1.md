@@ -21,7 +21,7 @@ Out of scope for Stage 1:
 - broadcast channels;
 - forum topics (Stage 2);
 - notifications, code signing, App Sandbox (Stage 3);
-- any media download or decode, and avatars (Stage 4).
+- any media download or decode, and avatars (Stage 4). Decision 2026-11-16: avatars of every kind wait for Stage 4, including letter avatars and the inline stripped thumbnails. Stage 4 decodes them through the same hardened path as chat images: a pure-Rust decoder rather than ImageIO, strict size and pixel caps, downscaling, and the encrypted cache, optionally in a sandboxed process.
 
 Design principle: **persist little, recover one way.** Only the critical login state survives a restart. Every failure is handled by rebuilding the client and reconciling.
 
