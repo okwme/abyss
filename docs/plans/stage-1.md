@@ -498,7 +498,7 @@ GPUI has no text-field widget at this commit. `Z/examples/input.rs` (912 lines) 
 4. **Client lifecycle:** build, rebuild and reconcile. *Done when:* every fault-injection test in section 2 passes, and the parked permits are released by rebuild.
 5. **Persistence:** `AbyssSession`, worker, `SecretStore`s. *Done when:* every section 3 test passes.
 6. **Login, logout, shutdown** state machines. *Done when:* every section 4 and section 5 test passes.
-7. **App bridge:** auth router, missing-credentials screen, `Quit` action, the should-close hook. *Done when:* `cargo dev` goes from login to the chat list, and closing shows "Closing…" then exits, or shows the unconfirmed-save message when `FaultyStore` stalls.
+7. **App bridge:** auth router, missing-credentials screen (superseded by onboarding, section 17 / task 6b), `Quit` action, the should-close hook. *Done when:* `cargo dev` goes from login to the chat list, and closing shows "Closing…" then exits, or shows the unconfirmed-save message when `FaultyStore` stalls.
 8. **Text input:** normal, composer and password. *Done when:* the section 10 tests pass, and manual Pinyin/Japanese IME testing works in the composer.
 9. **Chat list.** *Done when:* 1,000 fake dialogs scroll without dropped frames on Apple Silicon, live reorder works, read state from another device (fake) applies, and the displayed max id reaches read-history.
 10. **Message view and sending.** *Done when:* a 2,000-message fake chat (emoji, RTL, 4,096-character text, every entity and media kind, over-budget messages) renders; prepending shows no visible jump; links open only after confirmation; edits and deletes apply live; the section 9 tests pass.
@@ -610,3 +610,83 @@ History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This 
 - **Memory windows slide:** the 2,000-message in-memory window no longer stops at the cap. Scrolling past it drops the far end and reloads it from the cache (then the server) on return.
 - **Threading:** `Cache` is blocking. It's owned by a dedicated cache worker thread, which receives ordered commands from the actor, mirroring the persistence worker. The async runtime never blocks on disk.
 - **Status:** the storage layer is implemented (`crates/core/src/cache/`, 20 tests, including regressions for the cache review: roundtrip, wrong key, no plaintext in DB/WAL, 0700 + backup exclusion, reconcile, unscoped delete, corrupt rows, schema version, per-chat cap, LRU budget, byte accounting). Still to do: the cache worker, Keychain key handling (task 5), wiring into the actor and the sliding window (tasks 3–4, 10).
+
+## 17. Onboarding: connecting abyss to Telegram (added 2026-11-16)
+
+Replaces the bare "missing credentials" error screen (section 12) with a guided first-run flow. Lands as **task 6b**, after task 6, because it needs the persistence worker (task 5) and the login state machine (task 6).
+
+### 17.1 Credential model
+
+Telegram requires an `api_id`/`api_hash` per client application. Decision: **bring your own credentials (BYO)** by default.
+- A shared project `api_id` gives no secrecy: it's extractable from any binary. It also ties every user to one registration that Telegram can rate-limit or revoke, and risk 10 (anti-spam checks on new third-party ids) would hit all users at once.
+- BYO costs one visit to my.telegram.org. The onboarding exists to make that visit painless.
+- A packaged release may later embed a project id at build time (`option_env!("ABYSS_EMBEDDED_API_ID")` / `..._HASH`). This is off by default and not part of Stage 1.
+
+**Resolution order:**
+1. `ABYSS_API_ID` + `ABYSS_API_HASH` env vars. This is a dev override and is never persisted.
+2. The Keychain item `dev.abyss.apicreds`, owned by the persistence worker with the same attributes as the session item (section 3, task 5 notes).
+3. The embedded build-time pair, if compiled in.
+4. Otherwise go to onboarding.
+
+### 17.2 Core changes
+
+- `AuthState::MissingCredentials` becomes `AuthState::NeedCredentials { error: Option<CredentialError> }`.
+- Core starts its persistence worker before it has credentials. With no credentials it emits `NeedCredentials`, and no backend is built.
+- `Command::SubmitCredentials { api_id: i32, api_hash: ApiHash }` builds the client and moves to `Connecting` then `Phone`.
+  - Validation: `api_id > 0`. `ApiHash` is exactly 32 hex chars, normalized to lowercase, with whitespace trimmed on paste.
+  - Persist **only after the first successful `request_login_code`**, which proves the pair is valid. Until then the pair lives in memory only.
+- `API_ID_INVALID` and `API_ID_PUBLISHED_FLOOD` from `request_login_code` map to `CredentialError`. The state goes back to `NeedCredentials` with that error, without touching the session. The client is retired through the normal rebuild boundary.
+- `Command::ResetCredentials` is allowed only while logged out. It deletes `dev.abyss.apicreds`. While signed in, changing credentials means logging out first; the UI says so.
+- `ApiHash` has a redacting `Debug` and is never logged. This is the same rule as phone numbers.
+
+### 17.3 Screens
+
+Every screen has Back except Welcome. Copy lives in one module (`crates/app/src/onboarding/copy.rs`) so docs and UI stay in sync.
+
+1. **Welcome.** What abyss is (a small, auditable client) and an honest threat model:
+   - It reduces the *client-side* attack surface.
+   - Cloud chats are still readable by Telegram's servers.
+   - There are no secret chats, calls, stickers, browser or Mini Apps in v1.
+
+   One button: **Connect to Telegram**.
+2. **Get API credentials.** Numbered steps, with **Open my.telegram.org** opening the system browser.
+   - The URL is the hardcoded constant `https://my.telegram.org/apps`, opened via `cx.open_url`. This is the only URL the app ever opens.
+   - The steps:
+     1. Log in with your phone number. The login code arrives *in your Telegram app*, not by SMS.
+     2. Open "API development tools".
+     3. Fill App title `abyss`, a Short name of 5–32 letters/digits, and Platform "Desktop"; leave URL empty.
+     4. Copy `api_id` and `api_hash`.
+   - Troubleshooting:
+     - If the form says "ERROR", retry later, with VPN and ad blockers off and a letters-only short name.
+     - There is one app per account.
+     - Never share the `api_hash`.
+     - New `api_id`s can draw extra anti-spam scrutiny.
+3. **Enter credentials.** The `api_id` field accepts digits only, at most 10. The `api_hash` field accepts hex only, exactly 32 characters; it has a paste-normalizing filter and is masked with a reveal toggle. Inline validation runs, then **Continue** sends `SubmitCredentials`. A `CredentialError` comes back here with a specific message.
+4. **Phone** (section 4). International format with a leading `+`. Explain that the code is sent to your other Telegram sessions first.
+5. **Code.** Show where the code went (the sent-code type from `auth.sentCode`). Add a fixed warning: "Telegram and abyss will never ask for this code anywhere else." Expect a "new login" notice on your other devices.
+6. **Password** (2FA, section 4), with the hint.
+7. **Done.** Tips:
+   - The session shows as "abyss" under Settings › Devices in official apps, where it can be revoked remotely.
+   - If `account.getPassword` reports `has_password = false`, recommend enabling 2FA in an official app. abyss doesn't set it.
+
+Back from screens 4–6 to the credential screens is allowed only before the session is authorized. After that, the only way back is logout.
+
+### 17.4 Docs
+
+`docs/connecting.md` mirrors 17.3 with screenshots. The README "Getting started" links to it. Its text is generated from or checked against `copy.rs` by a unit test that greps the doc for each step's key phrase.
+
+### 17.5 Tests
+
+- **Core:**
+  - The credential validators: boundaries, case, whitespace, non-hex.
+  - Credentials are not persisted before a successful code request and are persisted after.
+  - An env override is never persisted.
+  - `API_ID_INVALID` returns to `NeedCredentials` with an error, and the session stays untouched.
+  - `ResetCredentials` is refused while signed in.
+  - `ApiHash` `Debug` redacts.
+- **Fake backend:** scripted `API_ID_INVALID` and `API_ID_PUBLISHED_FLOOD` on the first code request.
+- **App:**
+  - The onboarding router follows each `AuthState`.
+  - Back navigation follows the rules in 17.3.
+  - `cargo dev -- --onboarding` starts the fake from `NeedCredentials` so the whole flow can be clicked through.
+- **Manual (task 12):** create a real app on my.telegram.org following only the in-app text, and record any wording fixes.
