@@ -980,6 +980,17 @@ Open items:
   - **Low:** `retain_peers` order went stale after a live bump; a reordering bump now bumps the dialogs revision.
   - Test gap: MessageId-vs-RPC correlation is now tested in both arrival orders with a late successful RPC.
 
+- **Round 11 (review of task 6b plus re-check of task 4c, 2026-11-16).** Round-8 auth findings are fixed, apart from the gaps below. Round 9 is fixed except the FloodWait deadline. Open items go to task 6d (after 6c), except the hash input, which is already in 6c:
+  - **High:** after Back, the authorization probe can overtake the abandoned sign-in RPC, which the sender still has queued. Establish completion ordering with the original invocation before accepting a negative probe.
+  - Forget during an in-flight sign-in strands reconciliation, because the active pair is dropped before the probe can run. Defer the drop and delete until reconciliation proves the account is signed out.
+  - `complete_login` swallows unauthorized errors from `updates.getState`.
+  - Credential persistence eligibility is inferred from the current screen, so a FloodWait on the first sendCode can still save. Track proof per credential version.
+  - The masked `api_hash` input exposes plaintext through `text_for_range`, and `EditBuffer` derives `Debug` and is never wiped (6c).
+  - Delivery types: flash-call input is truncated to 8 digits, Fragment loses its URL (route it to the unsupported-flow screen), and the missed-call length is dropped in the UI.
+  - Credential save and delete failures have no Retry UI, and Forget claims the pair is gone before the delete succeeds.
+  - The FloodWait 10-minute deadline is not enforced at dispatch or on rebuild replay (`sends.rs`).
+  - **Low:** `docs/connecting.md` overstates the flow and logout recovery.
+
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 
 History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This supersedes the "nothing on disk except the Keychain item" property in sections 3 and 9. The new property: **nothing plaintext on disk; everything on disk is undecryptable without a device-only Keychain key.**
