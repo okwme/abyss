@@ -1,15 +1,16 @@
 //! Onboarding and login actions of the session (plan section 17.3): the
 //! UI-only welcome and guide steps, credential entry, Back, resend, the Done
-//! screen and Logout. Core decides everything else.
+//! screen and Logout (with its confirmation and Retry). Core decides
+//! everything else. A command's UI change is made only once core admitted it.
 
 use abyss_core::api::{ApiHash, ApiId, Command};
 use gpui::{Context, Window};
 
 use super::Root;
 use super::auth::{AuthView, Back, Onboarding, Stored, back};
-use super::session::Session;
+use super::session::{LogoutPrompt, Session};
 use crate::ui::copy::onboarding as copy;
-use crate::ui::text_input::Mask;
+use crate::ui::password::{PasswordInput, Reveal};
 
 /// What a credential entry holds, checked like core checks it.
 pub(crate) fn check_entry(api_id: &str, api_hash: &str) -> Result<(ApiId, ApiHash), &'static str> {
@@ -50,31 +51,35 @@ impl Session {
 
     pub(super) fn toggle_hash_mask(&mut self, cx: &mut Context<'_, Root>) {
         self.api_hash.update(cx, |input, cx| {
-            let next = match input.mask() {
-                Mask::Hidden => Mask::Shown,
-                Mask::Shown => Mask::Hidden,
+            let next = match input.reveal() {
+                Reveal::Hidden => Reveal::Shown,
+                Reveal::Shown => Reveal::Hidden,
             };
-            input.set_mask(next, cx);
+            input.set_reveal(next, cx);
         });
         cx.notify();
     }
 
     /// Validates inline, then sends `SubmitCredentials`. The fields are
-    /// cleared once sent.
+    /// wiped once core admitted it; refused, they keep their text.
     pub(super) fn submit_credentials(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         if !matches!(self.auth, AuthView::Onboarding(Onboarding::Entry { .. })) {
             return;
         }
         let id = self.api_id.read(cx).text().to_owned();
-        let hash = zeroize::Zeroizing::new(self.api_hash.read(cx).text().to_owned());
-        match check_entry(&id, &hash) {
+        // A zeroizing copy; the field keeps its fixed buffer until admitted.
+        let hash = self.api_hash.read(cx).secret();
+        let checked = check_entry(&id, std::str::from_utf8(&hash).unwrap_or_default());
+        drop(hash);
+        match checked {
             Ok((api_id, api_hash)) => {
                 self.entry_error = None;
-                self.api_id.update(cx, |input, cx| input.clear(window, cx));
-                self.api_hash
-                    .update(cx, |input, cx| input.clear(window, cx));
                 let api_id = api_id.get();
-                self.send(Command::SubmitCredentials { api_id, api_hash }, window, cx);
+                let cmd = Command::SubmitCredentials { api_id, api_hash };
+                if self.admit_auth(cmd, window, cx).is_ok() {
+                    self.api_id.update(cx, |input, cx| input.clear(window, cx));
+                    self.api_hash.update(cx, PasswordInput::clear);
+                }
             }
             Err(problem) => self.entry_error = Some(problem.into()),
         }
@@ -115,9 +120,39 @@ impl Session {
         }
     }
 
-    pub(super) fn logout(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+    /// Log out deletes local data, so it asks first.
+    pub(super) fn logout(&mut self, _: &mut Window, cx: &mut Context<'_, Root>) {
         if matches!(self.auth, AuthView::SignedIn | AuthView::Done { .. }) {
-            self.send(Command::Logout, window, cx);
+            self.set_logout_prompt(LogoutPrompt::Open);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn cancel_logout(&mut self, _: &mut Window, cx: &mut Context<'_, Root>) {
+        self.set_logout_prompt(LogoutPrompt::Closed);
+        cx.notify();
+    }
+
+    /// Confirmed: the prompt closes once core admitted the logout; refused,
+    /// it stays up for another try.
+    pub(super) fn confirm_logout(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        let signed_in = matches!(self.auth, AuthView::SignedIn | AuthView::Done { .. });
+        if !self.confirming_logout() || !signed_in {
+            self.set_logout_prompt(LogoutPrompt::Closed);
+            return cx.notify();
+        }
+        if self.admit_auth(Command::Logout, window, cx).is_ok() {
+            self.set_logout_prompt(LogoutPrompt::Closed);
+        }
+        cx.notify();
+    }
+
+    /// "Logout incomplete": Retry runs the local deletion again.
+    pub(super) fn retry_logout(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if matches!(self.auth, AuthView::LogoutIncomplete { .. })
+            && self.admit_auth(Command::Logout, window, cx).is_ok()
+        {
+            self.set_auth(AuthView::LoggingOut, window, cx);
         }
     }
 }

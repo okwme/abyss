@@ -96,12 +96,64 @@ fn session_body(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
             cx,
         ))
     });
+    let confirm = session
+        .confirming_logout()
+        .then(|| logout_confirm(cx).into_any_element());
     div()
         .size_full()
         .relative()
         .child(screen)
         .children(logout)
+        .children(confirm)
         .children(session.notice.clone().map(toast))
+        .into_any_element()
+}
+
+/// Logout deletes local data, so it asks first.
+fn logout_confirm(cx: &mut Context<'_, Root>) -> Div {
+    let cancel = on(
+        secondary("logout-cancel", copy::CANCEL),
+        Session::cancel_logout,
+        cx,
+    );
+    let confirm = on(
+        button("logout-confirm", copy::onboarding::LOGOUT),
+        Session::confirm_logout,
+        cx,
+    );
+    modal(
+        card()
+            .bg(white())
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded_md()
+            .child(title(copy::LOGOUT_CONFIRM_TITLE))
+            .child(muted(copy::LOGOUT_CONFIRM_DETAIL))
+            .child(footer(None, vec![cancel, confirm])),
+    )
+}
+
+/// "Logout incomplete": the local deletion failed; Retry runs it again.
+fn logout_incomplete_screen(
+    remote: abyss_core::api::RemoteLogout,
+    cx: &mut Context<'_, Root>,
+) -> AnyElement {
+    use abyss_core::api::RemoteLogout;
+    let remote = matches!(remote, RemoteLogout::Failed(_) | RemoteLogout::TimedOut)
+        .then(|| muted(copy::LOGOUT_REMOTE_UNCONFIRMED));
+    let retry = on(
+        button("retry-logout", copy::onboarding::RETRY),
+        Session::retry_logout,
+        cx,
+    );
+    centered()
+        .child(
+            card()
+                .child(title(copy::LOGOUT_INCOMPLETE_TITLE))
+                .child(error_line(copy::LOGOUT_INCOMPLETE_DETAIL))
+                .children(remote)
+                .child(footer(None, vec![retry])),
+        )
         .into_any_element()
 }
 
@@ -131,6 +183,7 @@ fn auth_screen(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
             cx,
         ),
         AuthView::LoggingOut => onboarding::logging_out_screen(),
+        AuthView::LogoutIncomplete { remote } => logout_incomplete_screen(*remote, cx),
         AuthView::Done {
             has_password,
             saved,
@@ -329,18 +382,20 @@ fn closing_overlay(closing: Closing) -> Option<AnyElement> {
             copy::LOGOUT_UNFINISHED_DETAIL,
         ),
     };
-    Some(
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .occlude()
-            .bg(rgba(0xffff_ffe6))
-            .flex()
-            .justify_center()
-            .items_center()
-            .child(content)
-            .into_any_element(),
-    )
+    Some(modal(content).into_any_element())
+}
+
+/// A layer over the window that blocks the content under it.
+fn modal(content: Div) -> Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .occlude()
+        .bg(rgba(0xffff_ffe6))
+        .flex()
+        .justify_center()
+        .items_center()
+        .child(content)
 }

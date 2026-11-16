@@ -50,6 +50,33 @@ pub fn signed_in_blob(self_id: i64, access_hash: i64) -> zeroize::Zeroizing<Vec<
     critical::encode(&state).unwrap_or_default()
 }
 
+/// Like [`signed_in_blob`], plus an auth key of `key_byte` repeated on every
+/// DC option, so a test can recognize the old account's keys in a later blob.
+#[cfg(test)]
+pub fn signed_in_blob_with_key(
+    self_id: i64,
+    access_hash: i64,
+    key_byte: u8,
+) -> zeroize::Zeroizing<Vec<u8>> {
+    let mut state = critical::CriticalState::default();
+    let options: Vec<DcOption> = (1..=5)
+        .filter_map(|id| state.dc_option(id))
+        .map(|mut o| {
+            o.auth_key = Some([key_byte; 256]);
+            o
+        })
+        .collect();
+    for option in &options {
+        let _ = state.set_dc_option(option);
+    }
+    state.self_user = Some(critical::SelfUser {
+        id: self_id,
+        access_hash,
+        bot: false,
+    });
+    critical::encode(&state).unwrap_or_default()
+}
+
 /// Error returned to grammers from session calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionError {

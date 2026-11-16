@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{Actor, ActorChannels, ActorInit, CacheParts, Internal, open_cache};
+use crate::actor::{Actor, ActorChannels, ActorInit, Identity, Internal, provision_cache};
 use crate::api::{Command, Event, LogoutStatus, SaveStatus, UserError};
 use crate::backend::Backend;
 use crate::backend::grammers::GrammersBackend;
@@ -310,7 +310,12 @@ fn start_with<B: Backend>(
         .name("abyss-core".into())
         .spawn(move || {
             let report = runtime.block_on(async move {
-                let (actor, channels) = bring_up(boot, after_load).await;
+                // Shutdown during startup (a stalled Keychain read or
+                // prompt): nothing was confirmed. The persistence worker is
+                // its own thread, so its stalled call stays off this path.
+                let Some((actor, channels)) = bring_up(boot, after_load).await else {
+                    return ShutdownReport::UNCONFIRMED;
+                };
                 // Spawned so a panic in the actor itself is contained and reported.
                 tokio::spawn(actor.run(channels))
                     .await
@@ -336,9 +341,24 @@ fn start_with<B: Backend>(
     })
 }
 
-/// Loads the session and opens the cache (task 5 wiring, steps 1-2). A
-/// Keychain that cannot be read counts as logged out, with a warning.
+/// [`prepare`], abandoned when shutdown starts first (review round 8): the
+/// startup waits must never hold up the shutdown acknowledgement.
 async fn bring_up<B: Backend>(
+    boot: Boot<B>,
+    after_load: impl FnOnce(),
+) -> Option<(Actor<B>, ActorChannels)> {
+    let cancel = boot.cancel.clone();
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        up = prepare(boot, after_load) => Some(up),
+    }
+}
+
+/// Loads the session and opens the cache (task 5 wiring, steps 1-2). A
+/// Keychain that cannot be read counts as logged out, with a warning. The
+/// cache is bound to the loaded account, or quarantined (plan section 16).
+async fn prepare<B: Backend>(
     boot: Boot<B>,
     after_load: impl FnOnce(),
 ) -> (Actor<B>, ActorChannels) {
@@ -351,24 +371,24 @@ async fn bring_up<B: Backend>(
         internal,
         cancel,
     } = boot;
-    let account = match persist.load_session().await {
-        Ok(loaded) => loaded.snapshot,
+    let (account, identity) = match persist.load_session().await {
+        Ok(loaded) => {
+            let identity = match loaded.snapshot.self_id() {
+                Ok(Some(id)) => Identity::Verified(id),
+                _ => Identity::SignedOut,
+            };
+            (loaded.snapshot, identity)
+        }
         Err(e) => {
             let _ = events.send(Event::Error(UserError::from(&e))).await;
-            persist.fresh_session()
+            (persist.fresh_session(), Identity::Unknown)
         }
     };
     let (handle, cache_parts) = match cache {
-        Some(CacheConfig { dir }) => match open_cache(&persist, dir.clone()).await {
-            Some((handle, key)) => (
-                Some(handle),
-                Some(CacheParts {
-                    dir,
-                    key: Some(key),
-                }),
-            ),
-            None => (None, Some(CacheParts { dir, key: None })),
-        },
+        Some(CacheConfig { dir }) => {
+            let provisioned = provision_cache(&persist, dir, identity).await;
+            (provisioned.served, Some(provisioned.parts))
+        }
         None => (None, None),
     };
     after_load();
@@ -384,6 +404,9 @@ async fn bring_up<B: Backend>(
         cache_parts,
     })
 }
+
+#[cfg(all(test, feature = "fake"))]
+mod startup_tests;
 
 #[cfg(all(test, feature = "fake"))]
 mod tests {

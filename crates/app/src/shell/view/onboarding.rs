@@ -14,7 +14,7 @@ use crate::shell::Root;
 use crate::shell::auth::{Onboarding, Saved, SentView, Stored};
 use crate::shell::session::Session;
 use crate::ui::copy::onboarding as text;
-use crate::ui::text_input::Mask;
+use crate::ui::password::Reveal;
 
 /// The credential screens.
 pub(super) fn screen(
@@ -75,9 +75,9 @@ fn entry(
     stored: Stored,
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
-    let reveal_label = match session.api_hash.read(cx).mask() {
-        Mask::Hidden => text::REVEAL,
-        Mask::Shown => text::HIDE,
+    let reveal_label = match session.api_hash.read(cx).reveal() {
+        Reveal::Hidden => text::REVEAL,
+        Reveal::Shown => text::HIDE,
     };
     let reveal = on(
         secondary("reveal-hash", reveal_label),

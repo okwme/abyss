@@ -15,6 +15,7 @@ impl<B: Backend> Actor<B> {
         match msg {
             AuthMsg::Step { tag, step } => self.on_auth_step(tag, step).await,
             AuthMsg::Cred { attempt, done } => self.on_cred(attempt, done).await,
+            AuthMsg::CacheSettled => self.on_cache_settled().await,
         }
     }
 

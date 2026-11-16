@@ -1,10 +1,13 @@
-//! The 2FA password field (plan section 10).
+//! Masked secret fields: the 2FA password (plan section 10) and the
+//! `api_hash` (plan section 17.3, task 6c).
 //!
 //! A separate element from the vendored editor, which builds plaintext
 //! temporaries on every edit. Here the plaintext lives only in a fixed
 //! [`SecretBuf`](secret::SecretBuf); everything the platform, IME, text
-//! services or the screen can see is bullets. Copy and cut are not handled;
-//! paste is, for password managers.
+//! services or accessibility can read is bullets. Copy and cut are not
+//! handled; paste is, for password managers. The `api_hash` field can be
+//! revealed on screen (Show/Hide); that changes only what is drawn, never
+//! what the platform text APIs return.
 
 mod secret;
 mod secure_input;
@@ -22,6 +25,7 @@ use gpui::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+pub(crate) use self::secret::Filter;
 use self::secret::{BULLET, MaskedEdit, Overflow, bullets};
 use self::secure_input::SecureInputGuard;
 use super::text_input::{
@@ -31,14 +35,22 @@ use super::text_input::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PasswordEvent {
-    /// Enter was pressed. The owner takes the secret with
-    /// [`PasswordInput::take_secret`], which wipes the field.
+    /// Enter was pressed. The owner copies the secret with
+    /// [`PasswordInput::secret`] and wipes the field once core admitted it.
     Submit,
+}
+
+/// Whether a secret field draws its text (the `api_hash` only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reveal {
+    Hidden,
+    Shown,
 }
 
 pub(crate) struct PasswordInput {
     focus_handle: FocusHandle,
     edit: MaskedEdit,
+    reveal: Reveal,
     placeholder: SharedString,
     /// The shaped bullets from the last paint.
     last_line: Option<ShapedLine>,
@@ -52,7 +64,32 @@ pub(crate) struct PasswordInput {
 impl EventEmitter<PasswordEvent> for PasswordInput {}
 
 impl PasswordInput {
+    /// The 2FA password field.
     pub(crate) fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        Self::with_filter(
+            Filter::Password,
+            super::copy::PASSWORD_PLACEHOLDER,
+            window,
+            cx,
+        )
+    }
+
+    /// The `api_hash` field: 32 hex digits, masked until revealed.
+    pub(crate) fn api_hash(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        Self::with_filter(
+            Filter::ApiHash,
+            super::copy::onboarding::API_HASH_PLACEHOLDER,
+            window,
+            cx,
+        )
+    }
+
+    fn with_filter(
+        filter: Filter,
+        placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let subscriptions = [
             cx.on_focus(&focus_handle, window, |this, window, _| {
@@ -67,8 +104,9 @@ impl PasswordInput {
         ];
         Self {
             focus_handle,
-            edit: MaskedEdit::default(),
-            placeholder: super::copy::PASSWORD_PLACEHOLDER.into(),
+            edit: MaskedEdit::new(filter),
+            reveal: Reveal::Hidden,
+            placeholder: placeholder.into(),
             last_line: None,
             last_bounds: None,
             is_selecting: false,
@@ -94,7 +132,26 @@ impl PasswordInput {
         self.edit.is_empty()
     }
 
+    pub(crate) fn reveal(&self) -> Reveal {
+        self.reveal
+    }
+
+    /// Shows or hides the text on screen. The password never shows.
+    pub(crate) fn set_reveal(&mut self, reveal: Reveal, cx: &mut Context<'_, Self>) {
+        if self.edit.filter() == Filter::ApiHash {
+            self.reveal = reveal;
+            cx.notify();
+        }
+    }
+
+    /// A copy of the secret; the field keeps it (wipe it with
+    /// [`Self::clear`] once the submission was accepted).
+    pub(crate) fn secret(&self) -> Zeroizing<Vec<u8>> {
+        self.edit.copy()
+    }
+
     /// Hands the secret over and wipes the field.
+    #[cfg(test)]
     pub(crate) fn take_secret(&mut self, cx: &mut Context<'_, Self>) -> Zeroizing<Vec<u8>> {
         let secret = self.edit.take();
         cx.notify();
@@ -251,31 +308,39 @@ impl PasswordInput {
         }
     }
 
-    /// The current shaped bullets, if they match the secret's length.
+    /// The current shaped line, if it matches the secret's length.
     fn line(&self) -> Option<&ShapedLine> {
         self.last_line
             .as_ref()
-            .filter(|l| l.len() == masked_offset(self.edit.len()))
+            .filter(|l| l.len() == self.masked_offset(self.edit.len()))
     }
 
     fn index_for_position(&self, position: Point<Pixels>) -> usize {
         match (self.line(), self.last_bounds) {
             (Some(line), Some(bounds)) => {
-                char_offset(line.closest_index_for_x(position.x - bounds.left()))
+                self.char_offset(line.closest_index_for_x(position.x - bounds.left()))
             }
             _ => self.edit.cursor(),
         }
     }
-}
 
-/// Byte offset in the bullet string of char `i`.
-fn masked_offset(i: usize) -> usize {
-    i * BULLET.len_utf8()
-}
+    /// Bytes per drawn char: a bullet, or a revealed hex digit (ASCII).
+    fn glyph_len(&self) -> usize {
+        match self.reveal {
+            Reveal::Hidden => BULLET.len_utf8(),
+            Reveal::Shown => 1,
+        }
+    }
 
-/// Char index of a byte offset in the bullet string.
-fn char_offset(byte: usize) -> usize {
-    byte / BULLET.len_utf8()
+    /// Byte offset in the drawn string of char `i`.
+    fn masked_offset(&self, i: usize) -> usize {
+        i * self.glyph_len()
+    }
+
+    /// Char index of a byte offset in the drawn string.
+    fn char_offset(&self, byte: usize) -> usize {
+        byte / self.glyph_len()
+    }
 }
 
 impl EntityInputHandler for PasswordInput {
@@ -372,11 +437,11 @@ impl EntityInputHandler for PasswordInput {
         let r = self.edit.clamp(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + line.x_for_index(masked_offset(r.start)),
+                bounds.left() + line.x_for_index(self.masked_offset(r.start)),
                 bounds.top(),
             ),
             point(
-                bounds.left() + line.x_for_index(masked_offset(r.end)),
+                bounds.left() + line.x_for_index(self.masked_offset(r.end)),
                 bounds.bottom(),
             ),
         ))
@@ -401,18 +466,26 @@ impl EntityInputHandler for PasswordInput {
         _cx: &mut Context<'_, Self>,
     ) -> Option<usize> {
         let local = self.last_bounds?.localize(&point)?;
-        Some(char_offset(self.line()?.closest_index_for_x(local.x)))
+        Some(self.char_offset(self.line()?.closest_index_for_x(local.x)))
     }
 }
 
 /// The bullets (or placeholder) to shape, with the marked range underlined.
+/// A revealed `api_hash` is drawn as itself: the shaped copy is the residual
+/// cost of Show (plan risk 9), and the platform still only sees bullets.
 fn masked_runs(input: &PasswordInput, style: &TextStyle) -> (SharedString, Vec<TextRun>) {
     let len = input.edit.len();
     let (text, color) = if len == 0 {
         (input.placeholder.clone(), style.color.opacity(0.4))
+    } else if input.reveal == Reveal::Shown {
+        (
+            SharedString::from(input.edit.reveal().to_owned()),
+            style.color,
+        )
     } else {
         (SharedString::from(bullets(len)), style.color)
     };
+    let masked_offset = |i: usize| input.masked_offset(i);
     let run = TextRun {
         len: text.len(),
         font: style.font(),
@@ -501,7 +574,7 @@ impl Element for PasswordElement {
             .text_system()
             .shape_line(text, font_size, &runs, None);
         let sel = input.edit.selected();
-        let x = |i: usize| bounds.left() + line.x_for_index(masked_offset(i));
+        let x = |i: usize| bounds.left() + line.x_for_index(input.masked_offset(i));
         let (selection, cursor) = if sel.is_empty() {
             let at = point(x(input.edit.cursor()), bounds.top());
             (

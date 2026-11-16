@@ -41,14 +41,26 @@ pub(crate) fn logged_out(remote: RemoteLogout, local: LocalDeletion) -> SharedSt
             " Telegram didn't confirm it: end the session from Active Sessions on another device."
         }
     };
-    let local = match local {
-        LocalDeletion::Deleted => "",
-        LocalDeletion::Failed(_) => {
-            " Some local data couldn't be deleted; signing out again retries."
-        }
-    };
-    format!("Signed out.{remote}{local}").into()
+    match local {
+        LocalDeletion::Deleted => format!("Signed out.{remote}").into(),
+        LocalDeletion::Failed(_) => format!("{LOGOUT_INCOMPLETE_TITLE}.{remote}").into(),
+    }
 }
+
+/// A logout whose local deletion failed (plan section 5).
+pub(crate) const LOGOUT_INCOMPLETE_TITLE: &str = "Logout incomplete";
+pub(crate) const LOGOUT_INCOMPLETE_DETAIL: &str = "Some of this account's data couldn't be \
+     deleted from this Mac, and the session key may remain in the Keychain. Retry to finish \
+     before signing in again.";
+/// The remote half of an incomplete logout failed too.
+pub(crate) const LOGOUT_REMOTE_UNCONFIRMED: &str = "Telegram didn't confirm the sign-out: end \
+     the session from Active Sessions on another device.";
+
+/// Logout asks first: it deletes local data (plan section 17.3, task 6c).
+pub(crate) const LOGOUT_CONFIRM_TITLE: &str = "Log out?";
+pub(crate) const LOGOUT_CONFIRM_DETAIL: &str = "This ends the session with Telegram and deletes \
+     this account's session and cached messages from this Mac.";
+pub(crate) const CANCEL: &str = "Cancel";
 
 pub(crate) fn password_detail(hint: Option<&str>) -> SharedString {
     match hint {
@@ -70,7 +82,7 @@ pub(crate) const CORE_GONE: &str = "abyss's core has stopped.";
 pub(crate) const CLOSING: &str = "Closing…";
 pub(crate) const UNCONFIRMED_TITLE: &str = "Couldn't confirm the session was saved";
 pub(crate) const UNCONFIRMED_DETAIL: &str = "You may need to sign in again next time.";
-pub(crate) const LOGOUT_UNFINISHED_TITLE: &str = "Sign-out didn't finish";
+pub(crate) const LOGOUT_UNFINISHED_TITLE: &str = LOGOUT_INCOMPLETE_TITLE;
 pub(crate) const LOGOUT_UNFINISHED_DETAIL: &str = "Some of this account's data may still be on \
      this Mac. Open abyss again and sign out to finish deleting it.";
 pub(crate) const QUIT: &str = "Quit";

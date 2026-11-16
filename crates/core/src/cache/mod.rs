@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 mod worker;
-pub use db::{Cache, EraseError};
+pub use db::{Binding, Cache, EraseError};
 pub(crate) use worker::CacheCmd;
 pub use worker::{CACHE_QUEUE, CacheHandle, DeleteKey, EraseFailure, KeyError, WorkerError};
 

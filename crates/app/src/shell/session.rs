@@ -14,11 +14,11 @@ use super::Root;
 use super::auth::{AuthView, project};
 use super::bridge::{CoreLink, EventSource, SharedCore, spawn_pump};
 use super::shutdown::{self, Closing, Next};
-use crate::chat::ChatShell;
+use crate::chat::{ChatShell, Refused};
 use crate::launch::Launch;
 use crate::ui::copy;
 use crate::ui::password::{PasswordEvent, PasswordInput};
-use crate::ui::text_input::{Limits, Mask, TextInput, TextInputEvent, text_input};
+use crate::ui::text_input::{Limits, TextInput, TextInputEvent, text_input};
 
 /// How long a notice (toast) stays up.
 const NOTICE_FOR: Duration = Duration::from_secs(5);
@@ -84,9 +84,12 @@ pub(crate) struct Session {
     pub(super) phone: Entity<TextInput>,
     pub(super) code: Entity<TextInput>,
     pub(super) password: Entity<PasswordInput>,
-    /// Credential entry (plan section 17.3).
+    /// Credential entry (plan section 17.3). The `api_hash` is a masked
+    /// secret field, like the password.
     pub(super) api_id: Entity<TextInput>,
-    pub(super) api_hash: Entity<TextInput>,
+    pub(super) api_hash: Entity<PasswordInput>,
+    /// Log out was pressed and waits for confirmation.
+    logout_prompt: bool,
     /// Inline validation of the credential entry.
     pub(super) entry_error: Option<SharedString>,
     /// Which credential source is in control (core's `CredentialSource`).
@@ -113,13 +116,8 @@ impl Session {
         let composer = text_input(Limits::COMPOSER, copy::COMPOSER_PLACEHOLDER, cx);
         let password = cx.new(|cx| PasswordInput::new(window, cx));
         let api_id = text_input(Limits::API_ID, copy::onboarding::API_ID_PLACEHOLDER, cx);
-        let api_hash = text_input(Limits::API_HASH, copy::onboarding::API_HASH_PLACEHOLDER, cx);
-        api_hash.update(cx, |input, cx| input.set_mask(Mask::Hidden, cx));
-        let [id_sub, hash_sub] = [&api_id, &api_hash].map(|input| {
-            cx.subscribe_in(input, window, |root, _, _: &TextInputEvent, window, cx| {
-                root.with_session(|s, cx| s.submit_credentials(window, cx), cx);
-            })
-        });
+        let api_hash = cx.new(|cx| PasswordInput::api_hash(window, cx));
+        let [id_sub, hash_sub] = credential_subscriptions(&api_id, &api_hash, window, cx);
         let subscriptions = [
             id_sub,
             hash_sub,
@@ -156,6 +154,7 @@ impl Session {
             password,
             api_id,
             api_hash,
+            logout_prompt: false,
             entry_error: None,
             source: None,
             composer,
@@ -181,6 +180,30 @@ impl Session {
         if let Err(refused) = super::chats::admit(&self.core, cmd) {
             self.show_refused(refused, window, cx);
         }
+    }
+
+    /// Queues an auth command; the caller changes the UI only on `Ok`, so a
+    /// refused command changes nothing and the user can submit again (as
+    /// the chat commands do, task 10b). Refused, it shows "busy".
+    pub(super) fn admit_auth(
+        &mut self,
+        cmd: Command,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) -> Result<(), Refused> {
+        let admitted = super::chats::admit(&self.core, cmd);
+        if let Err(refused) = admitted {
+            self.show_refused(refused, window, cx);
+        }
+        admitted
+    }
+
+    pub(super) fn confirming_logout(&self) -> bool {
+        self.logout_prompt
+    }
+
+    pub(super) fn set_logout_prompt(&mut self, open: LogoutPrompt) {
+        self.logout_prompt = open == LogoutPrompt::Open;
     }
 
     pub(super) fn show_notice(
@@ -266,20 +289,28 @@ impl Session {
             return;
         }
         let phone = self.phone.read(cx).text().to_owned();
-        self.auth = self.auth.cleared();
-        self.send(Command::SubmitPhone(phone), window, cx);
+        if self
+            .admit_auth(Command::SubmitPhone(phone), window, cx)
+            .is_ok()
+        {
+            self.auth = self.auth.cleared();
+        }
         cx.notify();
     }
 
+    /// The code leaves the field only once core accepted it.
     pub(super) fn submit_code(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         if !matches!(self.auth, AuthView::Code { .. }) {
             return;
         }
-        let code = self
-            .code
-            .update(cx, |input, cx| input.take_text(window, cx));
-        self.auth = self.auth.cleared();
-        self.send(Command::SubmitCode(code), window, cx);
+        let code = self.code.read(cx).text().to_owned();
+        if self
+            .admit_auth(Command::SubmitCode(code), window, cx)
+            .is_ok()
+        {
+            self.code.update(cx, |input, cx| input.clear(window, cx));
+            self.auth = self.auth.cleared();
+        }
         cx.notify();
     }
 
@@ -289,17 +320,30 @@ impl Session {
         if !matches!(self.auth, AuthView::Password { .. }) {
             return;
         }
-        self.auth = self.auth.cleared();
-        if std::mem::take(&mut self.needs_params) {
-            self.send(Command::RetryPasswordParams, window, cx);
+        if self.needs_params {
+            if self
+                .admit_auth(Command::RetryPasswordParams, window, cx)
+                .is_ok()
+            {
+                self.needs_params = false;
+                self.auth = self.auth.cleared();
+            }
             cx.notify();
             return;
         }
-        let secret = self.password.update(cx, PasswordInput::take_secret);
+        // A copy: the field keeps the password until core accepted it.
+        let secret = self.password.read(cx).secret();
         let buf = PasswordBuf::from_slice(&secret);
         drop(secret);
         if let Ok(buf) = buf {
-            self.send(Command::SubmitPassword(buf), window, cx);
+            // A refused command is dropped, zeroizing the copy.
+            if self
+                .admit_auth(Command::SubmitPassword(buf), window, cx)
+                .is_ok()
+            {
+                self.password.update(cx, PasswordInput::clear);
+                self.auth = self.auth.cleared();
+            }
         } else if let Some(next) = self
             .auth
             .with_error(UserError::InvalidPassword, Instant::now())
@@ -358,6 +402,7 @@ impl Session {
         }
         self.closing = Closing::Waiting;
         self.password.update(cx, PasswordInput::clear);
+        self.api_hash.update(cx, PasswordInput::clear);
         let ack = self
             .core
             .try_borrow_mut()
@@ -391,6 +436,33 @@ impl Session {
             drop(core.begin_shutdown());
         }
     }
+}
+
+/// Whether the logout confirmation is up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogoutPrompt {
+    Open,
+    Closed,
+}
+
+/// Enter in either credential field submits both.
+fn credential_subscriptions(
+    api_id: &Entity<TextInput>,
+    api_hash: &Entity<PasswordInput>,
+    window: &mut Window,
+    cx: &mut Context<'_, Root>,
+) -> [Subscription; 2] {
+    let id_sub = cx.subscribe_in(api_id, window, |root, _, _: &TextInputEvent, window, cx| {
+        root.with_session(|s, cx| s.submit_credentials(window, cx), cx);
+    });
+    let hash_sub = cx.subscribe_in(
+        api_hash,
+        window,
+        |root, _, _: &PasswordEvent, window, cx| {
+            root.with_session(|s, cx| s.submit_credentials(window, cx), cx);
+        },
+    );
+    [id_sub, hash_sub]
 }
 
 /// Re-renders a countdown every second until it ends.

@@ -13,6 +13,7 @@ mod logout;
 mod onboarding;
 mod review4b;
 mod review4c;
+mod review6c;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{Actor, ActorInit, CacheParts, Internal, open_cache};
+use super::{Actor, ActorInit, Identity, Internal, provision_cache};
 use crate::ShutdownReport;
 use crate::api::{AuthState, Command, ConnState, Event, HistoryDir, SendState, UserError};
 use crate::backend::fake::{
@@ -73,6 +74,53 @@ struct Setup {
     stored_creds: Option<crate::api::ApiCredentials>,
     /// Reading the credential item fails (a locked Keychain).
     creds_locked: bool,
+    /// Reuse this store (a restart) instead of a new one; `signed_out` and
+    /// a `StoredSession::Blob` are then ignored.
+    store: Option<MemoryStore>,
+    session: StoredSession,
+}
+
+/// The session item at startup (task 6c).
+#[derive(Default)]
+enum StoredSession {
+    /// The default signed-in one (unless `signed_out`).
+    #[default]
+    Default,
+    /// This item instead.
+    Blob(zeroize::Zeroizing<Vec<u8>>),
+    /// Reading it fails at startup (an unreadable Keychain).
+    Unreadable,
+}
+
+/// The store the harness starts over.
+fn prepare_store(setup: &Setup) -> MemoryStore {
+    let Some(store) = setup.store.clone() else {
+        let store = MemoryStore::new();
+        if !setup.signed_out {
+            let blob = match &setup.session {
+                StoredSession::Blob(blob) => blob.clone(),
+                _ => signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH),
+            };
+            store.set(SecretItem::Session, &blob).unwrap();
+        }
+        return store;
+    };
+    store
+}
+
+/// Loads the session as `core::prepare` does.
+async fn load(persist: &PersistHandle) -> (crate::session::SessionSnapshot, Identity) {
+    match persist.load_session().await {
+        Ok(loaded) => {
+            let identity = loaded
+                .snapshot
+                .self_id()
+                .unwrap()
+                .map_or(Identity::SignedOut, Identity::Verified);
+            (loaded.snapshot, identity)
+        }
+        Err(_) => (persist.fresh_session(), Identity::Unknown),
+    }
 }
 
 async fn harness(script: FakeScript, cache: Option<CacheHandle>) -> Harness {
@@ -94,15 +142,8 @@ async fn harness_with(
 }
 
 async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness {
-    let store = MemoryStore::new();
-    if !setup.signed_out {
-        store
-            .set(
-                SecretItem::Session,
-                &signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH),
-            )
-            .unwrap();
-    }
+    let store = prepare_store(&setup);
+    let unreadable = matches!(setup.session, StoredSession::Unreadable);
     if let Some(creds) = &setup.stored_creds {
         store
             .set(
@@ -115,16 +156,18 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
     if setup.creds_locked {
         faults.fail_get_of(SecretItem::ApiCredentials);
     }
+    if unreadable {
+        faults.fail_get_of(SecretItem::Session);
+    }
     let persist = PersistHandle::spawn(wrapped).unwrap();
-    let account = persist.load_session().await.unwrap().snapshot;
+    let (account, identity) = load(&persist).await;
+    if unreadable {
+        faults.heal_item(SecretItem::Session);
+    }
     let (cache, cache_parts) = match setup.cache_dir {
         Some(dir) => {
-            let (handle, key) = open_cache(&persist, dir.clone()).await.unwrap();
-            let parts = CacheParts {
-                dir,
-                key: Some(key),
-            };
-            (Some(handle), Some(parts))
+            let provisioned = provision_cache(&persist, dir, identity).await;
+            (provisioned.served, Some(provisioned.parts))
         }
         None => (setup.cache, None),
     };

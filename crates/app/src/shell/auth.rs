@@ -9,8 +9,8 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use abyss_core::api::{
-    AuthState, CodeDelivery, CredentialError, CredentialSource, NewLogin, NextDelivery,
-    SentCodeInfo, UserError,
+    AuthState, CodeDelivery, CredentialError, CredentialSource, LocalDeletion, NewLogin,
+    NextDelivery, RemoteLogout, SentCodeInfo, UserError,
 };
 use gpui::SharedString;
 
@@ -76,6 +76,11 @@ pub(crate) enum AuthView {
     SignUpRequired,
     OfficialAppRequired,
     LoggingOut,
+    /// The logout's local deletion failed: "Logout incomplete" with Retry.
+    /// Core accepts no login until the retry succeeds.
+    LogoutIncomplete {
+        remote: RemoteLogout,
+    },
     /// A login finished in this run: tips, then the chats.
     Done {
         has_password: Option<bool>,
@@ -230,6 +235,10 @@ pub(crate) fn project(state: AuthState, prev: &AuthView, now: Instant) -> Projec
         AuthState::SignedIn { new_login, .. } => signed_in(new_login, Saved::Yes),
         AuthState::SignedInUnsaved { new_login, .. } => signed_in(new_login, Saved::No),
         AuthState::LoggingOut => Projection::view(AuthView::LoggingOut),
+        AuthState::LoggedOut {
+            remote,
+            local: LocalDeletion::Failed(_),
+        } => Projection::view(AuthView::LogoutIncomplete { remote }),
         AuthState::LoggedOut { remote, local } => {
             Projection::with_notice(AuthView::Connecting, copy::logged_out(remote, local))
         }
@@ -277,6 +286,7 @@ pub(crate) fn back(view: &AuthView, source: Option<CredentialSource>) -> Back {
         | AuthView::Connecting
         | AuthView::Verifying { .. }
         | AuthView::LoggingOut
+        | AuthView::LogoutIncomplete { .. }
         | AuthView::Done { .. }
         | AuthView::SignedIn => Back::None,
     }
@@ -432,6 +442,29 @@ mod tests {
             local: LocalDeletion::Deleted,
         };
         assert!(project(gone, &AuthView::LoggingOut, now).notice.is_some());
+    }
+
+    /// Task 6c: a failed local deletion is never shown as "Signed out".
+    #[test]
+    fn failed_local_deletion_is_logout_incomplete() {
+        let failed = AuthState::LoggedOut {
+            remote: RemoteLogout::Revoked,
+            local: LocalDeletion::Failed(abyss_core::api::StorageError::Internal),
+        };
+        let p = project(failed, &AuthView::LoggingOut, Instant::now());
+        assert_eq!(
+            p.view,
+            AuthView::LogoutIncomplete {
+                remote: RemoteLogout::Revoked
+            }
+        );
+        assert_eq!(p.notice, None);
+        let text = crate::ui::copy::logged_out(
+            RemoteLogout::Revoked,
+            LocalDeletion::Failed(abyss_core::api::StorageError::Internal),
+        );
+        assert!(text.starts_with("Logout incomplete"), "{text}");
+        assert!(!text.contains("Signed out"), "{text}");
     }
 
     #[test]
