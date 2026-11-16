@@ -230,6 +230,8 @@ impl<B: Backend> Actor<B> {
     async fn start_snapshots(&mut self, kind: BootKind) {
         if kind == BootKind::Full {
             self.purge_queued();
+            // Deferred loads were for windows that are invalidated now.
+            self.deferred.clear();
             for (chat, _) in self.windows.invalidate_all() {
                 self.emit(Event::ChatInvalidated(chat)).await;
             }

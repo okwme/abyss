@@ -1,12 +1,13 @@
 //! Glue between the session and the chat shell (`crate::chat`): routes chat
 //! events in, lends the shell an admission function so its UI changes follow
-//! only admitted commands, wires window focus and system wake, and checks
-//! what the message list showed after each painted frame.
+//! only admitted commands, wires window focus and system wake, checks what
+//! the message list showed after each painted frame, and wakes the shell
+//! when a refused or failed command's backoff ends (`chat::retry`).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use abyss_core::SendError;
-use abyss_core::api::{Command, Event, SendState, UserError, WindowState};
+use abyss_core::api::{Command, Event, LoadTarget, SendState, UserError, WindowState};
 use abyss_core::model::{ChatId, LocalId};
 use gpui::{App, Context, Focusable, Subscription, WeakEntity, Window};
 
@@ -81,7 +82,7 @@ impl Session {
     ) -> Option<R> {
         let core = &self.core;
         let mut admit = |cmd: Command| admit(core, cmd);
-        match f(&mut self.shell, &mut admit) {
+        let out = match f(&mut self.shell, &mut admit) {
             Ok(r) => Some(r),
             Err(refused) => {
                 tracing::debug!(?refused, "core refused a chat command");
@@ -90,7 +91,47 @@ impl Session {
                 }
                 None
             }
+        };
+        self.schedule_retry(window, cx);
+        out
+    }
+
+    /// Wakes the shell once when the earliest waiting retry is due (a
+    /// refused focus change, dialogs page, frame command or a failed load),
+    /// unless an earlier wake-up is already scheduled.
+    fn schedule_retry(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        let now = cx.background_executor().now();
+        let Some(due) = self.shell.retry_due(now) else {
+            return;
+        };
+        if !self.shell.schedule_retry(due) {
+            return;
         }
+        let wait = due.saturating_duration_since(now);
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update_in(cx, |root, window, cx| {
+                root.with_session(|s, cx| s.retry_fired(due, window, cx), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A retry wake-up: re-sends what is due (focus, dialogs) and redraws,
+    /// so the frame check retries frame-driven commands.
+    fn retry_fired(&mut self, due: Instant, window: &mut Window, cx: &mut Context<'_, Root>) {
+        self.shell.retry_fired(due);
+        let now = cx.background_executor().now();
+        self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
+            let focus = if s.focus_out_of_sync() {
+                s.sync_focus(now, admit)
+            } else {
+                Ok(())
+            };
+            focus.and(s.request_dialogs(now, admit))
+        });
+        cx.notify();
     }
 
     pub(super) fn show_refused(
@@ -119,25 +160,40 @@ impl Session {
                 ..
             }
         );
-        let paged = matches!(event, Event::DialogsPaging { .. });
-        self.shell.apply(event);
+        let paged = matches!(
+            event,
+            Event::DialogsPaging { .. }
+                | Event::LoadEnded {
+                    target: LoadTarget::Dialogs,
+                    ..
+                }
+        );
+        let now = cx.background_executor().now();
+        if let Event::LoadEnded { target, error } = event {
+            self.shell.load_ended(target, error, now);
+        } else {
+            self.shell.apply(event);
+        }
         if flood {
             self.start_countdown(window, cx);
         }
-        // An empty list renders no rows, so nothing else would ask for the
-        // next page (a first page of broadcast channels only).
-        if paged && self.shell.list.is_empty() {
+        // The sidebar may want the next page whatever it renders: an empty
+        // list renders no row to ask (a first page of broadcast channels
+        // only). A refusal retries after a backoff.
+        if paged {
             self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
-                s.request_dialogs(0, admit)
+                s.request_dialogs(now, admit)
             });
         }
+        self.schedule_retry(window, cx);
     }
 
     /// After a painted frame: load more, mark read, report the live tail.
     pub(super) fn check_frame(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         let seen = self.shell.seen();
+        let now = cx.background_executor().now();
         self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
-            s.frame_seen(seen, admit)
+            s.frame_seen(seen, now, admit)
         });
     }
 
@@ -147,8 +203,9 @@ impl Session {
         } else {
             WindowState::Inactive
         };
+        let now = cx.background_executor().now();
         self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
-            s.set_focus(state, admit)
+            s.set_focus(state, now, admit)
         });
         // Redraw, so the frame check sees the active window.
         cx.notify();
@@ -241,14 +298,15 @@ impl Session {
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        if !self.shell.wants_dialogs(last_visible) {
+        let now = cx.background_executor().now();
+        if !self.shell.dialogs_seen(last_visible, now) {
             return;
         }
         cx.defer_in(window, move |root, window, cx| {
             root.with_session(
                 |s, cx| {
                     s.drive(OnRefusal::Quiet, window, cx, |s, admit| {
-                        s.request_dialogs(last_visible, admit)
+                        s.request_dialogs(now, admit)
                     })
                 },
                 cx,

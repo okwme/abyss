@@ -386,8 +386,8 @@ impl Session {
     }
 
     fn on_error(&mut self, error: UserError, window: &mut Window, cx: &mut Context<'_, Root>) {
+        // Errors never end a load: core says which ended (`LoadEnded`).
         tracing::info!(?error, "core reported an error");
-        self.shell.load_failed();
         match self.auth.with_error(error, Instant::now()) {
             Some(next) => self.set_auth(next, window, cx),
             None => self.show_notice(copy::user_error(error), window, cx),

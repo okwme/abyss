@@ -57,6 +57,14 @@ pub struct Last {
     pub preview: Preview,
 }
 
+/// Whether a new message `new` changes a chat whose newest known message is
+/// `known`: only a newer id does (a chat with no known id takes any). An
+/// unpinned chat it changes moves to the top of its section. The UI mirrors
+/// the order with this same rule (`Event::ChatBumped`).
+pub fn bump_moves(known: Option<MsgId>, new: MsgId) -> bool {
+    known.is_none_or(|k| new > k)
+}
+
 impl Last {
     pub fn of(m: &Message) -> Self {
         Self {
@@ -224,12 +232,7 @@ impl Dialogs {
         let Some(pos) = self.list.iter().position(|c| c.id == chat) else {
             return Bump::Unknown;
         };
-        if self
-            .list
-            .get(pos)
-            .and_then(|c| c.last_id)
-            .is_some_and(|known| known >= last.id)
-        {
+        if !bump_moves(self.list.get(pos).and_then(|c| c.last_id), last.id) {
             return Bump::Reflected;
         }
         let provisional = pos >= self.confirmed;

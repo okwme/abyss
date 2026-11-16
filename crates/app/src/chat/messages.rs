@@ -4,10 +4,13 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::time::Instant;
 
-use abyss_core::api::HistoryDir;
+use abyss_core::api::{HistoryDir, UserError};
 use abyss_core::model::{ChatId, Message, MsgId};
 use abyss_core::store::{MAX_MESSAGES_PER_CHAT, ViewGen};
+
+use super::retry::{Backoff, earliest};
 
 /// Rows from either end of the window at which the next page is requested.
 pub(crate) const LOAD_MARGIN: usize = 10;
@@ -87,11 +90,69 @@ enum End {
     Newest,
 }
 
-/// History loads asked of core and not answered yet.
+/// One direction's history loading.
+#[derive(Clone, Copy, Debug, Default)]
+struct DirLoad {
+    /// Core admitted a load and has not answered it (`History` in this
+    /// direction, `LoadEnded`, or a `Reconciled` of the view).
+    pending: bool,
+    /// Core said there was nothing to load: wait for the next history
+    /// event of the window before asking again, so a disagreement about
+    /// what is left cannot loop.
+    parked: bool,
+    /// Failed loads: bounded, spaced retries.
+    retry: Backoff,
+}
+
+impl DirLoad {
+    fn may_ask(&self, now: Instant) -> bool {
+        !self.pending && !self.parked && self.retry.ready(now)
+    }
+
+    /// Core answered this direction with history.
+    fn answered(&mut self) {
+        *self = Self::default();
+    }
+
+    fn ended(&mut self, error: Option<UserError>, now: Instant) {
+        if !self.pending {
+            return; // not ours (a load core started itself)
+        }
+        self.pending = false;
+        match error {
+            None => self.parked = true,
+            Some(_) => self.retry.failed(now),
+        }
+    }
+
+    fn due(&self, now: Instant) -> Option<Instant> {
+        (!self.pending && !self.parked)
+            .then(|| self.retry.due(now))
+            .flatten()
+    }
+}
+
+/// History loads asked of core, per direction.
 #[derive(Clone, Copy, Debug, Default)]
 struct Pending {
-    older: bool,
-    newer: bool,
+    older: DirLoad,
+    newer: DirLoad,
+}
+
+impl Pending {
+    fn dir(&mut self, dir: HistoryDir) -> Option<&mut DirLoad> {
+        match dir {
+            HistoryDir::Older => Some(&mut self.older),
+            HistoryDir::Newer => Some(&mut self.newer),
+            HistoryDir::Tail => None,
+        }
+    }
+
+    /// The window changed: a parked direction may ask again.
+    fn unpark(&mut self) {
+        self.older.parked = false;
+        self.newer.parked = false;
+    }
 }
 
 #[derive(Debug)]
@@ -181,12 +242,16 @@ impl MessageWindow {
             self.view = Some(b.view);
             self.has_older = true;
             self.has_newer = false;
+            // Loads asked of the old view are over with it.
+            self.pending = Pending::default();
         }
-        // Any answer ends a load: core runs one history load per chat at a
-        // time and drops requests while one runs, so a stuck flag would stall
-        // scrolling. A duplicate request is harmless.
-        self.pending.older = false;
-        self.pending.newer = false;
+        // An answer in a direction ends its load; core queues a load asked
+        // while another runs, so the other direction is still answered.
+        // Any change to the window lets a parked direction ask again.
+        if let Some(load) = self.pending.dir(b.dir) {
+            load.answered();
+        }
+        self.pending.unpark();
         let mut splices = Splices::default();
         let trimmed = !b.removed.is_empty();
         self.remove_ids(&b.removed, &mut splices);
@@ -289,37 +354,54 @@ impl MessageWindow {
         self.messages.clear();
         self.has_older = true;
         self.has_newer = false;
-        self.pending.older = false;
-        self.pending.newer = false;
+        self.pending = Pending::default();
         Applied::Reset
     }
 
-    /// A load failed: allow the next scroll to ask again.
-    pub(crate) fn clear_pending(&mut self) {
-        self.pending.older = false;
-        self.pending.newer = false;
+    /// Core reconciled `view` with the server: any load it was asked for is
+    /// over (core finished or queued it; asking again is harmless), and a
+    /// parked or failing direction may ask again.
+    pub(crate) fn reconciled(&mut self, view: ViewGen) {
+        if self.view == Some(view) {
+            self.pending = Pending::default();
+        }
+    }
+
+    /// A load in `dir` ended without history (`Event::LoadEnded`): nothing
+    /// to load parks the direction until the window changes; a failure
+    /// waits out a backoff.
+    pub(crate) fn load_ended(&mut self, dir: HistoryDir, error: Option<UserError>, now: Instant) {
+        if let Some(load) = self.pending.dir(dir) {
+            load.ended(error, now);
+        }
+    }
+
+    /// When a failed load may be asked again, if one waits past `now`.
+    pub(crate) fn retry_due(&self, now: Instant) -> Option<Instant> {
+        earliest(self.pending.older.due(now), self.pending.newer.due(now))
     }
 
     /// Whether to ask for older history with row `first_visible` on screen.
-    pub(crate) fn wants_older(&self, first_visible: usize) -> bool {
-        self.is_loaded() && self.has_older && !self.pending.older && first_visible < LOAD_MARGIN
+    pub(crate) fn wants_older(&self, first_visible: usize, now: Instant) -> bool {
+        self.is_loaded()
+            && self.has_older
+            && self.pending.older.may_ask(now)
+            && first_visible < LOAD_MARGIN
     }
 
     /// Whether to ask for newer history with message row `last_visible` on
     /// screen (only while detached from the live tail).
-    pub(crate) fn wants_newer(&self, last_visible: usize) -> bool {
+    pub(crate) fn wants_newer(&self, last_visible: usize, now: Instant) -> bool {
         self.is_loaded()
             && self.has_newer
-            && !self.pending.newer
+            && self.pending.newer.may_ask(now)
             && last_visible.saturating_add(LOAD_MARGIN) >= self.messages.len()
     }
 
     /// Core admitted a load in `dir`; no other until it is answered.
     pub(crate) fn requested(&mut self, dir: HistoryDir) {
-        match dir {
-            HistoryDir::Older => self.pending.older = true,
-            HistoryDir::Newer => self.pending.newer = true,
-            HistoryDir::Tail => {}
+        if let Some(load) = self.pending.dir(dir) {
+            load.pending = true;
         }
     }
 }

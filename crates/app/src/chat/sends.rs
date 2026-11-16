@@ -10,16 +10,9 @@ use abyss_core::api::SendState;
 use abyss_core::model::{ChatId, LocalId, MsgId};
 
 /// Same bound as core's pending-send table: an echo exists only while core
-/// may still report on its send.
+/// may still report on its send. A `SentUnconfirmed` echo (the server has
+/// the message; only its id is unknown) gives way to a new send at the cap.
 pub(crate) const MAX_ECHOES: usize = 256;
-
-/// `Reconciled` events of its chat a `SentUnconfirmed` echo needs before it
-/// leaves. Core runs one history load per chat at a time and drops replies
-/// of superseded views, so the first `Reconciled` after the send was
-/// accepted may answer a tail requested before it; the second was requested
-/// after the first finished, so after the acceptance, and shows the
-/// server's copy.
-const UNCONFIRMED_RECONCILES: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Echo {
@@ -31,8 +24,6 @@ pub(crate) struct Echo {
     pub(crate) date: i64,
     /// When core resends a flood-waiting send (`SendState::FloodWait`).
     resend_at: Option<Instant>,
-    /// `Reconciled` events of its chat seen since it became `SentUnconfirmed`.
-    reconciles: u8,
 }
 
 impl Echo {
@@ -44,7 +35,6 @@ impl Echo {
             state: SendState::Sending,
             date,
             resend_at: None,
-            reconciles: 0,
         }
     }
 
@@ -77,15 +67,25 @@ pub(crate) struct Echoes {
 pub(crate) struct Full;
 
 impl Echoes {
+    /// Whether a new send has no room: the table is at its cap and no
+    /// `SentUnconfirmed` echo can give way.
     pub(crate) fn is_full(&self) -> bool {
-        self.list.len() >= MAX_ECHOES
+        self.list.len() >= MAX_ECHOES && self.oldest_unconfirmed().is_none()
+    }
+
+    fn oldest_unconfirmed(&self) -> Option<usize> {
+        self.list
+            .iter()
+            .position(|e| e.state == SendState::SentUnconfirmed)
     }
 
     pub(crate) fn push(&mut self, echo: Echo) -> Result<(), Full> {
-        if self.is_full() {
-            return Err(Full);
+        if self.list.len() >= MAX_ECHOES {
+            let at = self.oldest_unconfirmed().ok_or(Full)?;
+            self.list.remove(at);
         }
         self.list.push(echo);
+        debug_assert!(self.list.len() <= MAX_ECHOES);
         Ok(())
     }
 
@@ -122,7 +122,6 @@ impl Echoes {
             }
             _ => None,
         };
-        echo.reconciles = 0;
         Some(echo.chat)
     }
 
@@ -157,34 +156,33 @@ impl Echoes {
     /// (`Event::Reconciled`). `shown` answers whether the reconciled view
     /// holds an id, when that view is the one on screen. A sent echo at or
     /// below `newest` that the view lacks was deleted. An unconfirmed echo
-    /// is never matched by text (plan section 9); it leaves once a reconcile
-    /// requested after its acceptance brought the server's copy (see
-    /// [`UNCONFIRMED_RECONCILES`]). Returns whether any echo went.
+    /// is never matched by text (plan section 9), nor by how many tails
+    /// arrived: it leaves only on core's evidence ([`Self::covered`]).
+    /// Returns whether any echo went.
     pub(crate) fn reconciled(
         &mut self,
         chat: ChatId,
         newest: Option<MsgId>,
         shown: Option<&dyn Fn(MsgId) -> bool>,
     ) -> bool {
+        let (Some(shown), Some(newest)) = (shown, newest) else {
+            return false;
+        };
         let before = self.list.len();
-        for e in self.list.iter_mut().filter(|e| e.chat == chat) {
-            if e.state == SendState::SentUnconfirmed {
-                e.reconciles = e.reconciles.saturating_add(1);
-            }
-        }
-        self.list.retain(|e| {
-            if e.chat != chat {
-                return true;
-            }
-            match e.state {
-                SendState::SentUnconfirmed => e.reconciles < UNCONFIRMED_RECONCILES,
-                SendState::Sent { id } => match (shown, newest) {
-                    (Some(shown), Some(newest)) => id > newest || shown(id),
-                    _ => true,
-                },
-                _ => true,
-            }
+        self.list.retain(|e| match e.state {
+            SendState::Sent { id } if e.chat == chat => id > newest || shown(id),
+            _ => true,
         });
+        self.list.len() != before
+    }
+
+    /// Core showed server history covering these unconfirmed sends
+    /// (`Event::SendsCovered`): their messages are on screen (or deleted).
+    /// Returns whether any echo went.
+    pub(crate) fn covered(&mut self, sends: &[LocalId]) -> bool {
+        let before = self.list.len();
+        self.list
+            .retain(|e| e.state != SendState::SentUnconfirmed || !sends.contains(&e.local_id));
         self.list.len() != before
     }
 }
@@ -275,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_drops_deleted_sends_and_late_unconfirmed_ones() {
+    fn reconcile_drops_deleted_sends_but_not_unconfirmed_ones() {
         let mut e = Echoes::default();
         for n in 1..=4 {
             e.push(echo(n, A)).unwrap();
@@ -285,6 +283,10 @@ mod tests {
         set(&mut e, 3, SendState::Sent { id: MsgId(50) });
         let shown = |_: MsgId| false;
         assert!(e.reconciled(A, Some(MsgId(20)), Some(&shown)));
+        assert!(!e.reconciled(A, Some(MsgId(20)), None), "not on screen");
+        for _ in 0..3 {
+            e.reconciled(A, Some(MsgId(20)), Some(&shown));
+        }
         assert_eq!(
             states(&e, A),
             [
@@ -292,14 +294,11 @@ mod tests {
                 SendState::Sent { id: MsgId(50) },
                 SendState::Sending
             ],
-            "5 was deleted; the first reconcile may predate the unconfirmed send"
+            "5 was deleted; reconciles alone never prove an unconfirmed send"
         );
-        assert!(e.reconciled(A, Some(MsgId(20)), None), "not on screen");
-        assert_eq!(
-            states(&e, A),
-            [SendState::Sent { id: MsgId(50) }, SendState::Sending],
-            "the second reconcile was requested after it"
-        );
+        assert!(!e.covered(&[LocalId(3)]), "only unconfirmed sends");
+        assert!(e.covered(&[LocalId(1)]));
+        assert_eq!(e.count(A), 2);
     }
 
     #[test]
@@ -310,5 +309,12 @@ mod tests {
         }
         assert!(e.is_full());
         assert_eq!(e.push(echo(9999, A)), Err(Full));
+        // An accepted send whose id is unknown gives way at the cap.
+        set(&mut e, 7, SendState::SentUnconfirmed);
+        assert!(!e.is_full());
+        e.push(echo(9999, A)).unwrap();
+        assert!(e.get(LocalId(7)).is_none());
+        assert_eq!(e.count(A), MAX_ECHOES);
+        assert!(e.is_full());
     }
 }

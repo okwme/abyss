@@ -621,8 +621,10 @@ mod fake {
             "Bumped",
         );
         bumped.unread = 4;
-        // A new message moves the chat up; read-state changes alone do not.
+        // A new message (a newer id) moves the chat up; read-state changes
+        // alone do not.
         bumped.last_date = i64::from(i32::MAX);
+        bumped.last_id = Some(abyss_core::model::MsgId(i32::MAX));
         harness
             .events
             .unbounded_send(Event::ChatBumped(bumped))
@@ -768,6 +770,184 @@ mod fake {
             None,
             "the newest message is off screen: core counts it unread"
         );
+    }
+
+    const CHAT: ChatId = ChatId {
+        kind: PeerKind::User,
+        id: 1,
+    };
+
+    /// Whether a tail has older history.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum More {
+        Older,
+        Start,
+    }
+
+    /// Signs in, lists one chat, opens it and delivers its tail `ids`.
+    fn open_chat(
+        root: &Entity<Root>,
+        cx: &mut VisualTestContext,
+        harness: &Harness,
+        ids: std::ops::RangeInclusive<i32>,
+        more: More,
+    ) {
+        sign_in(root, cx, harness);
+        cx.simulate_resize(gpui::size(gpui::px(800.), gpui::px(300.)));
+        let script = FakeScript::demo(1, 0);
+        harness
+            .events
+            .unbounded_send(Event::DialogsReset(script.dialogs))
+            .unwrap();
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_chat(CHAT, window, cx), cx);
+        });
+        cx.run_until_parked();
+        harness
+            .events
+            .unbounded_send(Event::History {
+                chat: CHAT,
+                view: abyss_core::store::ViewGen(1),
+                dir: abyss_core::api::HistoryDir::Tail,
+                messages: ids.map(|id| message(CHAT, id)).collect(),
+                removed: Vec::new(),
+                has_more: more == More::Older,
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn count(sent: &[String], prefix: &str) -> usize {
+        sent.iter().filter(|c| c.starts_with(prefix)).count()
+    }
+
+    /// Task 10c, finding 1 (HIGH), through the real window: a deactivation
+    /// core refuses still stops read marks and the live tail, and core is
+    /// told once the backoff ends.
+    #[gpui::test]
+    fn a_refused_deactivation_stops_reads_and_is_retried(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        open_chat(&root, cx, &harness, 1..=30, More::Start);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(read(&root, cx, |s| s.shell.viewing()), Some(CHAT));
+        let from = harness.sent.borrow().commands.len();
+        harness.sent.borrow_mut().full = true;
+        cx.deactivate_window();
+        harness.sent.borrow_mut().full = false;
+        harness
+            .events
+            .unbounded_send(Event::History {
+                chat: CHAT,
+                view: abyss_core::store::ViewGen(1),
+                dir: abyss_core::api::HistoryDir::Newer,
+                messages: vec![message(CHAT, 31)],
+                removed: Vec::new(),
+                has_more: false,
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let sent = commands_since(&harness, from);
+        assert_eq!(count(&sent, "MarkRead"), 0, "inactive: {sent:?}");
+        assert_eq!(count(&sent, "ViewingTail(None)"), 1, "{sent:?}");
+        assert_eq!(count(&sent, "Window"), 0, "refused, not yet retried");
+        cx.executor().advance_clock(crate::chat::retry::FIRST_DELAY);
+        cx.run_until_parked();
+        let sent = commands_since(&harness, from);
+        assert_eq!(count(&sent, "Window(Inactive)"), 1, "{sent:?}");
+        assert_eq!(count(&sent, "MarkRead"), 0);
+        cx.executor()
+            .advance_clock(crate::chat::retry::MAX_DELAY * 4);
+        cx.run_until_parked();
+        assert_eq!(commands_since(&harness, from).len(), sent.len(), "settled");
+    }
+
+    /// Task 10c, finding 2, through the real window: errors (a full core
+    /// queue, a failed send) never re-ask a history load, and a load core
+    /// reports failed is retried a bounded number of times.
+    #[gpui::test]
+    fn errors_do_not_loop_history_loads(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        let from = harness.sent.borrow().commands.len();
+        open_chat(&root, cx, &harness, 1..=5, More::Older);
+        assert_eq!(count(&commands_since(&harness, from), "LoadOlder"), 1);
+        for error in [UserError::Busy, UserError::Rejected].repeat(10) {
+            harness.events.unbounded_send(Event::Error(error)).unwrap();
+            cx.run_until_parked();
+        }
+        assert_eq!(count(&commands_since(&harness, from), "LoadOlder"), 1);
+        let ended = Event::LoadEnded {
+            target: abyss_core::api::LoadTarget::History {
+                chat: CHAT,
+                dir: abyss_core::api::HistoryDir::Older,
+            },
+            error: Some(UserError::Busy),
+        };
+        for _ in 0..20 {
+            let ended = match &ended {
+                Event::LoadEnded { target, error } => Event::LoadEnded {
+                    target: *target,
+                    error: *error,
+                },
+                _ => unreachable!(),
+            };
+            harness.events.unbounded_send(ended).unwrap();
+            harness
+                .events
+                .unbounded_send(Event::Error(UserError::Busy))
+                .unwrap();
+            cx.run_until_parked();
+            cx.executor().advance_clock(crate::chat::retry::MAX_DELAY);
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            count(&commands_since(&harness, from), "LoadOlder"),
+            usize::from(crate::chat::retry::MAX_FAILURES),
+            "bounded"
+        );
+    }
+
+    /// Task 10c, finding 3, through the real window: the empty sidebar's
+    /// refused request for the next page is retried, not forgotten.
+    #[gpui::test]
+    fn empty_sidebar_retries_a_refused_page(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        sign_in(&root, cx, &harness);
+        let from = harness.sent.borrow().commands.len();
+        harness.sent.borrow_mut().full = true;
+        harness
+            .events
+            .unbounded_send(Event::DialogsReset(Vec::new()))
+            .unwrap();
+        harness
+            .events
+            .unbounded_send(Event::DialogsPaging { has_more: true })
+            .unwrap();
+        cx.run_until_parked();
+        harness.sent.borrow_mut().full = false;
+        cx.run_until_parked();
+        assert_eq!(count(&commands_since(&harness, from), "LoadDialogs"), 0);
+        cx.executor().advance_clock(crate::chat::retry::FIRST_DELAY);
+        cx.run_until_parked();
+        assert_eq!(count(&commands_since(&harness, from), "LoadDialogs"), 1);
+        // Core fails the page: retried after a backoff, never in a loop.
+        harness
+            .events
+            .unbounded_send(Event::LoadEnded {
+                target: abyss_core::api::LoadTarget::Dialogs,
+                error: Some(UserError::Network),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(count(&commands_since(&harness, from), "LoadDialogs"), 1);
+        // The second failure in a row: twice the first wait.
+        cx.executor().advance_clock(crate::chat::retry::FIRST_DELAY);
+        cx.run_until_parked();
+        assert_eq!(count(&commands_since(&harness, from), "LoadDialogs"), 1);
+        cx.executor().advance_clock(crate::chat::retry::FIRST_DELAY);
+        cx.run_until_parked();
+        assert_eq!(count(&commands_since(&harness, from), "LoadDialogs"), 2);
     }
 
     #[gpui::test]

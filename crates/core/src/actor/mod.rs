@@ -8,8 +8,10 @@ mod auth;
 mod auth_outcome;
 mod binding;
 mod boot;
+mod covered;
 mod jobs;
 mod lifecycle;
+mod loads;
 mod logout;
 mod merge;
 mod onboarding;
@@ -37,8 +39,8 @@ use lifecycle::{Lifecycle, Live, LiveEvent, Phase, Reason};
 pub(crate) use logout::CacheParts;
 
 use crate::api::{
-    AuthState, ClientGen, Command, ConnState, Event, HistoryDir, RemoteLogout, SaveStatus,
-    UserError, WindowState,
+    AuthState, ClientGen, Command, ConnState, Event, HistoryDir, LoadTarget, RemoteLogout,
+    SaveStatus, UserError, WindowState,
 };
 use crate::backend::{Backend, DialogsCursor, HistoryQuery, StreamItem};
 use crate::cache::CacheHandle;
@@ -96,6 +98,11 @@ pub(crate) struct Actor<B: Backend> {
     /// Chats with a history load (cache or server) in flight, and that load.
     /// At most one per window chat.
     history_busy: HashMap<ChatId, Load>,
+    /// `LoadOlder`/`LoadNewer` asked while their chat's load ran; started
+    /// when it ends (at most [`loads::MAX_DEFERRED`]).
+    deferred: Vec<(ChatId, HistoryDir)>,
+    /// Server history known to cover chats with `SentUnconfirmed` sends.
+    covers: covered::Covers,
     /// Source of [`jobs::ReqId`]s.
     next_req: u64,
     dialogs_busy: bool,
@@ -176,6 +183,8 @@ impl<B: Backend> Actor<B> {
             window: WindowState::Active,
             last_refresh: Instant::now(),
             history_busy: HashMap::new(),
+            deferred: Vec::with_capacity(loads::MAX_DEFERRED),
+            covers: covered::Covers::default(),
             next_req: 0,
             dialogs_busy: false,
             dialogs_queued: false,
@@ -240,6 +249,7 @@ impl<B: Backend> Actor<B> {
                 () = sleep_until(send_due) => self.resume_flooded_sends().await,
                 _ = flush.tick() => self.flush_reads().await,
             }
+            self.run_deferred_loads().await;
             self.pump();
             self.sync_peers();
         }
@@ -423,10 +433,18 @@ impl<B: Backend> Actor<B> {
         match kind {
             Some(TaskKind::Dialogs) => {
                 self.dialogs_busy = false;
+                self.load_ended(LoadTarget::Dialogs, Some(UserError::Internal))
+                    .await;
                 self.snapshot_done(boot::Snapshot::Dialogs).await;
             }
             Some(TaskKind::History(load)) => {
                 self.release_history(load);
+                // The kind does not say which way it loaded: the UI ignores
+                // an end of a load it is not waiting for.
+                for dir in [HistoryDir::Older, HistoryDir::Newer] {
+                    self.history_ended(load.chat, dir, Some(UserError::Internal))
+                        .await;
+                }
                 self.snapshot_done(boot::Snapshot::Tail(load)).await;
             }
             Some(TaskKind::Send(local_id)) => {
@@ -486,7 +504,8 @@ impl<B: Backend> Actor<B> {
             return;
         }
         if self.dialogs_loaded && self.dialogs_next.is_none() {
-            return; // every page is loaded
+            // Every page is loaded.
+            return self.load_ended(LoadTarget::Dialogs, None).await;
         }
         let cursor = if self.dialogs_loaded {
             self.dialogs_next.clone()
@@ -495,6 +514,9 @@ impl<B: Backend> Actor<B> {
         };
         if self.enqueue(Job::Dialogs { cursor }).await {
             self.dialogs_busy = true;
+        } else {
+            self.load_ended(LoadTarget::Dialogs, Some(UserError::Busy))
+                .await;
         }
     }
 
@@ -581,13 +603,18 @@ impl<B: Backend> Actor<B> {
     }
 
     /// Scrolls the open window. Serves from the disk cache when it is known to be
-    /// contiguous, else asks the server. Single-flight per chat.
+    /// contiguous, else asks the server. Single-flight per chat: asked while
+    /// a load runs, it waits for that one. Answered by `History` in `dir`, or
+    /// by `LoadEnded` (see `loads.rs`).
     async fn load_more(&mut self, chat: ChatId, dir: HistoryDir) {
-        if self.open != Some(chat) || self.history_busy.contains_key(&chat) {
-            return;
+        if self.open != Some(chat) {
+            return self.history_ended(chat, dir, None).await;
+        }
+        if self.history_busy.contains_key(&chat) {
+            return self.defer_load(chat, dir);
         }
         let Some(w) = self.windows.get(chat) else {
-            return;
+            return self.history_ended(chat, dir, None).await;
         };
         let view = w.view_gen();
         let (edge, more) = match dir {
@@ -595,7 +622,7 @@ impl<B: Backend> Actor<B> {
             _ => (w.messages().back(), w.has_newer()),
         };
         let Some(edge) = edge.filter(|_| more).map(|m| m.id) else {
-            return;
+            return self.history_ended(chat, dir, None).await;
         };
         let load = self.begin_load(chat, view);
         if let Some(cache) = self
@@ -627,6 +654,8 @@ impl<B: Backend> Actor<B> {
         };
         if !self.enqueue(job).await {
             self.release_history(load);
+            self.history_ended(load.chat, dir, Some(UserError::Busy))
+                .await;
         }
     }
 

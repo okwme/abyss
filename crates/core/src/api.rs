@@ -211,6 +211,15 @@ pub enum UserError {
     Internal,
 }
 
+/// The load a [`Event::LoadEnded`] is about: one the UI asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadTarget {
+    /// `LoadDialogs`.
+    Dialogs,
+    /// `LoadOlder` (`dir: Older`) or `LoadNewer` (`dir: Newer`) of `chat`.
+    History { chat: ChatId, dir: HistoryDir },
+}
+
 /// Which part of a window a history event extends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryDir {
@@ -264,11 +273,33 @@ pub enum Event {
     /// gap or light refresh), after the `History`/`Deleted`/`Edited` events
     /// it caused. Everything in the window up to `newest` is now the server's
     /// truth: echoes of sends at or below `newest` are in it (or were
-    /// deleted), and `SentUnconfirmed` echoes of this chat can be dropped.
+    /// deleted). It says nothing about `SentUnconfirmed` sends, whose ids
+    /// are unknown (see `SendsCovered`).
     Reconciled {
         chat: ChatId,
         view: ViewGen,
         newest: Option<MsgId>,
+    },
+    /// A load the UI asked for ended without its answer (`DialogsPaging`,
+    /// or `History` in that direction). `error: None`: there was nothing
+    /// to load (every dialogs page is loaded; the chat is not open, or has
+    /// no more history that way). `Some`: it failed or was not queued; the
+    /// error is also sent as `Error`. A `LoadOlder`/`LoadNewer` that arrives
+    /// while another history load of its chat runs is not dropped: it runs
+    /// once that load ends, so it is always answered by one or the other.
+    LoadEnded {
+        target: LoadTarget,
+        error: Option<UserError>,
+    },
+    /// These `SentUnconfirmed` sends of `chat` are covered by server history
+    /// requested after the server accepted them, and already applied to the
+    /// chat's window: their messages are shown (or were deleted), so their
+    /// echoes can go. Sent after the `History` events that showed them.
+    /// Core fetches older pages (a few at most) when the tail alone does not
+    /// reach back to a send; until this event, the echo stays.
+    SendsCovered {
+        chat: ChatId,
+        sends: Vec<LocalId>,
     },
     Edited(Message),
     Deleted {
@@ -300,6 +331,7 @@ impl Event {
             }
             Event::Edited(m) => m.retained_bytes(),
             Event::Deleted { ids, .. } => ids.capacity() * std::mem::size_of::<MsgId>(),
+            Event::SendsCovered { sends, .. } => sends.capacity() * std::mem::size_of::<LocalId>(),
             _ => 0,
         }
     }

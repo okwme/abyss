@@ -1,4 +1,6 @@
-use abyss_core::api::{Command, HistoryDir, SendState, WindowState};
+use std::time::Instant;
+
+use abyss_core::api::{Command, HistoryDir, LoadTarget, SendState, UserError, WindowState};
 use abyss_core::model::{Body, ChatKind, LocalId, PeerKind, ThreadKey};
 use abyss_core::rich_text::RichText;
 use abyss_core::store::ViewGen;
@@ -7,8 +9,16 @@ use gpui::{
     list, point, px, size,
 };
 
+use super::retry::{FIRST_DELAY, MAX_FAILURES};
 use super::viewport::Seen;
 use super::*;
+
+/// A fixed instant: these tests are about order, not time, unless they
+/// say otherwise.
+fn now() -> Instant {
+    thread_local!(static NOW: Instant = Instant::now());
+    NOW.with(|n| *n)
+}
 
 const CHAT: ChatId = ChatId {
     kind: PeerKind::User,
@@ -278,26 +288,174 @@ fn exhausted_flood_wait_fails_with_retry_and_discard() {
     assert!(matches!(core.take().as_slice(), [Command::DiscardSend(r)] if *r == id));
 }
 
-/// Finding 4: echoes are reconciled on `Reconciled`, not on view resets,
-/// and an unconfirmed one outlives a reconcile that may predate its send.
+/// Task 10c, finding 5: reconciles prove nothing about an unconfirmed
+/// send (more than a page of newer messages can put it below both tails);
+/// it stays until core reports history covering it.
 #[test]
-fn unconfirmed_echo_outlives_view_resets_and_one_reconcile() {
+fn unconfirmed_echo_stays_until_core_reports_it_covered() {
     let mut core = Core::default();
     let mut shell = open(&mut core);
     let id = send(&mut shell, &mut core, "x");
     set(&mut shell, id, SendState::SentUnconfirmed);
     shell.apply(Event::ChatInvalidated(CHAT));
-    shell.apply(history(2, HistoryDir::Tail, 60..=101));
-    assert_eq!(shell.row_count(), 43, "a new view keeps the echo");
-    shell.apply(reconciled(2, 101));
-    assert_eq!(shell.row_count(), 43, "this tail may predate the send");
-    shell.apply(reconciled(2, 101));
+    shell.apply(history(2, HistoryDir::Tail, 160..=209));
+    assert_eq!(shell.row_count(), 51, "a new view keeps the echo");
+    for _ in 0..3 {
+        shell.apply(reconciled(2, 209));
+    }
+    assert_eq!(shell.row_count(), 51, "the send is below every tail");
+    let other = LocalId(id.0 + 1);
+    shell.apply(Event::SendsCovered {
+        chat: CHAT,
+        sends: vec![other],
+    });
+    assert_eq!(shell.row_count(), 51, "another send");
+    shell.apply(history(2, HistoryDir::Older, 101..=159));
+    shell.apply(Event::SendsCovered {
+        chat: CHAT,
+        sends: vec![id],
+    });
+    assert_eq!(shell.row_count(), 109, "the server copy took its place");
+    assert_eq!(shell.rows().item_count(), 109);
+    assert_eq!(shell.echoes().count(CHAT), 0);
+}
+
+/// Task 10c, finding 4: core may answer a load asked while a light refresh
+/// ran with only `Reconciled`. That ends the load: the next frame asks
+/// again instead of waiting forever.
+#[test]
+fn a_load_ended_by_reconciled_is_asked_again() {
+    let mut core = Core::default();
+    let mut shell = open(&mut core);
+    let top = Some(Seen {
+        first_row: 0,
+        last_message: None,
+    });
+    let older = |core: &mut Core| {
+        core.take()
+            .iter()
+            .filter(|c| matches!(c, Command::LoadOlder(CHAT)))
+            .count()
+    };
+    shell.frame_seen(top, now(), &mut core.admit()).unwrap();
+    assert_eq!(older(&mut core), 1);
+    shell.frame_seen(top, now(), &mut core.admit()).unwrap();
+    assert_eq!(older(&mut core), 0, "pending");
+    shell.apply(reconciled(7, 100));
+    shell.frame_seen(top, now(), &mut core.admit()).unwrap();
+    assert_eq!(older(&mut core), 0, "another view's reconcile");
+    shell.apply(reconciled(1, 100));
+    shell.frame_seen(top, now(), &mut core.admit()).unwrap();
+    assert_eq!(older(&mut core), 1, "the refresh ended the load");
+    // Core had nothing to load: parked until the window changes.
+    let ended = LoadTarget::History {
+        chat: CHAT,
+        dir: HistoryDir::Older,
+    };
+    shell.load_ended(ended, None, now());
+    shell.frame_seen(top, now(), &mut core.admit()).unwrap();
+    assert_eq!(older(&mut core), 0, "parked");
+    assert_eq!(shell.retry_due(now()), None, "no wake-up for a parked load");
+    shell.apply(live(101));
+    shell.frame_seen(top, now(), &mut core.admit()).unwrap();
+    assert_eq!(older(&mut core), 1, "the window changed");
+}
+
+/// Task 10c, finding 2: failed loads retry with a bounded backoff, however
+/// many errors and redraws follow, and errors of other commands end none.
+#[test]
+fn failed_history_loads_retry_a_bounded_number_of_times() {
+    let mut core = Core::default();
+    let mut shell = open(&mut core);
+    let top = Some(Seen {
+        first_row: 0,
+        last_message: None,
+    });
+    let ended = LoadTarget::History {
+        chat: CHAT,
+        dir: HistoryDir::Older,
+    };
+    let mut asked = 0;
+    let mut t = now();
+    for _ in 0..1_000 {
+        shell.frame_seen(top, t, &mut core.admit()).unwrap();
+        let sent = core.take();
+        if sent.iter().any(|c| matches!(c, Command::LoadOlder(CHAT))) {
+            asked += 1;
+            // A send's error says nothing about the load.
+            shell.apply(Event::Error(UserError::Rejected));
+            shell.frame_seen(top, t, &mut core.admit()).unwrap();
+            assert!(core.take().is_empty(), "an unrelated error ends nothing");
+            shell.apply(Event::Error(UserError::Busy));
+            shell.load_ended(ended, Some(UserError::Busy), t);
+        }
+        t += std::time::Duration::from_millis(100);
+    }
     assert_eq!(
-        shell.row_count(),
-        42,
-        "a later reconcile shows the server copy"
+        asked,
+        usize::from(MAX_FAILURES),
+        "then it waits for a fresh trigger"
     );
-    assert_eq!(shell.rows().item_count(), 42);
+    assert_eq!(shell.retry_due(t), None, "and schedules nothing");
+    shell.apply(reconciled(1, 100));
+    shell.frame_seen(top, t, &mut core.admit()).unwrap();
+    assert_eq!(core.take().len(), 1, "a reconcile is one");
+}
+
+/// Task 10c, finding 1 (HIGH): a refused `Window(Inactive)` still stops
+/// read marks and the live tail at once, and is retried after a backoff.
+#[test]
+fn a_refused_deactivation_stops_reads_and_is_retried() {
+    let mut core = Core::default();
+    let mut shell = open(&mut core);
+    let at = |last| {
+        Some(Seen {
+            first_row: 40,
+            last_message: Some(last),
+        })
+    };
+    shell.frame_seen(at(49), now(), &mut core.admit()).unwrap();
+    assert_eq!(viewing(&core.take()), [Some(CHAT)]);
+    core.full = true;
+    let refused = shell.set_focus(WindowState::Inactive, now(), &mut core.admit());
+    assert_eq!(refused, Err(Refused::Busy));
+    shell.apply(live(101));
+    core.full = false;
+    shell.frame_seen(at(50), now(), &mut core.admit()).unwrap();
+    let cmds = core.take();
+    assert!(reads(&cmds).is_empty(), "inactive: 101 is not read");
+    assert_eq!(viewing(&cmds), [None], "nor is the tail watched");
+    assert!(shell.focus_out_of_sync(), "core still thinks it is active");
+    let due = shell.retry_due(now()).expect("a retry waits");
+    assert_eq!(due, now() + FIRST_DELAY);
+    shell.sync_focus(due, &mut core.admit()).unwrap();
+    assert!(matches!(
+        core.take().as_slice(),
+        [Command::Window(WindowState::Inactive)]
+    ));
+    assert!(!shell.focus_out_of_sync());
+    assert_eq!(shell.retry_due(due), None);
+    // A frame retries too, once the backoff allows.
+    shell
+        .set_focus(WindowState::Active, now(), &mut core.admit())
+        .unwrap();
+    shell.frame_seen(at(50), now(), &mut core.admit()).unwrap();
+    assert_eq!(viewing(&core.take()), [Some(CHAT)]);
+    core.full = true;
+    assert!(
+        shell
+            .set_focus(WindowState::Inactive, now(), &mut core.admit())
+            .is_err()
+    );
+    core.full = false;
+    shell.frame_seen(at(50), due, &mut core.admit()).unwrap();
+    assert!(matches!(
+        core.take().as_slice(),
+        [
+            Command::Window(WindowState::Inactive),
+            Command::ViewingTail(None)
+        ]
+    ));
 }
 
 #[test]
@@ -361,19 +519,27 @@ fn mark_read_and_live_tail_follow_what_is_on_screen() {
         first_row: 40,
         last_message: Some(last),
     };
-    shell.frame_seen(Some(at(45)), &mut core.admit()).unwrap();
+    shell
+        .frame_seen(Some(at(45)), now(), &mut core.admit())
+        .unwrap();
     let cmds = core.take();
     assert_eq!(reads(&cmds), [96]);
     assert!(viewing(&cmds).is_empty(), "scrolled up: not the tail");
-    shell.frame_seen(Some(at(45)), &mut core.admit()).unwrap();
-    shell.frame_seen(Some(at(30)), &mut core.admit()).unwrap();
+    shell
+        .frame_seen(Some(at(45)), now(), &mut core.admit())
+        .unwrap();
+    shell
+        .frame_seen(Some(at(30)), now(), &mut core.admit())
+        .unwrap();
     assert!(core.take().is_empty(), "already sent; never backwards");
-    shell.frame_seen(Some(at(49)), &mut core.admit()).unwrap();
+    shell
+        .frame_seen(Some(at(49)), now(), &mut core.admit())
+        .unwrap();
     let cmds = core.take();
     assert_eq!(reads(&cmds), [100]);
     assert_eq!(viewing(&cmds), [Some(CHAT)]);
     shell
-        .set_focus(WindowState::Inactive, &mut core.admit())
+        .set_focus(WindowState::Inactive, now(), &mut core.admit())
         .unwrap();
     assert!(matches!(
         core.take().as_slice(),
@@ -383,25 +549,35 @@ fn mark_read_and_live_tail_follow_what_is_on_screen() {
         ]
     ));
     shell
-        .set_focus(WindowState::Inactive, &mut core.admit())
+        .set_focus(WindowState::Inactive, now(), &mut core.admit())
         .unwrap();
     assert!(core.take().is_empty());
     shell.apply(live(101));
-    shell.frame_seen(Some(at(50)), &mut core.admit()).unwrap();
+    shell
+        .frame_seen(Some(at(50)), now(), &mut core.admit())
+        .unwrap();
     assert!(core.take().is_empty(), "not while the window is inactive");
     shell
-        .set_focus(WindowState::Active, &mut core.admit())
+        .set_focus(WindowState::Active, now(), &mut core.admit())
         .unwrap();
-    shell.frame_seen(Some(at(50)), &mut core.admit()).unwrap();
+    shell
+        .frame_seen(Some(at(50)), now(), &mut core.admit())
+        .unwrap();
     let cmds = core.take();
     assert_eq!(reads(&cmds), [101]);
     assert_eq!(viewing(&cmds), [Some(CHAT)]);
     // A refused mark is asked again on the next frame.
     shell.apply(live(102));
     core.full = true;
-    assert!(shell.frame_seen(Some(at(51)), &mut core.admit()).is_err());
+    assert!(
+        shell
+            .frame_seen(Some(at(51)), now(), &mut core.admit())
+            .is_err()
+    );
     core.full = false;
-    shell.frame_seen(Some(at(51)), &mut core.admit()).unwrap();
+    shell
+        .frame_seen(Some(at(51)), now(), &mut core.admit())
+        .unwrap();
     assert_eq!(reads(&core.take()), [102]);
 }
 
@@ -421,21 +597,28 @@ fn scrolling_near_the_top_loads_older_once() {
             .filter(|c| matches!(c, Command::LoadOlder(CHAT)))
             .count()
     };
-    shell.frame_seen(at(20), &mut core.admit()).unwrap();
+    shell.frame_seen(at(20), now(), &mut core.admit()).unwrap();
     assert_eq!(older(&mut core), 0);
     core.full = true;
-    assert!(shell.frame_seen(at(2), &mut core.admit()).is_err());
+    assert!(shell.frame_seen(at(2), now(), &mut core.admit()).is_err());
     core.full = false;
-    shell.frame_seen(at(2), &mut core.admit()).unwrap();
+    shell.frame_seen(at(2), now(), &mut core.admit()).unwrap();
     assert_eq!(older(&mut core), 1, "a refused load is asked again");
-    shell.frame_seen(at(0), &mut core.admit()).unwrap();
+    shell.frame_seen(at(0), now(), &mut core.admit()).unwrap();
     assert_eq!(older(&mut core), 0, "in flight");
     shell.apply(history(1, HistoryDir::Older, 1..=50));
     assert_eq!(shell.rows().item_count(), 100);
-    shell.frame_seen(at(0), &mut core.admit()).unwrap();
+    shell.frame_seen(at(0), now(), &mut core.admit()).unwrap();
     assert_eq!(older(&mut core), 1);
-    shell.load_failed();
-    shell.frame_seen(at(0), &mut core.admit()).unwrap();
+    let ended = LoadTarget::History {
+        chat: CHAT,
+        dir: HistoryDir::Older,
+    };
+    shell.load_ended(ended, Some(UserError::Network), now());
+    shell.frame_seen(at(0), now(), &mut core.admit()).unwrap();
+    assert_eq!(older(&mut core), 0, "a failed load waits a moment");
+    let later = now() + FIRST_DELAY;
+    shell.frame_seen(at(0), later, &mut core.admit()).unwrap();
     assert_eq!(older(&mut core), 1);
 }
 
@@ -445,18 +628,20 @@ fn dialogs_paging_follows_core() {
     let mut core = Core::default();
     let mut shell = ChatShell::default();
     shell.apply(Event::DialogsReset(Vec::new()));
-    shell.request_dialogs(0, &mut core.admit()).unwrap();
+    shell.request_dialogs(now(), &mut core.admit()).unwrap();
     assert!(core.take().is_empty(), "core has not said more exist");
     shell.apply(Event::DialogsPaging { has_more: true });
     core.full = true;
-    assert!(shell.request_dialogs(0, &mut core.admit()).is_err());
+    assert!(shell.request_dialogs(now(), &mut core.admit()).is_err());
     core.full = false;
-    shell.request_dialogs(0, &mut core.admit()).unwrap();
+    let due = shell.retry_due(now()).expect("a retry waits");
+    assert_eq!(due, now() + FIRST_DELAY);
+    shell.request_dialogs(due, &mut core.admit()).unwrap();
     assert!(matches!(core.take().as_slice(), [Command::LoadDialogs]));
-    shell.request_dialogs(0, &mut core.admit()).unwrap();
+    shell.request_dialogs(due, &mut core.admit()).unwrap();
     assert!(core.take().is_empty(), "in flight");
     shell.apply(Event::DialogsPaging { has_more: true });
-    shell.request_dialogs(0, &mut core.admit()).unwrap();
+    shell.request_dialogs(due, &mut core.admit()).unwrap();
     assert!(
         matches!(core.take().as_slice(), [Command::LoadDialogs]),
         "an all-filtered page leaves the list empty and asks again"
@@ -549,7 +734,9 @@ fn only_rows_inside_the_viewport_count_as_seen(cx: &mut TestAppContext) {
     let seen = lay_out(cx, &shell).unwrap();
     assert_eq!(seen.first_row, 55, "following the tail: the last 10 rows");
     assert_eq!(seen.last_message, None, "only echoes on screen");
-    shell.frame_seen(Some(seen), &mut core.admit()).unwrap();
+    shell
+        .frame_seen(Some(seen), now(), &mut core.admit())
+        .unwrap();
     assert!(core.take().is_empty(), "message 100 is above the viewport");
 
     shell.rows().scroll_to(ListOffset {
@@ -558,7 +745,9 @@ fn only_rows_inside_the_viewport_count_as_seen(cx: &mut TestAppContext) {
     });
     let seen = lay_out(cx, &shell).unwrap();
     assert_eq!((seen.first_row, seen.last_message), (40, Some(49)));
-    shell.frame_seen(Some(seen), &mut core.admit()).unwrap();
+    shell
+        .frame_seen(Some(seen), now(), &mut core.admit())
+        .unwrap();
     let cmds = core.take();
     assert_eq!(reads(&cmds), [100]);
     assert_eq!(viewing(&cmds), [Some(CHAT)]);
@@ -570,6 +759,8 @@ fn only_rows_inside_the_viewport_count_as_seen(cx: &mut TestAppContext) {
     });
     let seen = lay_out(cx, &shell).unwrap();
     assert_eq!((seen.first_row, seen.last_message), (20, Some(30)));
-    shell.frame_seen(Some(seen), &mut core.admit()).unwrap();
+    shell
+        .frame_seen(Some(seen), now(), &mut core.admit())
+        .unwrap();
     assert_eq!(viewing(&core.take()), [None], "scrolled away from the tail");
 }

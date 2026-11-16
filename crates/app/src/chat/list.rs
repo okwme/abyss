@@ -1,11 +1,15 @@
 //! The chat list as the UI holds it: core's dialogs in display order (plan
 //! section 7). Core owns the order; this mirrors its events.
 
+use std::time::Instant;
+
+use abyss_core::api::UserError;
 use abyss_core::model::{ChatId, ChatSummary, Preview};
-use abyss_core::store::MAX_DIALOGS;
+use abyss_core::store::{MAX_DIALOGS, bump_moves};
 use gpui::SharedString;
 
 use super::copy;
+use super::retry::Backoff;
 
 /// Rows before the end of the list at which the next page is requested.
 const LOAD_MARGIN: usize = 20;
@@ -28,6 +32,11 @@ struct Paging {
     has_more: bool,
     /// A `LoadDialogs` was admitted and core has not answered it yet.
     in_flight: bool,
+    /// The sidebar needs the next page: its end is on screen, or it shows
+    /// no row at all. Kept until a request is admitted, whatever renders.
+    wanted: bool,
+    /// Refused or failed requests: bounded, spaced retries.
+    retry: Backoff,
 }
 
 #[derive(Debug, Default)]
@@ -36,14 +45,11 @@ pub(crate) struct ChatList {
     paging: Paging,
 }
 
-/// Whether `new` describes a newer last message than `old`: by message id,
-/// or by date when either id is unknown. Same-second messages with the same
-/// preview still order by id.
+/// Whether a `ChatBumped` summary `new` moved its chat in core: core's own
+/// rule ([`bump_moves`]), by message id. A summary without a last id is a
+/// read-state change, which never moves a chat.
 fn is_newer(new: &ChatSummary, old: &ChatSummary) -> bool {
-    match (new.last_id, old.last_id) {
-        (Some(n), Some(o)) => n > o,
-        _ => new.last_date > old.last_date,
-    }
+    new.last_id.is_some_and(|n| bump_moves(old.last_id, n))
 }
 
 impl ChatList {
@@ -53,10 +59,6 @@ impl ChatList {
 
     pub(crate) fn len(&self) -> usize {
         self.chats.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.chats.is_empty()
     }
 
     pub(crate) fn get(&self, id: ChatId) -> Option<&ChatSummary> {
@@ -113,31 +115,70 @@ impl ChatList {
         }
     }
 
-    /// Whether to ask core for the next page now that row `last_visible` is
-    /// on screen (any row, for an empty list): core said more exist, none is
-    /// outstanding, and the cap is not reached.
-    pub(crate) fn wants_more(&self, last_visible: usize) -> bool {
+    /// Row `last_visible` is on screen: near the end, the sidebar wants the
+    /// next page.
+    pub(crate) fn seen(&mut self, last_visible: usize) {
         let len = self.chats.len();
-        let near_end = len == 0 || last_visible.saturating_add(LOAD_MARGIN) >= len;
-        near_end && self.paging.has_more && !self.paging.in_flight && len < MAX_DIALOGS
+        if len == 0 || last_visible.saturating_add(LOAD_MARGIN) >= len {
+            self.paging.wanted = true;
+        }
+    }
+
+    /// Whether to ask core for the next page at `now`: the sidebar wants it,
+    /// core said more exist, none is outstanding, no retry is waiting, and
+    /// the cap is not reached.
+    pub(crate) fn wants_more(&self, now: Instant) -> bool {
+        self.could_ask() && self.paging.retry.ready(now)
+    }
+
+    fn could_ask(&self) -> bool {
+        let p = &self.paging;
+        p.wanted && p.has_more && !p.in_flight && self.chats.len() < MAX_DIALOGS
     }
 
     /// Core admitted a `LoadDialogs`.
     pub(crate) fn requested(&mut self) {
         self.paging.in_flight = true;
+        self.paging.wanted = false;
     }
 
-    /// Core applied a dialogs page (`DialogsPaging`).
+    /// Core did not take a `LoadDialogs`: ask again after a backoff.
+    pub(crate) fn refused(&mut self, now: Instant) {
+        self.paging.retry.failed(now);
+    }
+
+    /// Core applied a dialogs page (`DialogsPaging`). An empty list shows no
+    /// row to ask for more, so it wants the next page right away.
     pub(crate) fn paged(&mut self, pages: Pages) {
-        self.paging = Paging {
-            has_more: pages == Pages::More,
-            in_flight: false,
-        };
+        let p = &mut self.paging;
+        p.has_more = pages == Pages::More;
+        p.in_flight = false;
+        p.wanted |= self.chats.is_empty();
+        p.retry.reset();
     }
 
-    /// A core error: an outstanding page may never be answered.
-    pub(crate) fn load_failed(&mut self) {
-        self.paging.in_flight = false;
+    /// The `LoadDialogs` in flight ended without a page
+    /// (`Event::LoadEnded`): nothing left to load, or it failed and waits
+    /// out a backoff. Errors of other commands never end it.
+    pub(crate) fn load_ended(&mut self, error: Option<UserError>, now: Instant) {
+        let p = &mut self.paging;
+        if !p.in_flight {
+            return;
+        }
+        p.in_flight = false;
+        if error.is_some() {
+            p.wanted = true;
+            p.retry.failed(now);
+        } else {
+            p.has_more = false;
+        }
+    }
+
+    /// When a refused or failed request may be asked again, if one waits.
+    pub(crate) fn retry_due(&self, now: Instant) -> Option<Instant> {
+        self.could_ask()
+            .then(|| self.paging.retry.due(now))
+            .flatten()
     }
 }
 
@@ -178,7 +219,7 @@ pub(crate) fn hue(id: ChatId) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use abyss_core::model::{ChatKind, MediaKind, PeerKind};
+    use abyss_core::model::{ChatKind, MediaKind, MsgId, PeerKind};
 
     use super::*;
 
@@ -211,11 +252,12 @@ mod tests {
         }
     }
 
+    /// A chat whose last message (id `date`) was sent at `date`.
     fn with_message(n: i64, date: i64) -> ChatSummary {
         ChatSummary {
             last: Some(Preview::Text("hi".into())),
             last_date: date,
-            last_id: None,
+            last_id: Some(MsgId(i32::try_from(date).unwrap())),
             ..chat(n)
         }
     }
@@ -265,7 +307,7 @@ mod tests {
     /// Same second, same preview: only the message id tells them apart.
     fn with_id(n: i64, msg: i32) -> ChatSummary {
         ChatSummary {
-            last_id: Some(abyss_core::model::MsgId(msg)),
+            last_id: Some(MsgId(msg)),
             ..with_message(n, 100)
         }
     }
@@ -287,37 +329,83 @@ mod tests {
         assert_eq!(ids(&list), [2, 3, 1], "a repeated bump is deduped");
     }
 
+    /// Finding 6 (task 10c): a chat's first known message id moves it, as
+    /// in core, even within the same second.
+    #[test]
+    fn a_first_known_id_moves_the_chat_like_core() {
+        let mut list = ChatList::default();
+        let unknown = |n| ChatSummary {
+            last_date: 100,
+            ..chat(n)
+        };
+        list.reset(vec![unknown(1), unknown(2)]);
+        let bumped = with_id(2, 7);
+        assert_eq!(bumped.last_date, 100, "same date as before");
+        let mut core = abyss_core::store::Dialogs::default();
+        core.reset(vec![unknown(1), unknown(2)]);
+        let newest = abyss_core::store::Last {
+            id: MsgId(7),
+            date: 100,
+            preview: Preview::Text("hi".into()),
+        };
+        core.bump(id(2), newest, abyss_core::store::Unread::Unchanged);
+        list.bump(bumped);
+        let core_ids: Vec<i64> = core.as_slice().iter().map(|c| c.id.id).collect();
+        assert_eq!(core_ids, [2, 1]);
+        assert_eq!(ids(&list), core_ids, "the app follows core's order");
+        let mut read = list.get(id(1)).unwrap().clone();
+        read.unread = 3;
+        list.bump(read);
+        assert_eq!(ids(&list), [2, 1], "a read change never moves a chat");
+    }
+
     #[test]
     fn pagination_follows_core_paging_not_list_length() {
+        let now = Instant::now();
         let mut list = ChatList::default();
-        assert!(!list.wants_more(0), "nothing loaded yet: core loads page 1");
+        list.seen(0);
+        assert!(
+            !list.wants_more(now),
+            "nothing loaded yet: core loads page 1"
+        );
         // A first page made only of broadcast channels: nothing listed, more
-        // pages exist.
+        // pages exist. No row renders, yet the list wants the next page.
         list.reset(Vec::new());
         list.paged(Pages::More);
-        assert!(list.wants_more(0), "an all-filtered page still paginates");
+        assert!(list.wants_more(now), "an all-filtered page still paginates");
         list.requested();
-        assert!(!list.wants_more(0), "one page at a time");
-        list.paged(Pages::More);
+        assert!(!list.wants_more(now), "one page at a time");
         list.reset((0..100).map(chat).collect());
-        assert!(!list.wants_more(10));
-        assert!(list.wants_more(85));
+        list.paged(Pages::More);
+        list.seen(10);
+        assert!(!list.wants_more(now), "the end is not on screen");
+        list.seen(85);
+        assert!(list.wants_more(now));
         list.requested();
         // Core answers a "load more" with a reset when the page reorders
         // rows (4c): paging stays in flight until `DialogsPaging`.
         list.reset((0..100).rev().map(chat).collect());
-        assert!(!list.wants_more(99), "the reset alone ends nothing");
+        list.seen(99);
+        assert!(!list.wants_more(now), "the reset alone ends nothing");
         list.paged(Pages::More);
+        assert!(list.wants_more(now), "the end stayed on screen");
         list.requested();
         // An overlapping page: the length does not change.
         list.upsert_page((90..100).map(chat).collect());
         list.paged(Pages::More);
-        assert!(list.wants_more(99), "the same length asks again");
+        list.seen(99);
+        assert!(list.wants_more(now), "the same length asks again");
         list.requested();
-        list.load_failed();
-        assert!(list.wants_more(99), "a failed page can be asked again");
+        list.load_ended(Some(UserError::Network), now);
+        assert!(!list.wants_more(now), "a failed page waits a moment");
+        let due = list.retry_due(now).unwrap();
+        assert!(list.wants_more(due), "then is asked again");
+        list.requested();
+        list.load_ended(None, now);
+        assert!(!list.wants_more(due), "core has nothing more");
         list.paged(Pages::Done);
-        assert!(!list.wants_more(99), "every page loaded");
+        list.seen(99);
+        assert!(!list.wants_more(due), "every page loaded");
     }
 
     #[test]
@@ -330,7 +418,8 @@ mod tests {
         list.upsert_page(vec![chat(-1)]);
         list.bump(with_message(-2, 1));
         assert_eq!(list.len(), MAX_DIALOGS);
-        assert!(!list.wants_more(MAX_DIALOGS - 1), "never past the cap");
+        list.seen(MAX_DIALOGS - 1);
+        assert!(!list.wants_more(Instant::now()), "never past the cap");
     }
 
     #[test]

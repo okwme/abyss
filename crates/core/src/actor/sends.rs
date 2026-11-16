@@ -17,7 +17,8 @@
 //! - The send's server id comes from the RPC response or from a stream
 //!   `updateMessageID`, whichever arrives first; the other is a no-op. A
 //!   `SentUnconfirmed` send is remembered (bounded) so a later stream
-//!   confirmation still resolves it to `Sent`.
+//!   confirmation still resolves it to `Sent`, or server history covering
+//!   it (`covered.rs`) lets its echo go.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -25,7 +26,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::Actor;
-use super::jobs::{CallError, Job};
+use super::jobs::{CallError, Job, ReqId};
 use super::lifecycle::Phase;
 use crate::api::{Event, SendState, UserError};
 use crate::backend::{Backend, BackendError};
@@ -67,14 +68,42 @@ struct Pending {
     in_flight: bool,
     /// While `FloodWait`: when the send may go again.
     retry_at: Option<Instant>,
+    /// The newest id of `chat` core knew when the user sent it: the
+    /// server's id for the send is higher.
+    floor: Option<MsgId>,
+}
+
+/// A send the server accepted without telling its id.
+#[derive(Debug)]
+struct Unconfirmed {
+    random_id: i64,
+    local_id: LocalId,
+    chat: ChatId,
+    /// See [`Pending::floor`].
+    floor: Option<MsgId>,
+    /// The last history load begun before the acceptance was seen: a load
+    /// with a later id was requested after it.
+    after: ReqId,
+}
+
+impl Unconfirmed {
+    /// Whether server history applied from `lo` up to a tail requested as
+    /// `req` holds this send's message (or it was deleted).
+    fn covered(&self, chat: ChatId, lo: MsgId, req: ReqId) -> bool {
+        let above = self
+            .floor
+            .map_or(MsgId(1), |f| MsgId(f.0.saturating_add(1)));
+        self.chat == chat && req.0 > self.after.0 && lo <= above
+    }
 }
 
 #[derive(Debug, Default)]
 pub(super) struct PendingSends {
     map: HashMap<LocalId, Pending>,
-    /// `(random_id, local_id)` of sends that ended `SentUnconfirmed`, oldest
-    /// first, at most [`MAX_UNCONFIRMED`].
-    unconfirmed: VecDeque<(i64, LocalId)>,
+    /// Sends that ended `SentUnconfirmed`, oldest first, at most
+    /// [`MAX_UNCONFIRMED`]. Each leaves on a stream confirmation or when
+    /// server history covers it.
+    unconfirmed: VecDeque<Unconfirmed>,
     /// Bumped whenever a send enters or leaves the table (the required peer
     /// set depends on it).
     rev: u64,
@@ -162,11 +191,36 @@ impl PendingSends {
         ids
     }
 
-    fn remember_unconfirmed(&mut self, random_id: i64, id: LocalId) {
+    fn remember_unconfirmed(&mut self, p: &Pending, local_id: LocalId, after: ReqId) {
         if self.unconfirmed.len() >= MAX_UNCONFIRMED {
             self.unconfirmed.pop_front();
         }
-        self.unconfirmed.push_back((random_id, id));
+        self.unconfirmed.push_back(Unconfirmed {
+            random_id: p.random_id,
+            local_id,
+            chat: p.chat,
+            floor: p.floor,
+            after,
+        });
+    }
+
+    /// Whether a `SentUnconfirmed` send of `chat` waits for covering history.
+    pub(super) fn awaits_cover(&self, chat: ChatId) -> bool {
+        self.unconfirmed.iter().any(|u| u.chat == chat)
+    }
+
+    /// Forgets and returns the `SentUnconfirmed` sends of `chat` that server
+    /// history applied from `lo` up to a tail requested as `req` covers.
+    pub(super) fn covered_by(&mut self, chat: ChatId, lo: MsgId, req: ReqId) -> Vec<LocalId> {
+        let mut covered = Vec::new();
+        self.unconfirmed.retain(|u| {
+            let hit = u.covered(chat, lo, req);
+            if hit {
+                covered.push(u.local_id);
+            }
+            !hit
+        });
+        covered
     }
 
     /// The send `random_id` belongs to: a pending one (removed from the
@@ -181,8 +235,11 @@ impl PendingSends {
             self.remove(id);
             return Some(id);
         }
-        let at = self.unconfirmed.iter().position(|(r, _)| *r == random_id)?;
-        self.unconfirmed.remove(at).map(|(_, id)| id)
+        let at = self
+            .unconfirmed
+            .iter()
+            .position(|u| u.random_id == random_id)?;
+        self.unconfirmed.remove(at).map(|u| u.local_id)
     }
 }
 
@@ -219,6 +276,10 @@ impl<B: Backend> Actor<B> {
             self.error(UserError::Internal).await;
             return self.send_state(local_id, SendState::Failed).await;
         };
+        // `None` sorts below every id: the newest of what is known.
+        let floor = self
+            .tail_floor(chat)
+            .max(self.dialogs.get(chat).and_then(|c| c.last_id));
         let pending = Pending {
             chat,
             text,
@@ -229,6 +290,7 @@ impl<B: Backend> Actor<B> {
             state: SendState::Sending,
             in_flight: false,
             retry_at: None,
+            floor,
         };
         self.sends.insert(local_id, pending);
         self.dispatch_send(local_id).await;
@@ -339,7 +401,8 @@ impl<B: Backend> Actor<B> {
                 // table; the echo is matched by a later reconcile or a stream
                 // `updateMessageID`.
                 if let Some(p) = self.sends.remove(local_id) {
-                    self.sends.remember_unconfirmed(p.random_id, local_id);
+                    let after = ReqId(self.next_req);
+                    self.sends.remember_unconfirmed(&p, local_id, after);
                 }
                 self.send_state(local_id, SendState::SentUnconfirmed).await;
             }

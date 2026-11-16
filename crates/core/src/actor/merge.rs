@@ -26,7 +26,9 @@ pub(super) struct TailDiff {
 }
 
 /// Compares a tail `page` with an attached `window`, both ascending by id. An
-/// empty window is reported as a gap: replace instead of merging.
+/// empty window is reported as a gap: replace instead of merging. So is a
+/// partial page that starts above the window's newest message: the messages
+/// between them (more than a page arrived unseen) are known to neither.
 ///
 /// The page is authoritative over `range`
 /// ([`HistoryReply::authoritative_range`]): from the oldest id the server
@@ -46,6 +48,9 @@ pub(super) fn tail_diff(
         diff.gap = true;
         return diff;
     };
+    if page.has_more && range.is_some_and(|(lo, _)| lo.0 > newest.0.saturating_add(1)) {
+        diff.gap = true;
+    }
     for m in &page.messages {
         match window.binary_search_by_key(&m.id, |w| w.id) {
             Ok(i) => {
@@ -109,6 +114,8 @@ impl<B: Backend> Actor<B> {
                 .await;
         }
         self.emit_reconciled(chat, view).await;
+        self.tail_covers(chat, view, p.req, range.map(|(lo, _)| lo))
+            .await;
     }
 }
 
@@ -163,6 +170,30 @@ mod tests {
         assert!(tail_diff(&window, &page, Some((MIN_ID, MsgId(5)))).gap);
     }
 
+    /// Task 10c, finding 5: more than a page of messages arrived unseen. A
+    /// merge would leave a hole between the window and the page.
+    #[test]
+    fn a_partial_tail_past_the_window_is_a_gap() {
+        let window: VecDeque<Message> = msgs(&[1, 2, 3]).into();
+        let far = HistoryPage {
+            messages: msgs(&[10, 11]),
+            has_more: true,
+        };
+        assert!(tail_diff(&window, &far, Some((MsgId(10), MsgId(11)))).gap);
+        let next = HistoryPage {
+            messages: msgs(&[4, 5]),
+            has_more: true,
+        };
+        assert!(!tail_diff(&window, &next, Some((MsgId(4), MsgId(5)))).gap);
+        let whole = HistoryPage {
+            messages: msgs(&[10, 11]),
+            has_more: false,
+        };
+        let diff = tail_diff(&window, &whole, Some((MIN_ID, MsgId(11))));
+        assert!(!diff.gap, "the whole history: 1..=3 were deleted");
+        assert_eq!(diff.deleted, vec![MsgId(1), MsgId(2), MsgId(3)]);
+    }
+
     #[test]
     fn deleted_newest_message_is_removed() {
         // The window held 1..=10 when the tail was requested; 10 was deleted
@@ -207,6 +238,7 @@ mod tests {
         let mut reply = HistoryReply {
             chat: CHAT,
             view: ViewGen(1),
+            req: crate::actor::jobs::ReqId(1),
             dir: crate::api::HistoryDir::Tail,
             query: HistoryQuery::Tail,
             floor: Some(MsgId(100)),

@@ -2,9 +2,11 @@
 
 use super::Actor;
 use super::boot::{BootKind, Origin, Snapshot, TailVia};
-use super::jobs::{CallError, CallResult, DialogsStep, Done, Load, Outcome, PAGE, StreamEnd};
+use super::jobs::{
+    CallError, CallResult, DialogsStep, Done, Load, Outcome, PAGE, ReqId, StreamEnd,
+};
 use super::lifecycle::Reason;
-use crate::api::{Event, HistoryDir, UserError, WindowState};
+use crate::api::{Event, HistoryDir, LoadTarget, UserError, WindowState};
 use crate::backend::{
     Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, StreamError, Update,
 };
@@ -53,6 +55,8 @@ pub(super) enum TailMode {
 pub(super) struct HistoryReply {
     pub(super) chat: ChatId,
     pub(super) view: ViewGen,
+    /// The load that asked for it (its order says what it can cover).
+    pub(super) req: ReqId,
     pub(super) dir: HistoryDir,
     pub(super) query: HistoryQuery,
     /// See [`Job::History`](super::jobs::Job::History).
@@ -193,6 +197,7 @@ impl<B: Backend> Actor<B> {
                 let reply = HistoryReply {
                     chat: load.chat,
                     view: load.view,
+                    req: load.req,
                     dir: req.dir,
                     query: req.query,
                     floor: req.floor,
@@ -202,7 +207,11 @@ impl<B: Backend> Actor<B> {
                 };
                 self.on_history(reply).await;
             }
-            Err(e) => self.error(user_error(e)).await,
+            Err(e) => {
+                self.error(user_error(e)).await;
+                self.history_ended(load.chat, req.dir, Some(user_error(e)))
+                    .await;
+            }
         }
         if boot.is_some() {
             self.snapshot_done(Snapshot::Tail(load)).await;
@@ -269,7 +278,11 @@ impl<B: Backend> Actor<B> {
                 let has_more = self.dialogs_next.is_some();
                 self.emit(Event::DialogsPaging { has_more }).await;
             }
-            Err(e) => self.error(user_error(e)).await,
+            Err(e) => {
+                self.error(user_error(e)).await;
+                self.load_ended(LoadTarget::Dialogs, Some(user_error(e)))
+                    .await;
+            }
         }
         if std::mem::take(&mut self.dialogs_queued) {
             self.load_dialogs().await;
@@ -438,6 +451,9 @@ impl<B: Backend> Actor<B> {
                 if let Ok(change) = self.windows.prepend(p.chat, p.view, p.page) {
                     self.emit_history(p.chat, p.view, p.dir, change).await;
                 }
+                if let HistoryQuery::Before(edge) = p.query {
+                    self.older_covers(p.chat, p.view, edge, lo).await;
+                }
             }
             HistoryDir::Newer => {
                 let lo = match p.query {
@@ -487,7 +503,12 @@ impl<B: Backend> Actor<B> {
     pub(super) async fn on_tail(&mut self, p: HistoryReply) {
         let top = p.authoritative_top();
         let range = p.authoritative_range();
-        let HistoryReply { chat, mut page, .. } = p;
+        let HistoryReply {
+            chat,
+            req,
+            mut page,
+            ..
+        } = p;
         let Some(w) = self.windows.get(chat) else {
             return;
         };
@@ -527,6 +548,8 @@ impl<B: Backend> Actor<B> {
                 .await;
         }
         self.emit_reconciled(chat, view).await;
+        self.tail_covers(chat, view, req, range.map(|(lo, _)| lo))
+            .await;
     }
 
     /// Tells the UI that `view` of `chat` now matches the server's tail.

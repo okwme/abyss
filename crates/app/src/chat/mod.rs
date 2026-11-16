@@ -11,6 +11,7 @@ pub(crate) mod demo;
 pub(crate) mod format;
 pub(crate) mod list;
 pub(crate) mod messages;
+pub(crate) mod retry;
 pub(crate) mod rich;
 pub(crate) mod sends;
 pub(crate) mod viewport;
@@ -18,7 +19,7 @@ pub(crate) mod viewport;
 use std::collections::HashSet;
 use std::time::Instant;
 
-use abyss_core::api::{Event, WindowState};
+use abyss_core::api::{Event, LoadTarget, UserError, WindowState};
 use abyss_core::model::{ChatId, ChatSummary, Message, MsgId};
 use abyss_core::store::ViewGen;
 use gpui::{FollowMode, ListAlignment, ListState, px};
@@ -26,6 +27,7 @@ use gpui::{FollowMode, ListAlignment, ListState, px};
 pub(crate) use self::commands::{Admit, Refused};
 use self::list::{ChatList, Pages};
 use self::messages::{Applied, Batch, MessageWindow, RowOp};
+use self::retry::{Backoff, earliest};
 use self::sends::{Echo, Echoes};
 use self::viewport::Seen;
 
@@ -65,7 +67,18 @@ pub(crate) struct ChatShell {
     /// The chat core was last told shows its live tail (`ViewingTail`).
     viewing: Option<ChatId>,
     next_local: u64,
-    focus: WindowState,
+    /// Whether the window is active, as the OS last said. Reads and the
+    /// live tail follow this at once, whatever core was told.
+    active: WindowState,
+    /// The window state core last admitted (`Command::Window`).
+    focus_sent: WindowState,
+    /// Bringing core in line with `active` after a refusal.
+    focus_retry: Backoff,
+    /// Frame-driven commands (loads, read marks, the live tail) core
+    /// refused: the next frame retries, and a wake-up makes sure one comes.
+    frame_retry: Backoff,
+    /// When the pending wake-up for retries fires, if one is scheduled.
+    retry_timer: Option<Instant>,
     countdown: Countdown,
     /// Where the message rows were painted this frame.
     painted: viewport::Painted,
@@ -93,7 +106,11 @@ impl Default for ChatShell {
             read_sent: None,
             viewing: None,
             next_local: 1,
-            focus: WindowState::Active,
+            active: WindowState::Active,
+            focus_sent: WindowState::Active,
+            focus_retry: Backoff::default(),
+            frame_retry: Backoff::default(),
+            retry_timer: None,
             countdown: Countdown::Idle,
             painted: viewport::Painted::default(),
         }
@@ -234,6 +251,11 @@ impl ChatShell {
                 },
             ),
             Event::Reconciled { chat, view, newest } => self.on_reconciled(chat, view, newest),
+            Event::SendsCovered { sends, .. } => {
+                if self.echoes.covered(&sends) {
+                    self.sync_echoes();
+                }
+            }
             Event::ChatInvalidated(chat) => {
                 let applied = self.open_window(chat).map(MessageWindow::invalidate);
                 self.sync_rows(applied);
@@ -255,10 +277,62 @@ impl ChatShell {
                     self.after_echo_change();
                 }
             }
+            // `LoadEnded` needs the time: see [`Self::load_ended`]. Errors
+            // never end a load: core says which load ended.
             Event::Auth(_)
             | Event::CredentialSource(_)
             | Event::Connection(_)
-            | Event::Error(_) => {}
+            | Event::Error(_)
+            | Event::LoadEnded { .. } => {}
+        }
+    }
+
+    /// A load the UI asked for ended without its answer
+    /// (`Event::LoadEnded`) at `now`.
+    pub(crate) fn load_ended(
+        &mut self,
+        target: LoadTarget,
+        error: Option<UserError>,
+        now: Instant,
+    ) {
+        match target {
+            LoadTarget::Dialogs => self.list.load_ended(error, now),
+            LoadTarget::History { chat, dir } => {
+                if let Some(w) = self.open_window(chat) {
+                    w.load_ended(dir, error, now);
+                }
+            }
+        }
+    }
+
+    /// When the shell next wants a wake-up to retry something refused or
+    /// failed, if anything waits past `now`.
+    pub(crate) fn retry_due(&self, now: Instant) -> Option<Instant> {
+        let focus = self
+            .focus_out_of_sync()
+            .then(|| self.focus_retry.due(now))
+            .flatten();
+        let window = self.window.as_ref().and_then(|w| w.retry_due(now));
+        [self.list.retry_due(now), window, self.frame_retry.due(now)]
+            .into_iter()
+            .fold(focus, earliest)
+    }
+
+    /// A wake-up for `due` is to be scheduled unless an earlier one already
+    /// is; returns whether to schedule it. At most one is outstanding per
+    /// distinct earlier instant, so wake-ups never outnumber failures.
+    pub(crate) fn schedule_retry(&mut self, due: Instant) -> bool {
+        if self.retry_timer.is_some_and(|t| t <= due) {
+            return false;
+        }
+        self.retry_timer = Some(due);
+        true
+    }
+
+    /// The wake-up for `due` fired.
+    pub(crate) fn retry_fired(&mut self, due: Instant) {
+        if self.retry_timer == Some(due) {
+            self.retry_timer = None;
         }
     }
 
@@ -278,8 +352,13 @@ impl ChatShell {
         self.after_echo_change();
     }
 
-    /// Core merged the server's tail of `chat` into `view`.
+    /// Core merged the server's tail of `chat` into `view`. It also ends
+    /// any history load asked of that view: core answers a load asked while
+    /// the tail loaded after it, and asking again is harmless.
     fn on_reconciled(&mut self, chat: ChatId, view: ViewGen, newest: Option<MsgId>) {
+        if let Some(w) = self.open_window(chat) {
+            w.reconciled(view);
+        }
         let on_screen = self
             .window
             .as_ref()
@@ -357,15 +436,6 @@ impl ChatShell {
         if self.shown_echoes > 0 {
             self.rows.remeasure_items(start..start + self.shown_echoes);
         }
-    }
-
-    /// A core error: an outstanding history or dialogs load may never be
-    /// answered.
-    pub(crate) fn load_failed(&mut self) {
-        if let Some(w) = self.window.as_mut() {
-            w.clear_pending();
-        }
-        self.list.load_failed();
     }
 }
 

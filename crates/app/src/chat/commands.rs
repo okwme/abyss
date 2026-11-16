@@ -1,7 +1,10 @@
 //! The chat shell's commands to core. Each goes through an [`Admit`] first,
 //! and the UI changes that follow from it (an echo, a cleared composer, a
 //! pending load, a read mark) are made only once core admitted it. A full
-//! queue therefore changes nothing: the next attempt asks again.
+//! queue therefore changes nothing: the next attempt asks again, after a
+//! bounded backoff (`retry.rs`) that the shell wakes itself for.
+
+use std::time::Instant;
 
 use abyss_core::api::{Command, HistoryDir, UserError, WindowState};
 use abyss_core::model::{ChatId, LocalId};
@@ -118,51 +121,80 @@ impl ChatShell {
         Ok(())
     }
 
-    /// Whether chat list row `last_visible` on screen calls for the next
-    /// dialogs page (see [`super::list::ChatList::wants_more`]).
-    pub(crate) fn wants_dialogs(&self, last_visible: usize) -> bool {
-        self.list.wants_more(last_visible)
+    /// Chat list row `last_visible` is on screen (see
+    /// [`super::list::ChatList::seen`]). Returns whether a request is due.
+    pub(crate) fn dialogs_seen(&mut self, last_visible: usize, now: Instant) -> bool {
+        self.list.seen(last_visible);
+        self.list.wants_more(now)
     }
 
-    /// Asks for the next dialogs page if row `last_visible` calls for it.
+    /// Asks for the next dialogs page if the sidebar wants one and no retry
+    /// waits. A refusal is retried after a backoff.
     pub(crate) fn request_dialogs(
         &mut self,
-        last_visible: usize,
+        now: Instant,
         admit: Admit<'_>,
     ) -> Result<(), Refused> {
-        if self.list.wants_more(last_visible) {
-            admit(Command::LoadDialogs)?;
-            self.list.requested();
+        if !self.list.wants_more(now) {
+            return Ok(());
         }
-        Ok(())
+        match admit(Command::LoadDialogs) {
+            Ok(()) => {
+                self.list.requested();
+                Ok(())
+            }
+            Err(refused) => {
+                self.list.refused(now);
+                Err(refused)
+            }
+        }
     }
 
     /// After a frame was painted: load more history near either end, mark
     /// read up to the newest message on screen while the window is active,
     /// and tell core whether the live tail is on screen. `seen` is `None`
-    /// when no row was laid out.
+    /// when no row was laid out. A refusal is retried on a later frame, and
+    /// [`Self::retry_due`] makes sure one comes.
     pub(crate) fn frame_seen(
         &mut self,
         seen: Option<Seen>,
+        now: Instant,
         admit: Admit<'_>,
     ) -> Result<(), Refused> {
+        let res = self.frame_commands(seen, now, admit);
+        match res {
+            Ok(()) => self.frame_retry.reset(),
+            Err(_) => self.frame_retry.failed(now),
+        }
+        res
+    }
+
+    fn frame_commands(
+        &mut self,
+        seen: Option<Seen>,
+        now: Instant,
+        admit: Admit<'_>,
+    ) -> Result<(), Refused> {
+        if self.focus_out_of_sync() && self.focus_retry.ready(now) {
+            self.sync_focus(now, admit)?;
+        }
+        let active = self.active == WindowState::Active;
         let Some(w) = self.window.as_mut() else {
             return self.set_viewing(None, admit);
         };
         let chat = w.chat();
         if let Some(seen) = seen {
-            if w.wants_older(seen.first_row) {
+            if w.wants_older(seen.first_row, now) {
                 admit(Command::LoadOlder(chat))?;
                 w.requested(HistoryDir::Older);
             }
             if let Some(last) = seen.last_message
-                && w.wants_newer(last)
+                && w.wants_newer(last, now)
             {
                 admit(Command::LoadNewer(chat))?;
                 w.requested(HistoryDir::Newer);
             }
         }
-        let active = self.focus == WindowState::Active;
         let shown = seen.and_then(|s| s.last_message).and_then(|ix| w.get(ix));
         if let Some(max_id) = shown
             .map(|m| m.id)
@@ -184,21 +216,48 @@ impl ChatShell {
         Ok(())
     }
 
-    /// The window gained or lost focus. Losing it also tells core the tail
-    /// is no longer watched.
+    /// The window gained or lost focus. The shell follows at once (no read
+    /// mark and no live tail while inactive); core is told now, or, if it
+    /// refuses, after a backoff ([`Self::retry_due`]).
     pub(crate) fn set_focus(
         &mut self,
         state: WindowState,
+        now: Instant,
         admit: Admit<'_>,
     ) -> Result<(), Refused> {
-        if self.focus != state {
-            admit(Command::Window(state))?;
-            self.focus = state;
+        if self.active != state {
+            self.active = state;
+            self.focus_retry.reset();
         }
-        if state == WindowState::Inactive {
-            self.set_viewing(None, admit)?;
+        self.sync_focus(now, admit)
+    }
+
+    /// Whether core's idea of the window (its state, the live tail) lags
+    /// the actual one.
+    pub(crate) fn focus_out_of_sync(&self) -> bool {
+        self.focus_sent != self.active
+            || (self.active == WindowState::Inactive && self.viewing.is_some())
+    }
+
+    /// Tells core what it lacks of the actual window state: `Window`, and
+    /// while inactive `ViewingTail(None)`. Both are tried, so either one
+    /// admitted already stops core treating the tail as watched.
+    pub(crate) fn sync_focus(&mut self, now: Instant, admit: Admit<'_>) -> Result<(), Refused> {
+        let mut res = Ok(());
+        if self.focus_sent != self.active {
+            match admit(Command::Window(self.active)) {
+                Ok(()) => self.focus_sent = self.active,
+                Err(refused) => res = Err(refused),
+            }
         }
-        Ok(())
+        if self.active == WindowState::Inactive {
+            res = res.and(self.set_viewing(None, admit));
+        }
+        match res {
+            Ok(()) => self.focus_retry.reset(),
+            Err(_) => self.focus_retry.failed(now),
+        }
+        res
     }
 
     /// The echo table, for tests.
