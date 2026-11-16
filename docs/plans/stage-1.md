@@ -805,6 +805,13 @@ Open items:
     - Dialog order drifts when two previews in one second are identical.
     - A spoiler link leaks its target, and clicks overlap between copy and reveal.
 
+- **Round 7 (re-check of task 11b, 2026-11-16).** Original findings 3–6 are fixed; 1 and 2 are only partly fixed. These are open for task 11c, which runs after 4b because it needs actor changes:
+  - **High:** pins track page-fetch recency, not core's retained dialogs. At capacity, a single new chat evicts a chat core still keeps.
+  - **High:** a rebuild funnels up to 1,264 inherited peers into the 1,000-slot dialog set in unordered order, so retained dialogs are lost on the next repin.
+  - The tracker union can exceed the session's 1,264-pin cap, and a priority change doesn't trigger a repin.
+  - The users-plus-chats budget of 16 × limit + 16 rejects legitimate responses, such as a service message adding 32 users. Bound auxiliary peers by `MAX_DIRECTORY` instead.
+  - **Direction for 11c:** core owns the required-peer set and tells the backend exactly which peers to keep pinned: retained dialogs, open windows and pending sends. The backend stops guessing.
+
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 
 History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This supersedes the "nothing on disk except the Keychain item" property in sections 3 and 9. The new property: **nothing plaintext on disk; everything on disk is undecryptable without a device-only Keychain key.**
