@@ -41,11 +41,23 @@ pub enum Command {
         local_id: LocalId,
     },
     RetrySend(LocalId),
+    /// Drops a failed or unknown send from the pending-send table. A send that
+    /// is in flight cannot be discarded (`Busy`).
+    DiscardSend(LocalId),
+    /// The main window became active or inactive. Activation triggers a light
+    /// refresh; while active, one also runs every 5 minutes (plan section 2).
+    Window(WindowState),
     MarkRead {
         chat: ChatId,
         max_id: MsgId,
     },
     Logout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowState {
+    Active,
+    Inactive,
 }
 
 /// Login state. Placeholder: tasks 5–6 add the phone/code/password states.
@@ -58,7 +70,14 @@ pub enum AuthState {
 pub enum ConnState {
     Connecting,
     Online,
-    Rebuilding { attempt: u32 },
+    /// Retiring the client instance and building a new one. `attempt` counts
+    /// rebuilds since the last 5 minutes of stable operation, starting at 1.
+    Rebuilding {
+        attempt: u32,
+    },
+    /// No usable instance: a build failed and the next one waits for backoff, or
+    /// the account needs a new sign-in (repeated `AccountMigrated`).
+    Offline,
 }
 
 /// Lifecycle of one logical send (plan section 9).
@@ -89,6 +108,9 @@ pub enum UserError {
     Rejected,
     NotFound,
     ShuttingDown,
+    /// The server moved the account to another data center. Core rebuilds once;
+    /// if it recurs, the user has to sign in again (plan section 2, risk 6).
+    AccountMigrated,
     /// Not available yet in this build (auth lands in tasks 5–6).
     Unsupported,
     /// A bug: a contained panic or broken invariant.

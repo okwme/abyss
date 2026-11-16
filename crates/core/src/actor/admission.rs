@@ -39,7 +39,6 @@ impl Admission {
         self.parked.push(permit);
     }
 
-    #[cfg(test)]
     pub(super) fn parked(&self) -> usize {
         self.parked.len()
     }
@@ -47,6 +46,12 @@ impl Admission {
     #[cfg(test)]
     pub(super) fn available(&self) -> usize {
         self.sem.available_permits()
+    }
+
+    /// The semaphore itself, so tests can observe permits while the actor runs.
+    #[cfg(all(test, feature = "fake"))]
+    pub(super) fn probe(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.sem)
     }
 
     /// Recycles parked permits. Call only once the client instance that owned the

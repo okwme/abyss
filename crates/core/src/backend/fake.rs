@@ -1,23 +1,33 @@
 //! Scripted in-process backend for development and tests (`fake` feature only).
 //!
-//! Supports per-operation fault injection (error, hang forever, panic), fixed
-//! latency, live updates pushed by the test, and call/concurrency counters.
+//! Every build yields a fresh instance over one shared fake server. Supports
+//! per-call fault injection (error, hang forever, panic, delay), lifecycle faults
+//! (failed build, missing baseline, runner exit or panic, a runner that is slow
+//! to quit or ignores `quit`), stream faults (recoverable or fatal error, panic),
+//! fixed latency, live updates pushed by the test, and counters.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
-use super::{Backend, BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Update};
+use super::{
+    Backend, BackendError, Client, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance,
+    InstanceControl, Seed, SessionSeed, SessionSnapshot, StreamError, StreamItem, Update,
+    UpdateStream,
+};
 use crate::model::{Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey};
 use crate::rich_text::RichText;
 
 /// Maximum faults queued per operation.
 const MAX_FAULTS: usize = 1024;
-/// Capacity of the pushed-update channel.
+/// Capacity of the pushed-update channel (shared by every instance's stream).
 const UPDATE_CAPACITY: usize = 256;
+/// Recorded sends, seeds and other logs are capped at this many entries.
+const MAX_LOG: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
@@ -25,7 +35,6 @@ pub enum Op {
     History,
     Send,
     Read,
-    Update,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +44,27 @@ pub enum Fault {
     Hang,
     /// Panics inside the call (a bug in the Telegram library).
     Panic,
+    /// Succeeds after the given extra delay.
+    Delay(Duration),
+}
+
+/// A fault applied to the next build.
+#[derive(Clone, Copy, Debug)]
+pub enum BuildFault {
+    /// The build itself fails.
+    Fail(BackendError),
+    /// The stream never reports a baseline (`getState` failed).
+    NoBaseline,
+}
+
+/// How the current runner reacts to `quit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuitBehavior {
+    Prompt,
+    /// Stops after the given delay.
+    Slow(Duration),
+    /// Never stops by itself; only abort ends it.
+    Ignore,
 }
 
 /// Initial data for a fake account.
@@ -97,11 +127,30 @@ pub fn text_message(chat: ChatId, id: i32, text: &str) -> Message {
         thread: ThreadKey { chat, topic: None },
         sender: None,
         date: i64::from(id),
-        edited: false,
+        edit_date: None,
         outgoing: false,
         reply_to: None,
         body: Body::Text(RichText::plain(text)),
     }
+}
+
+/// What the test asks the current runner to do.
+#[derive(Clone, Copy, Debug)]
+enum RunnerCmd {
+    Exit,
+    Panic,
+}
+
+/// What the shared stream channel carries.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "test-only channel; updates are the common item"
+)]
+enum StreamCmd {
+    Update(Update),
+    Error(StreamError),
+    Panic,
 }
 
 #[derive(Debug, Default)]
@@ -109,9 +158,14 @@ struct State {
     dialogs: Vec<ChatSummary>,
     history: HashMap<ChatId, Vec<Message>>,
     faults: HashMap<Op, VecDeque<Fault>>,
+    build_faults: VecDeque<BuildFault>,
     calls: HashMap<Op, usize>,
     sent: Vec<(ChatId, i64)>,
+    attempted: Vec<(ChatId, i64)>,
     read: Vec<(ChatId, MsgId)>,
+    seeds: Vec<Seed>,
+    quit: Option<QuitBehavior>,
+    runner: Option<mpsc::Sender<RunnerCmd>>,
 }
 
 #[derive(Debug)]
@@ -120,19 +174,21 @@ struct Shared {
     latency: Duration,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
+    runners_finished: AtomicUsize,
+    retired: AtomicUsize,
 }
 
 /// Test-side control of a running [`FakeBackend`].
 #[derive(Clone, Debug)]
 pub struct FakeHandle {
     shared: Arc<Shared>,
-    updates: mpsc::Sender<Update>,
+    stream: mpsc::Sender<StreamCmd>,
 }
 
 #[derive(Debug)]
 pub struct FakeBackend {
     shared: Arc<Shared>,
-    updates: tokio::sync::Mutex<mpsc::Receiver<Update>>,
+    stream: Arc<tokio::sync::Mutex<mpsc::Receiver<StreamCmd>>>,
 }
 
 impl FakeBackend {
@@ -147,36 +203,18 @@ impl FakeBackend {
             latency: script.latency,
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            runners_finished: AtomicUsize::new(0),
+            retired: AtomicUsize::new(0),
         });
         let handle = FakeHandle {
             shared: Arc::clone(&shared),
-            updates: tx,
+            stream: tx,
         };
-        (
-            FakeBackend {
-                shared,
-                updates: tokio::sync::Mutex::new(rx),
-            },
-            handle,
-        )
-    }
-
-    /// Counts the call, applies latency, then any injected fault.
-    async fn enter(&self, op: Op) -> Result<InFlight<'_>, BackendError> {
-        let fault = self.shared.with(|s| {
-            *s.calls.entry(op).or_default() += 1;
-            s.faults.get_mut(&op).and_then(VecDeque::pop_front)
-        });
-        let guard = InFlight::new(&self.shared);
-        if !self.shared.latency.is_zero() {
-            tokio::time::sleep(self.shared.latency).await;
-        }
-        match fault {
-            None => Ok(guard),
-            Some(Fault::Error(e)) => Err(e),
-            Some(Fault::Hang) => std::future::pending().await,
-            Some(Fault::Panic) => injected_panic(op),
-        }
+        let backend = FakeBackend {
+            shared,
+            stream: Arc::new(tokio::sync::Mutex::new(rx)),
+        };
+        (backend, handle)
     }
 }
 
@@ -184,8 +222,8 @@ impl FakeBackend {
     clippy::panic,
     reason = "deliberate fault injection for panic-containment tests"
 )]
-fn injected_panic(op: Op) -> ! {
-    panic!("injected fake backend panic in {op:?}")
+fn injected_panic(what: &str) -> ! {
+    panic!("injected fake backend panic in {what}")
 }
 
 impl Shared {
@@ -195,6 +233,12 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut guard)
+    }
+}
+
+fn push_capped<T>(log: &mut Vec<T>, item: T) {
+    if log.len() < MAX_LOG {
+        log.push(item);
     }
 }
 
@@ -215,6 +259,15 @@ impl Drop for InFlight<'_> {
     }
 }
 
+/// Counts runner completions, including cancellation (the future is dropped).
+struct RunnerGuard(Arc<Shared>);
+
+impl Drop for RunnerGuard {
+    fn drop(&mut self) {
+        self.0.runners_finished.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 impl FakeHandle {
     /// Queues a one-shot fault for the next call of `op`.
     pub fn inject(&self, op: Op, fault: Fault) {
@@ -226,8 +279,49 @@ impl FakeHandle {
         });
     }
 
+    /// Queues a fault for the next build.
+    pub fn on_next_build(&self, fault: BuildFault) {
+        self.shared.with(|s| {
+            if s.build_faults.len() < MAX_FAULTS {
+                s.build_faults.push_back(fault);
+            }
+        });
+    }
+
+    /// Sets how runners react to `quit` from now on.
+    pub fn set_quit(&self, behavior: QuitBehavior) {
+        self.shared.with(|s| s.quit = Some(behavior));
+    }
+
+    /// Makes the current runner return (the connection driver died).
+    pub fn runner_exit(&self) {
+        self.runner_cmd(RunnerCmd::Exit);
+    }
+
+    /// Makes the current runner panic (a connection-task panic re-raised).
+    pub fn runner_panic(&self) {
+        self.runner_cmd(RunnerCmd::Panic);
+    }
+
+    fn runner_cmd(&self, cmd: RunnerCmd) {
+        if let Some(tx) = self.shared.with(|s| s.runner.clone()) {
+            let _ = tx.try_send(cmd);
+        }
+    }
+
+    /// Delivers a live update on whichever stream is current (or the next one).
     pub async fn push_update(&self, update: Update) {
-        let _ = self.updates.send(update).await;
+        let _ = self.stream.send(StreamCmd::Update(update)).await;
+    }
+
+    /// The current stream's next `next` call fails with `e`.
+    pub async fn stream_error(&self, e: StreamError) {
+        let _ = self.stream.send(StreamCmd::Error(e)).await;
+    }
+
+    /// The current stream's next `next` call panics.
+    pub async fn stream_panic(&self) {
+        let _ = self.stream.send(StreamCmd::Panic).await;
     }
 
     pub fn calls(&self, op: Op) -> usize {
@@ -242,9 +336,44 @@ impl FakeHandle {
         self.shared.max_in_flight.load(Ordering::SeqCst)
     }
 
-    /// `(chat, random_id)` of every send that reached the backend.
+    /// Number of builds attempted (including failed ones).
+    pub fn builds(&self) -> usize {
+        self.shared.with(|s| s.seeds.len())
+    }
+
+    /// The seed of every build, in order.
+    pub fn seeds(&self) -> Vec<Seed> {
+        self.shared.with(|s| s.seeds.clone())
+    }
+
+    /// Builds that loaded persisted state (process startup only).
+    pub fn stored_loads(&self) -> usize {
+        self.shared.with(|s| {
+            s.seeds
+                .iter()
+                .filter(|seed| seed.session == SessionSeed::Stored)
+                .count()
+        })
+    }
+
+    /// Runners that completed or were cancelled.
+    pub fn runners_finished(&self) -> usize {
+        self.shared.runners_finished.load(Ordering::SeqCst)
+    }
+
+    /// Instances whose control was retired.
+    pub fn retired(&self) -> usize {
+        self.shared.retired.load(Ordering::SeqCst)
+    }
+
+    /// `(chat, random_id)` of every send that reached the backend and succeeded.
     pub fn sent(&self) -> Vec<(ChatId, i64)> {
         self.shared.with(|s| s.sent.clone())
+    }
+
+    /// `(chat, random_id)` of every send call, including failed or hung ones.
+    pub fn send_attempts(&self) -> Vec<(ChatId, i64)> {
+        self.shared.with(|s| s.attempted.clone())
     }
 
     pub fn read_calls(&self) -> Vec<(ChatId, MsgId)> {
@@ -256,6 +385,151 @@ impl FakeHandle {
         self.shared.with(|s| {
             s.history.insert(chat, messages);
         });
+    }
+}
+
+impl Backend for FakeBackend {
+    type Client = FakeClient;
+    type Updates = FakeUpdates;
+    type Control = FakeControl;
+
+    fn build(
+        &self,
+        seed: Seed,
+    ) -> impl Future<Output = Result<Instance<Self>, BackendError>> + Send {
+        std::future::ready(self.build_now(seed))
+    }
+}
+
+impl FakeBackend {
+    fn build_now(&self, seed: Seed) -> Result<Instance<Self>, BackendError> {
+        let rev = match &seed.session {
+            SessionSeed::Stored => 0,
+            SessionSeed::Live(snapshot) => snapshot.rev(),
+        };
+        let (runner_tx, runner_rx) = mpsc::channel(4);
+        let fault = self.shared.with(|s| {
+            push_capped(&mut s.seeds, seed);
+            s.runner = Some(runner_tx);
+            s.build_faults.pop_front()
+        });
+        let baseline = match fault {
+            Some(BuildFault::Fail(e)) => return Err(e),
+            Some(BuildFault::NoBaseline) => false,
+            None => true,
+        };
+        let quit = Arc::new(Notify::new());
+        Ok(Instance {
+            client: FakeClient {
+                shared: Arc::clone(&self.shared),
+            },
+            updates: FakeUpdates {
+                stream: Arc::clone(&self.stream),
+                baseline,
+            },
+            runner: Box::pin(run_runner(
+                Arc::clone(&self.shared),
+                Arc::clone(&quit),
+                runner_rx,
+            )),
+            control: FakeControl {
+                shared: Arc::clone(&self.shared),
+                quit,
+                rev,
+            },
+        })
+    }
+}
+
+async fn run_runner(shared: Arc<Shared>, quit: Arc<Notify>, mut cmds: mpsc::Receiver<RunnerCmd>) {
+    let _guard = RunnerGuard(Arc::clone(&shared));
+    tokio::select! {
+        () = quit.notified() => {
+            match shared.with(|s| s.quit).unwrap_or(QuitBehavior::Prompt) {
+                QuitBehavior::Prompt => {}
+                QuitBehavior::Slow(d) => tokio::time::sleep(d).await,
+                QuitBehavior::Ignore => std::future::pending().await,
+            }
+        }
+        cmd = cmds.recv() => match cmd {
+            Some(RunnerCmd::Exit) => {}
+            Some(RunnerCmd::Panic) => injected_panic("runner"),
+            // Replaced by a newer build; keep running until quit.
+            None => quit.notified().await,
+        },
+    }
+}
+
+/// Retirement hooks of one fake instance.
+#[derive(Debug)]
+pub struct FakeControl {
+    shared: Arc<Shared>,
+    quit: Arc<Notify>,
+    rev: u64,
+}
+
+impl InstanceControl for FakeControl {
+    fn quit(&self) {
+        self.quit.notify_one();
+    }
+
+    fn retire(self) -> SessionSnapshot {
+        self.shared.retired.fetch_add(1, Ordering::SeqCst);
+        // Simulates a critical write (e.g. a DC option) during the instance's life.
+        SessionSnapshot::new(self.rev.saturating_add(1))
+    }
+}
+
+/// The update stream of one fake instance.
+#[derive(Debug)]
+pub struct FakeUpdates {
+    stream: Arc<tokio::sync::Mutex<mpsc::Receiver<StreamCmd>>>,
+    /// The baseline is still to be reported.
+    baseline: bool,
+}
+
+impl UpdateStream for FakeUpdates {
+    async fn next(&mut self) -> Result<StreamItem, StreamError> {
+        if std::mem::take(&mut self.baseline) {
+            return Ok(StreamItem::Baseline);
+        }
+        let mut rx = self.stream.lock().await;
+        match rx.recv().await {
+            Some(StreamCmd::Update(u)) => Ok(StreamItem::Update(u)),
+            Some(StreamCmd::Error(e)) => Err(e),
+            Some(StreamCmd::Panic) => injected_panic("update stream"),
+            None => Err(StreamError::Fatal),
+        }
+    }
+}
+
+/// Calls of one fake instance, served by the shared fake server.
+#[derive(Debug)]
+pub struct FakeClient {
+    shared: Arc<Shared>,
+}
+
+impl FakeClient {
+    /// Counts the call, applies latency, then any injected fault.
+    async fn enter(&self, op: Op) -> Result<InFlight<'_>, BackendError> {
+        let fault = self.shared.with(|s| {
+            *s.calls.entry(op).or_default() += 1;
+            s.faults.get_mut(&op).and_then(VecDeque::pop_front)
+        });
+        let guard = InFlight::new(&self.shared);
+        if !self.shared.latency.is_zero() {
+            tokio::time::sleep(self.shared.latency).await;
+        }
+        match fault {
+            None => Ok(guard),
+            Some(Fault::Delay(d)) => {
+                tokio::time::sleep(d).await;
+                Ok(guard)
+            }
+            Some(Fault::Error(e)) => Err(e),
+            Some(Fault::Hang) => std::future::pending().await,
+            Some(Fault::Panic) => injected_panic("call"),
+        }
     }
 }
 
@@ -282,7 +556,7 @@ fn page(all: &[Message], query: HistoryQuery, limit: usize) -> HistoryPage {
     }
 }
 
-impl Backend for FakeBackend {
+impl Client for FakeClient {
     async fn dialogs(
         &self,
         cursor: Option<DialogsCursor>,
@@ -324,11 +598,13 @@ impl Backend for FakeBackend {
         text: String,
         random_id: i64,
     ) -> Result<MsgId, BackendError> {
+        self.shared
+            .with(|s| push_capped(&mut s.attempted, (chat, random_id)));
         let _g = self.enter(Op::Send).await?;
         // The real server also echoes own sends as updates; the fake does not, so tests
         // control update ordering explicitly with `FakeHandle::push_update`.
         let id = self.shared.with(|s| {
-            s.sent.push((chat, random_id));
+            push_capped(&mut s.sent, (chat, random_id));
             let history = s.history.entry(chat).or_default();
             let id = history.last().map_or(1, |m| m.id.0.saturating_add(1));
             let mut msg = text_message(chat, id, &text);
@@ -341,22 +617,9 @@ impl Backend for FakeBackend {
 
     async fn read_history(&self, chat: ChatId, max_id: MsgId) -> Result<(), BackendError> {
         let _g = self.enter(Op::Read).await?;
-        self.shared.with(|s| s.read.push((chat, max_id)));
+        self.shared
+            .with(|s| push_capped(&mut s.read, (chat, max_id)));
         Ok(())
-    }
-
-    async fn next_update(&self) -> Result<Update, BackendError> {
-        let fault = self
-            .shared
-            .with(|s| s.faults.get_mut(&Op::Update).and_then(VecDeque::pop_front));
-        match fault {
-            Some(Fault::Error(e)) => return Err(e),
-            Some(Fault::Hang) => std::future::pending::<()>().await,
-            Some(Fault::Panic) => injected_panic(Op::Update),
-            None => {}
-        }
-        let mut rx = self.updates.lock().await;
-        rx.recv().await.ok_or(BackendError::Transient)
     }
 }
 

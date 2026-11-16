@@ -588,6 +588,35 @@ Core API gaps (for the core tasks):
 
 Needs manual testing: `cargo dev` login → chat list; Cmd+Q, Cmd+W and the close button showing "Closing…" then exiting (keystrokes could not be automated here without Accessibility permission).
 
+**Task 4 status (2026-11-16): done.** Implemented the client lifecycle in `crates/core/src/actor/{lifecycle,boot,merge}.rs`:
+- **Backend as an instance factory.** `Backend::build(Seed) -> Instance { client, updates, runner, control }`, with per-instance `Client` calls, an `UpdateStream` that yields `StreamItem::Baseline` once and then updates, a runner future that core spawns and supervises, and `InstanceControl::{quit, retire}`. `Seed` carries `SessionSeed::Stored` (process startup only) or `SessionSeed::Live(SessionSnapshot)` from the retired instance, plus bounded `CarriedPeers` (window chats and pending-send chats, at most 264). `SessionSnapshot` is an opaque placeholder in `backend/seed.rs` for task 5.
+- **Rebuild triggers**, each causing exactly one rebuild: runner exit or panic; update stream fatal error, panic, or a transient error still failing after retries at 0.5, 1 and 2 s on the same stream; stall (3 deadline misses within 2 minutes, or all 16 permits parked); wake (`CoreHandle::notify_wake`, control plane); baseline not established within 10 s; bootstrap buffer or tombstone overflow (4,096 each); authenticated migration (`BackendError::Migrated` → `UserError::AccountMigrated`; rebuilds once, a second one halts in `Offline`). Triggers coalesce while a rebuild is running.
+- **Retirement order:** bump `ClientGen` and stop admission → cancel the instance's tasks (calls observe a per-instance token and return `Dropped`) and join them, 3 s cap then abort and join → `quit` and await the runner, 5 s cap then `abort` and await again → `InstanceControl::retire` (revoke, capture the snapshot) → apply surviving send outcomes → recycle parked permits → build after backoff (1 s doubling to 60 s, up to 20% jitter, reset after 5 minutes online). Build and retirement run as one spawned step, so the actor keeps serving commands and the cache meanwhile.
+- **Bootstrap:** the consumer starts first; snapshots wait for `Baseline`; updates are buffered meanwhile and deletions recorded as tombstones. At the baseline every window is invalidated (`ChatInvalidated`), the open chat's cached tail is shown again, then the first dialogs page and the open chat's server tail are fetched as priority jobs (UI jobs wait until `Online`). Snapshot pages are filtered by tombstones; buffered updates are replayed over them (edits win only if `edit_date` is at least the window's; a replayed message already reflected in the dialogs snapshot does not bump the chat again). Then `Online` and send replay.
+- **Light refresh** on `Command::Window(Active)` (at most every 15 s) and every 5 minutes while active: dialogs first page plus the open tail, with updates buffered the same way. The tail is merged into the window in place (deletions, newer edits, appends); a message missing inside the window counts as a gap and replaces the window instead.
+- **Sends:** `Sending` and under-cap `Unknown` entries replay after `Online` with the same `random_id`; the 3-attempt cap counts across rebuilds. `Command::DiscardSend` removes `Failed`/`Unknown` entries (`Busy` while in flight, `NotFound` if absent).
+- **Shutdown** interrupts an `emit` blocked on a full event queue, then retires the live instance with 1 s / 2 s caps.
+- **Events:** `ConnState::{Connecting, Online, Rebuilding{attempt}, Offline}`; `ChatInvalidated` at every bootstrap baseline.
+- `FakeBackend` faults: failed build, missing baseline, runner exit/panic, runner slow or deaf to `quit`, stream transient/fatal error and panic, per-call `Delay`, and counters for builds, seeds, runner completions, retirements and send attempts.
+
+Verified: fmt, clippy in both feature configs, 99 core tests (15 lifecycle tests with paused time), no gpui in `cargo tree -p abyss-core`.
+
+Deviations:
+- `ClientGen` bumps at the start of a rebuild (plan step 1), not after retirement; only the parked-permit recycling waits for retirement. Completions joined during retirement are therefore stale, except send outcomes, which outlive instances.
+- `Message::edited: bool` became `edit_date: Option<i64>` (`edited()` remains as a method), because the merge needs to order edits. The cache schema is now version 2; version 1 message rows are dropped on open.
+- With a cache, the server tail's overlap check now runs in the cache worker (`CacheCmd::ReconcileTail`) against what the cache holds, because a rebuild invalidates the window the actor used to compare with.
+- The bootstrap's dialogs snapshot still resets the chat list (`DialogsReset`), so pages beyond the first must be reloaded; the refresh does the same. Live updates during a light refresh are delayed until it ends (at most the 30 s call deadline).
+- Stream errors are classified by the backend (`StreamError::{Transient, Fatal}`): only transient ones are retried on the same stream.
+- `ConnState::Offline` is emitted for each failed build; `Rebuilding{attempt}` only when a rebuild starts. The window state defaults to `Active` until the app reports otherwise.
+- `DiscardSend` emits no event on success.
+
+Open for task 6 (and 5/11):
+- Task 5 fills `SessionSnapshot` from the `CriticalCell`; `InstanceControl::retire` must revoke the write token. Task 11's grammers `UpdateStream` must yield `Baseline` from `AbyssSession::set_update_state`, and `quit` maps to `pool.handle.quit()`.
+- A second `AccountMigrated` leaves core `Offline` (halted) with no instance; task 6 must route it to sign-in, and a fresh login should clear the halt.
+- Shutdown does not yet seal persistence or report `SaveStatus`; a retirement step still running at shutdown is waited for 3 s, then aborted (its runner is then left to `shutdown_timeout`).
+- A retirement step that panics keeps the previous snapshot and recycles parked permits.
+- `SentUnconfirmed` and `updateMessageID` correlation are not modelled yet (task 10/11).
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.

@@ -91,7 +91,7 @@ mod tests {
             thread: ThreadKey { chat, topic: None },
             sender: None,
             date: 0,
-            edited: false,
+            edit_date: None,
             outgoing: false,
             reply_to: None,
             body: Body::Text(RichText::plain(

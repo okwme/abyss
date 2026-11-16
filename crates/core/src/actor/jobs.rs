@@ -1,15 +1,18 @@
-//! Spawned work: backend calls (admitted, with deadlines) and cache reads.
+//! Spawned work: backend calls (admitted, with deadlines), cache reads and the
+//! update consumer.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::api::{ClientGen, HistoryDir};
 use crate::backend::{
-    Backend, BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Update,
+    BackendError, Client, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, StreamError,
+    StreamItem, UpdateStream,
 };
 use crate::cache::CacheHandle;
 use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId};
@@ -19,6 +22,13 @@ use crate::store::ViewGen;
 pub(super) const PAGE: u32 = 50;
 /// Dialogs per page.
 pub(super) const DIALOGS_PAGE: u32 = 100;
+/// Waits between retries of a failing update stream (plan section 2): after the
+/// last one fails too, the instance is rebuilt.
+pub(super) const STREAM_RETRY: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
 
 /// A backend call waiting for admission.
 #[derive(Debug)]
@@ -49,6 +59,8 @@ pub(super) enum CallError {
     Backend(BackendError),
     /// The deadline passed; the outcome of a write is unknown.
     Timeout,
+    /// The instance was retired while the call ran; the outcome is unknown.
+    Dropped,
 }
 
 pub(super) type CallResult<T> = Result<T, CallError>;
@@ -58,6 +70,15 @@ pub(super) type CallResult<T> = Result<T, CallError>;
 pub(super) enum DialogsStep {
     First,
     Next,
+}
+
+/// Why the update consumer stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StreamEnd {
+    /// The stream failed for good: rebuild.
+    Failed(StreamError),
+    /// The instance is retiring or the actor is gone.
+    Cancelled,
 }
 
 /// What a finished task reports back to the actor.
@@ -78,7 +99,7 @@ pub(super) enum Outcome {
         local_id: LocalId,
         res: CallResult<MsgId>,
     },
-    Read,
+    Read(CallResult<()>),
     CacheChats(Option<Vec<ChatSummary>>),
     CacheHistory {
         chat: ChatId,
@@ -87,8 +108,7 @@ pub(super) enum Outcome {
         anchor: Option<MsgId>,
         messages: Option<Vec<Message>>,
     },
-    /// The update consumer stopped (stream error); task 4 turns this into a rebuild.
-    UpdatesEnded(BackendError),
+    UpdatesEnded(StreamEnd),
 }
 
 #[derive(Debug)]
@@ -113,11 +133,13 @@ pub(super) enum TaskKind {
 /// A spawned task reporting back to the actor.
 pub(super) type DoneFuture = Pin<Box<dyn Future<Output = Done> + Send>>;
 
-/// What every admitted call carries: its generation, deadline and permit.
+/// What every admitted call carries: its generation, deadline, permit, and the
+/// instance's cancellation token.
 struct Admitted {
     cgen: ClientGen,
     deadline: Duration,
     permit: OwnedSemaphorePermit,
+    cancel: CancellationToken,
 }
 
 impl Admitted {
@@ -128,12 +150,17 @@ impl Admitted {
         call: impl Future<Output = Result<T, BackendError>>,
         outcome: impl FnOnce(CallResult<T>) -> Outcome,
     ) -> Done {
-        let (res, parked) = match tokio::time::timeout(self.deadline, call).await {
-            Ok(res) => {
-                drop(self.permit);
-                (res.map_err(CallError::Backend), None)
-            }
-            Err(_) => (Err(CallError::Timeout), Some(self.permit)),
+        let res = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => None,
+            res = tokio::time::timeout(self.deadline, call) => Some(res),
+        };
+        let (res, parked) = match res {
+            Some(Ok(res)) => (res.map_err(CallError::Backend), None),
+            Some(Err(_)) => (Err(CallError::Timeout), Some(self.permit)),
+            // Admission is closed while an instance retires, so releasing this
+            // permit cannot over-admit the retiring instance.
+            None => (Err(CallError::Dropped), None),
         };
         Done {
             cgen: self.cgen,
@@ -143,18 +170,31 @@ impl Admitted {
     }
 }
 
+/// Everything `job_future` needs besides the job.
+pub(super) struct CallCtx<C> {
+    pub(super) client: Arc<C>,
+    pub(super) cgen: ClientGen,
+    pub(super) deadline: Duration,
+    pub(super) cancel: CancellationToken,
+}
+
 /// Builds the future for an admitted job, plus its kind.
-pub(super) fn job_future<B: Backend>(
-    backend: Arc<B>,
+pub(super) fn job_future<C: Client>(
+    ctx: CallCtx<C>,
     job: Job,
-    cgen: ClientGen,
-    deadline: Duration,
     permit: OwnedSemaphorePermit,
 ) -> (TaskKind, DoneFuture) {
+    let CallCtx {
+        client,
+        cgen,
+        deadline,
+        cancel,
+    } = ctx;
     let admitted = Admitted {
         cgen,
         deadline,
         permit,
+        cancel,
     };
     match job {
         Job::Dialogs { cursor } => {
@@ -163,7 +203,7 @@ pub(super) fn job_future<B: Backend>(
             } else {
                 DialogsStep::Next
             };
-            let call = async move { backend.dialogs(cursor, DIALOGS_PAGE).await };
+            let call = async move { client.dialogs(cursor, DIALOGS_PAGE).await };
             let fut = admitted.run(call, move |res| Outcome::Dialogs { step, res });
             (TaskKind::Dialogs, Box::pin(fut))
         }
@@ -173,7 +213,7 @@ pub(super) fn job_future<B: Backend>(
             dir,
             query,
         } => {
-            let call = async move { backend.history(chat, query, PAGE).await };
+            let call = async move { client.history(chat, query, PAGE).await };
             let fut = admitted.run(call, move |res| Outcome::History {
                 chat,
                 view,
@@ -189,14 +229,14 @@ pub(super) fn job_future<B: Backend>(
             text,
             random_id,
         } => {
-            let call = async move { backend.send_text(chat, text, random_id).await };
+            let call = async move { client.send_text(chat, text, random_id).await };
             let fut = admitted.run(call, move |res| Outcome::Send { local_id, res });
             (TaskKind::Send(local_id), Box::pin(fut))
         }
         Job::Read { chat, max_id } => {
-            let call = async move { backend.read_history(chat, max_id).await };
+            let call = async move { client.read_history(chat, max_id).await };
             // Read marks are best effort; the next read covers a lost one.
-            let fut = admitted.run(call, |_| Outcome::Read);
+            let fut = admitted.run(call, Outcome::Read);
             (TaskKind::Read, Box::pin(fut))
         }
     }
@@ -229,30 +269,49 @@ pub(super) async fn cache_history(
     }
 }
 
-/// Forwards live updates to the actor until the stream fails or the actor goes away.
-pub(super) async fn consume_updates<B: Backend>(
-    backend: Arc<B>,
+/// Forwards stream items to the actor. A transient error is retried on the same
+/// stream after each [`STREAM_RETRY`] wait; one more failure ends the consumer,
+/// and so does a fatal error. Stops promptly when `cancel` fires.
+pub(super) async fn consume_updates<U: UpdateStream>(
+    mut stream: U,
     cgen: ClientGen,
-    tx: tokio::sync::mpsc::Sender<(ClientGen, Update)>,
+    tx: mpsc::Sender<(ClientGen, StreamItem)>,
+    cancel: CancellationToken,
 ) -> Done {
+    let ended = |end| Done {
+        cgen,
+        parked: None,
+        outcome: Outcome::UpdatesEnded(end),
+    };
+    let mut failures = 0usize;
     loop {
-        match backend.next_update().await {
-            Ok(update) => {
-                if tx.send((cgen, update)).await.is_err() {
-                    return Done {
-                        cgen,
-                        parked: None,
-                        outcome: Outcome::UpdatesEnded(BackendError::Transient),
-                    };
+        let next = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return ended(StreamEnd::Cancelled),
+            next = stream.next() => next,
+        };
+        match next {
+            Ok(item) => {
+                failures = 0;
+                let sent = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => false,
+                    res = tx.send((cgen, item)) => res.is_ok(),
+                };
+                if !sent {
+                    return ended(StreamEnd::Cancelled);
                 }
             }
-            Err(e) => {
-                return Done {
-                    cgen,
-                    parked: None,
-                    outcome: Outcome::UpdatesEnded(e),
-                };
+            Err(StreamError::Transient) if failures < STREAM_RETRY.len() => {
+                let wait = STREAM_RETRY.get(failures).copied().unwrap_or_default();
+                failures += 1;
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return ended(StreamEnd::Cancelled),
+                    () = tokio::time::sleep(wait) => {}
+                }
             }
+            Err(e) => return ended(StreamEnd::Failed(e)),
         }
     }
 }

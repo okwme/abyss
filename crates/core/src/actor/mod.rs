@@ -1,9 +1,13 @@
-//! The core actor: owns the store, admits backend calls, applies completions and
-//! live updates, and emits events. Runs on the core runtime; never blocks.
+//! The core actor: owns the store and the client lifecycle, admits backend calls,
+//! applies completions and live updates, and emits events. Runs on the core
+//! runtime; never blocks.
 
 mod admission;
 mod apply;
+mod boot;
 mod jobs;
+mod lifecycle;
+mod merge;
 mod sends;
 #[cfg(all(test, feature = "fake"))]
 mod tests;
@@ -14,14 +18,17 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::{Id, JoinError, JoinSet};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use admission::Admission;
 pub use admission::MAX_CONCURRENT;
-use jobs::{Done, Job, TaskKind};
+use boot::Boot;
+use jobs::{CallCtx, Done, Job, TaskKind};
+use lifecycle::{Lifecycle, Live, LiveEvent, Phase, Reason};
 
-use crate::api::{ClientGen, Command, ConnState, Event, HistoryDir, UserError};
-use crate::backend::{Backend, DialogsCursor, HistoryQuery, Update};
+use crate::api::{ClientGen, Command, ConnState, Event, HistoryDir, UserError, WindowState};
+use crate::backend::{Backend, DialogsCursor, HistoryQuery, StreamItem};
 use crate::cache::CacheHandle;
 use crate::events::EventSender;
 use crate::model::{ChatId, MsgId};
@@ -33,35 +40,38 @@ pub const CALL_DEADLINE: Duration = Duration::from_secs(30);
 pub const READ_FLUSH: Duration = Duration::from_millis(500);
 /// Admitted-call backlog waiting for a permit.
 const MAX_QUEUED: usize = 256;
-/// Live updates buffered between the consumer task and the actor.
+/// Stream items buffered between the update consumer and the actor.
 const UPDATE_QUEUE: usize = 256;
 
-/// Messages from the supervisor (task 4 drives rebuilds through this).
+/// Control-plane messages, never queued behind UI commands.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Internal {
-    /// The client instance has fully retired: bump the generation, drop stale
-    /// completions, and recycle parked permits.
-    #[cfg_attr(
-        not(all(test, feature = "fake")),
-        expect(
-            dead_code,
-            reason = "task 4 sends this once a client instance has retired"
-        )
-    )]
-    Retire,
+    /// The system woke from sleep: rebuild rather than trust old sockets.
+    Wake,
 }
 
 pub(crate) struct Actor<B: Backend> {
     backend: Arc<B>,
     events: EventSender,
+    /// Shutdown. Also interrupts an `emit` blocked on a full event queue.
+    cancel: CancellationToken,
     cache: Option<CacheHandle>,
     dialogs: Dialogs,
     windows: Windows,
     cgen: ClientGen,
     admission: Admission,
+    /// UI-initiated calls; admitted only while live.
     queue: VecDeque<Job>,
+    /// Bootstrap and refresh snapshots; admitted whenever an instance exists.
+    priority: VecDeque<Job>,
+    /// Cache reads, which outlive client instances.
     tasks: JoinSet<Done>,
     kinds: HashMap<Id, TaskKind>,
+    live: Option<Live<B>>,
+    life: Lifecycle<B>,
+    boot: Option<Boot>,
+    window: WindowState,
+    last_refresh: Instant,
     /// Chats with a history load (cache or server) in flight, and its view.
     history_busy: HashMap<ChatId, ViewGen>,
     dialogs_busy: bool,
@@ -76,35 +86,53 @@ pub(crate) struct Actor<B: Backend> {
     reads: HashMap<ChatId, MsgId>,
     sends: sends::PendingSends,
     deadline: Duration,
-    updates_tx: mpsc::Sender<(ClientGen, Update)>,
+    updates_tx: mpsc::Sender<(ClientGen, StreamItem)>,
 }
 
 pub(crate) struct ActorChannels {
     pub commands: mpsc::Receiver<Command>,
     pub internal: mpsc::Receiver<Internal>,
-    pub updates: mpsc::Receiver<(ClientGen, Update)>,
+    pub updates: mpsc::Receiver<(ClientGen, StreamItem)>,
+}
+
+/// Inputs of [`Actor::new`].
+pub(crate) struct ActorInit<B> {
+    pub backend: Arc<B>,
+    pub events: EventSender,
+    pub cache: Option<CacheHandle>,
+    pub commands: mpsc::Receiver<Command>,
+    pub internal: mpsc::Receiver<Internal>,
+    pub cancel: CancellationToken,
+}
+
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 impl<B: Backend> Actor<B> {
-    pub(crate) fn new(
-        backend: Arc<B>,
-        events: EventSender,
-        cache: Option<CacheHandle>,
-        commands: mpsc::Receiver<Command>,
-        internal: mpsc::Receiver<Internal>,
-    ) -> (Self, ActorChannels) {
+    pub(crate) fn new(init: ActorInit<B>) -> (Self, ActorChannels) {
         let (updates_tx, updates) = mpsc::channel(UPDATE_QUEUE);
         let actor = Actor {
-            backend,
-            events,
-            cache,
+            backend: init.backend,
+            events: init.events,
+            cancel: init.cancel,
+            cache: init.cache,
             dialogs: Dialogs::default(),
             windows: Windows::default(),
             cgen: ClientGen(1),
             admission: Admission::default(),
             queue: VecDeque::new(),
+            priority: VecDeque::new(),
             tasks: JoinSet::new(),
             kinds: HashMap::new(),
+            live: None,
+            life: Lifecycle::default(),
+            boot: None,
+            window: WindowState::Active,
+            last_refresh: Instant::now(),
             history_busy: HashMap::new(),
             dialogs_busy: false,
             dialogs_queued: false,
@@ -117,52 +145,58 @@ impl<B: Backend> Actor<B> {
             deadline: CALL_DEADLINE,
             updates_tx,
         };
-        (
-            actor,
-            ActorChannels {
-                commands,
-                internal,
-                updates,
-            },
-        )
+        let channels = ActorChannels {
+            commands: init.commands,
+            internal: init.internal,
+            updates,
+        };
+        (actor, channels)
     }
 
-    /// Runs until cancelled or the command channel closes, then aborts and joins
-    /// every task it spawned.
-    pub(crate) async fn run(mut self, mut ch: ActorChannels, cancel: CancellationToken) {
+    /// Runs until cancelled or the command channel closes, then retires the
+    /// client instance and joins every task it spawned.
+    pub(crate) async fn run(mut self, mut ch: ActorChannels) {
+        let cancel = self.cancel.clone();
         self.start().await;
         let mut flush = tokio::time::interval(READ_FLUSH);
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            let baseline_by = self.boot.as_ref().and_then(Boot::baseline_deadline);
+            let refresh_at = self.refresh_due();
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
-                Some(msg) = ch.internal.recv() => self.on_internal(msg),
+                Some(msg) = ch.internal.recv() => self.on_internal(msg).await,
+                step = lifecycle::next_step(self.life.step_mut()) => self.on_step(step).await,
+                ev = lifecycle::next_live(&mut self.live) => self.on_live(ev).await,
                 Some(joined) = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
                     self.on_joined(joined).await;
                 }
-                Some((cgen, update)) = ch.updates.recv() => {
+                Some((cgen, item)) = ch.updates.recv() => {
                     if cgen == self.cgen {
-                        self.on_update(update).await;
+                        self.on_feed(item).await;
                     }
                 }
                 cmd = ch.commands.recv() => match cmd {
                     Some(cmd) => self.on_command(cmd).await,
                     None => break,
                 },
+                () = sleep_until(baseline_by) => self.rebuild(Reason::NoBaseline).await,
+                () = sleep_until(refresh_at) => self.refresh().await,
                 _ = flush.tick() => self.flush_reads().await,
             }
             self.pump();
         }
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
+        self.shut_down_instance().await;
     }
 
     async fn start(&mut self) {
-        self.emit(Event::Connection(ConnState::Online)).await;
+        self.emit(Event::Connection(ConnState::Connecting)).await;
         if let Some(cache) = self.cache.clone() {
             let cgen = self.cgen;
-            self.spawn(TaskKind::CacheChats, async move {
+            self.spawn_local(TaskKind::CacheChats, async move {
                 let chats = cache.chats().await.ok();
                 Done {
                     cgen,
@@ -171,16 +205,11 @@ impl<B: Backend> Actor<B> {
                 }
             });
         }
-        let (backend, cgen, tx) = (
-            Arc::clone(&self.backend),
-            self.cgen,
-            self.updates_tx.clone(),
-        );
-        self.spawn(TaskKind::Updates, jobs::consume_updates(backend, cgen, tx));
-        self.load_dialogs().await;
+        self.start_build(Duration::ZERO);
     }
 
-    fn spawn(
+    /// Spawns a task that is not bound to a client instance (cache reads).
+    fn spawn_local(
         &mut self,
         kind: TaskKind,
         fut: impl std::future::Future<Output = Done> + Send + 'static,
@@ -189,16 +218,22 @@ impl<B: Backend> Actor<B> {
         self.kinds.insert(handle.id(), kind);
     }
 
+    /// Emits an event, waiting for queue space; gives up on shutdown so a UI
+    /// that stopped draining cannot block cancellation.
     async fn emit(&self, event: Event) {
-        // A closed channel means the UI is gone; shutdown follows via cancellation.
-        let _ = self.events.send(event).await;
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => {}
+            // A closed channel means the UI is gone; shutdown follows via cancellation.
+            _ = self.events.send(event) => {}
+        }
     }
 
     async fn error(&self, e: UserError) {
         self.emit(Event::Error(e)).await;
     }
 
-    /// Queues a backend call; it is spawned when a permit is free.
+    /// Queues a backend call; it is spawned when admitted and a permit is free.
     async fn enqueue(&mut self, job: Job) -> bool {
         if self.queue.len() >= MAX_QUEUED {
             self.error(UserError::Busy).await;
@@ -208,39 +243,77 @@ impl<B: Backend> Actor<B> {
         true
     }
 
-    /// Spawns queued jobs while permits are available.
+    /// Spawns queued jobs on the live instance while permits are available.
+    /// Snapshot jobs go first; UI jobs wait until the bootstrap has finished.
     fn pump(&mut self) {
-        while !self.queue.is_empty() {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let user = self.life.phase == Phase::Live;
+        loop {
+            let queue = if !self.priority.is_empty() {
+                &mut self.priority
+            } else if user && !self.queue.is_empty() {
+                &mut self.queue
+            } else {
+                return;
+            };
             let Some(permit) = self.admission.try_acquire() else {
                 return;
             };
-            let Some(job) = self.queue.pop_front() else {
+            let Some(job) = queue.pop_front() else {
                 return;
             };
-            let (kind, fut) = jobs::job_future(
-                Arc::clone(&self.backend),
-                job,
-                self.cgen,
-                self.deadline,
-                permit,
-            );
-            self.spawn(kind, fut);
+            let ctx = CallCtx {
+                client: Arc::clone(&live.client),
+                cgen: self.cgen,
+                deadline: self.deadline,
+                cancel: live.cancel.clone(),
+            };
+            let (kind, fut) = jobs::job_future(ctx, job, permit);
+            let handle = live.tasks.spawn(fut);
+            live.kinds.insert(handle.id(), kind);
         }
     }
 
-    fn on_internal(&mut self, msg: Internal) {
+    /// Drops queued snapshot and history loads (their views are going away) and
+    /// dialogs loads; sends and read marks stay queued for the next instance.
+    fn purge_queued(&mut self) {
+        let keep = |job: &Job| matches!(job, Job::Send { .. } | Job::Read { .. });
+        let (kept, purged): (Vec<Job>, Vec<Job>) = self.queue.drain(..).partition(keep);
+        self.queue = kept.into();
+        let purged: Vec<Job> = self.priority.drain(..).chain(purged).collect();
+        for job in purged {
+            match job {
+                Job::Dialogs { .. } => self.dialogs_busy = false,
+                Job::History { chat, view, .. } => self.release_history(chat, view),
+                Job::Send { .. } | Job::Read { .. } => {}
+            }
+        }
+    }
+
+    async fn on_internal(&mut self, msg: Internal) {
         match msg {
-            Internal::Retire => self.retire(),
+            Internal::Wake => self.rebuild(Reason::Wake).await,
         }
     }
 
-    /// See [`Internal::Retire`]. Task 4 performs teardown before sending it.
-    fn retire(&mut self) {
-        self.cgen = ClientGen(self.cgen.0 + 1);
-        self.admission.release_parked();
-        self.history_busy.clear();
-        self.dialogs_busy = false;
-        self.dialogs_queued = false;
+    async fn on_live(&mut self, ev: LiveEvent) {
+        match ev {
+            LiveEvent::Joined(Ok((id, done))) => {
+                if let Some(live) = self.live.as_mut() {
+                    live.kinds.remove(&id);
+                }
+                self.on_done(done).await;
+            }
+            LiveEvent::Joined(Err(e)) => {
+                let kind = self.live.as_mut().and_then(|l| l.kinds.remove(&e.id()));
+                if e.is_panic() {
+                    self.on_panic(kind).await;
+                }
+            }
+            LiveEvent::RunnerEnded => self.rebuild(Reason::RunnerEnded).await,
+        }
     }
 
     async fn on_joined(&mut self, joined: Result<(Id, Done), JoinError>) {
@@ -262,14 +335,22 @@ impl<B: Backend> Actor<B> {
     /// released by unwinding; clear the state it held and keep running.
     async fn on_panic(&mut self, kind: Option<TaskKind>) {
         match kind {
-            Some(TaskKind::Dialogs) => self.dialogs_busy = false,
+            Some(TaskKind::Dialogs) => {
+                self.dialogs_busy = false;
+                self.snapshot_done(boot::Snapshot::Dialogs).await;
+            }
             Some(TaskKind::History(chat)) => {
                 self.history_busy.remove(&chat);
+                self.snapshot_done(boot::Snapshot::Tail(chat)).await;
             }
             Some(TaskKind::Send(local_id)) => {
                 if let Some(state) = self.sends.mark_unknown(local_id) {
                     self.emit(Event::SendState { local_id, state }).await;
                 }
+            }
+            Some(TaskKind::Updates) => {
+                self.error(UserError::Internal).await;
+                return self.rebuild(Reason::StreamFailed).await;
             }
             _ => {}
         }
@@ -289,6 +370,8 @@ impl<B: Backend> Actor<B> {
                 local_id,
             } => self.send_text(chat, text, local_id).await,
             Command::RetrySend(local_id) => self.retry_send(local_id).await,
+            Command::DiscardSend(local_id) => self.discard_send(local_id).await,
+            Command::Window(state) => self.on_window(state).await,
             Command::MarkRead { chat, max_id } => self.mark_read(chat, max_id).await,
             Command::SubmitPhone(_)
             | Command::SubmitCode(_)
@@ -331,7 +414,7 @@ impl<B: Backend> Actor<B> {
                 cache.write(crate::cache::CacheCmd::Touch(chat)).await;
                 let cgen = self.cgen;
                 let fut = jobs::cache_history(cache, cgen, chat, view, HistoryDir::Tail, None);
-                self.spawn(TaskKind::History(chat), fut);
+                self.spawn_local(TaskKind::History(chat), fut);
             }
             None => self.request_tail(chat, view).await,
         }
@@ -381,7 +464,7 @@ impl<B: Backend> Actor<B> {
             .filter(|_| self.contiguous.contains(&chat))
         {
             let cgen = self.cgen;
-            self.spawn(
+            self.spawn_local(
                 TaskKind::History(chat),
                 jobs::cache_history(cache, cgen, chat, view, dir, Some(edge)),
             );
@@ -420,7 +503,12 @@ impl<B: Backend> Actor<B> {
         }
     }
 
+    /// Queues coalesced read marks. While no instance is live they keep
+    /// coalescing instead of piling up in the queue.
     async fn flush_reads(&mut self) {
+        if self.life.phase != Phase::Live {
+            return;
+        }
         let reads: Vec<(ChatId, MsgId)> = self.reads.drain().collect();
         for (chat, max_id) in reads {
             self.enqueue(Job::Read { chat, max_id }).await;

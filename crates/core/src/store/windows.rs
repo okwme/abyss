@@ -183,6 +183,11 @@ impl Windows {
         Some(view_gen)
     }
 
+    /// Chats with a window, most recently used last.
+    pub fn chats(&self) -> impl Iterator<Item = ChatId> + '_ {
+        self.lru.iter().copied()
+    }
+
     /// Clears every window (client rebuild), in recency order.
     pub fn invalidate_all(&mut self) -> Vec<(ChatId, ViewGen)> {
         let chats = self.lru.clone();
