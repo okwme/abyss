@@ -145,6 +145,38 @@ async fn loads_dialogs_and_tail() {
     h.stop().await;
 }
 
+fn dialogs_len(ev: &Event) -> usize {
+    match ev {
+        Event::DialogsReset(v) | Event::DialogsAppended(v) => v.len(),
+        _ => 0,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_merges_the_first_page_into_loaded_pages() {
+    let mut h = harness(FakeScript::demo(250, 0), None);
+    h.online().await;
+    for expected in [100, 50] {
+        h.send(Command::LoadDialogs).await;
+        let (ev, _) = h.until(|e| matches!(e, Event::DialogsAppended(_))).await;
+        assert_eq!(dialogs_len(&ev), expected);
+    }
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    h.send(Command::Window(crate::api::WindowState::Active))
+        .await;
+    let (ev, _) = h.until(|e| matches!(e, Event::DialogsReset(_))).await;
+    assert_eq!(dialogs_len(&ev), 250, "later pages survive a refresh");
+    let calls = h.fake.calls(Op::Dialogs);
+    h.send(Command::LoadDialogs).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        h.fake.calls(Op::Dialogs),
+        calls,
+        "the cursor still points past the last page"
+    );
+    h.stop().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn commands_before_online_wait_for_the_bootstrap() {
     let mut h = harness(FakeScript::demo(2, 10), None);
