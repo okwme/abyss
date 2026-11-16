@@ -8,6 +8,8 @@
 //! commands, the cache and the UI meanwhile.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +19,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::boot::Boot;
 use super::jobs::{self, CallError, Done, Outcome, TaskKind};
+use super::logout::LocalDone;
 use super::{Actor, admission::MAX_CONCURRENT};
-use crate::api::{ClientGen, ConnState, Event};
+use crate::api::{
+    ClientGen, ConnState, Event, LogoutStatus, RemoteLogout, StorageError, UserError,
+};
 use crate::backend::{
     Backend, BackendError, CarriedPeers, Instance, InstanceControl, Seed, SessionSeed,
     SessionSnapshot,
@@ -73,8 +78,22 @@ pub(super) enum Phase {
     Live,
     /// A retirement step is running; then build again, or halt.
     Retiring(After),
-    /// The account needs a new sign-in; no instance until then (task 6).
+    /// The account needs a new sign-in after a repeated migration; no
+    /// instance until the user submits a phone number.
     Halted,
+    /// An instance exists but the account is not signed in: no update
+    /// stream, no bootstrap; only login calls run.
+    SignedOut,
+    /// A logout step is running (plan section 5).
+    LoggingOut(LogoutStage),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LogoutStage {
+    /// `Terminate`, `auth.logOut` with the runner alive, then retirement.
+    Remote,
+    /// Deleting the session item, then crypto-erasing the cache.
+    Local,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,13 +113,20 @@ enum Migration {
 pub(super) enum Step<B: Backend> {
     Built(Result<Instance<B>, BackendError>),
     Retired(Retired),
+    /// Logout, remote stage done (the instance, if any, is retired).
+    SignedOut {
+        remote: RemoteLogout,
+        retired: Option<Retired>,
+    },
+    /// Logout, local stage done.
+    Deleted(LocalDone),
 }
 
 pub(super) struct Retired {
-    snapshot: SessionSnapshot,
+    pub(super) snapshot: SessionSnapshot,
     /// Completions that must still be applied: send outcomes (which outlive the
     /// instance) and timed-out calls holding a permit.
-    dones: Vec<Done>,
+    pub(super) dones: Vec<Done>,
 }
 
 /// Rebuild delays: exponential with jitter, reset after stable operation.
@@ -189,6 +215,9 @@ pub(super) struct Live<B: Backend> {
     pub(super) client: Arc<B::Client>,
     control: B::Control,
     runner: Option<JoinHandle<()>>,
+    /// The update stream until the bootstrap starts its consumer (only once
+    /// the account is signed in).
+    updates: std::sync::Mutex<Option<B::Updates>>,
     pub(super) tasks: JoinSet<Done>,
     pub(super) kinds: HashMap<Id, TaskKind>,
     pub(super) cancel: CancellationToken,
@@ -225,23 +254,68 @@ pub(super) async fn next_live<B: Backend>(live: &mut Option<Live<B>>) -> LiveEve
     }
 }
 
+/// A wait capped at a deadline that moves closer once shutdown starts: from
+/// then on it is at most `short` away (never later than the original).
+struct Cap<'a> {
+    at: Instant,
+    short: Duration,
+    shutdown: &'a CancellationToken,
+}
+
+impl<'a> Cap<'a> {
+    fn new(cap: Duration, short: Duration, shutdown: &'a CancellationToken) -> Self {
+        let now = Instant::now();
+        let at = if shutdown.is_cancelled() {
+            now + cap.min(short)
+        } else {
+            now + cap
+        };
+        Self {
+            at,
+            short,
+            shutdown,
+        }
+    }
+
+    /// `None` when the cap expired first.
+    async fn run<F: Future>(&mut self, fut: F) -> Option<F::Output> {
+        let mut fut = pin!(fut);
+        if !self.shutdown.is_cancelled() {
+            tokio::select! {
+                res = tokio::time::timeout_at(self.at, &mut fut) => return res.ok(),
+                () = self.shutdown.cancelled() => {}
+            }
+        }
+        self.at = self.at.min(Instant::now() + self.short);
+        tokio::time::timeout_at(self.at, fut).await.ok()
+    }
+}
+
 /// Retires an instance (plan section 2, rebuild steps 2-6). Returns once its
-/// runner has completed or its cancellation has completed.
-pub(super) async fn retire<B: Backend>(live: Live<B>, caps: Caps) -> Retired {
+/// runner has completed or its cancellation has completed, and its session
+/// is revoked. `shutdown` shortens the remaining caps to [`SHUTDOWN_CAPS`], so
+/// a retirement running when shutdown starts still finishes all of its steps,
+/// promptly, and never detaches a runner.
+pub(super) async fn retire<B: Backend>(
+    live: Live<B>,
+    caps: Caps,
+    shutdown: &CancellationToken,
+) -> Retired {
     let Live {
         client,
         control,
         runner,
+        updates,
         mut tasks,
         mut kinds,
         cancel,
         cgen,
     } = live;
     cancel.cancel();
+    drop(updates);
     let mut dones = Vec::with_capacity(MAX_CONCURRENT);
-    let deadline = Instant::now() + caps.tasks;
-    while let Ok(Some(joined)) = tokio::time::timeout_at(deadline, tasks.join_next_with_id()).await
-    {
+    let mut cap = Cap::new(caps.tasks, SHUTDOWN_CAPS.tasks, shutdown);
+    while let Some(Some(joined)) = cap.run(tasks.join_next_with_id()).await {
         keep(joined, &mut kinds, cgen, &mut dones);
     }
     tasks.abort_all();
@@ -249,14 +323,13 @@ pub(super) async fn retire<B: Backend>(live: Live<B>, caps: Caps) -> Retired {
         keep(joined, &mut kinds, cgen, &mut dones);
     }
     control.quit();
-    if let Some(mut handle) = runner
-        && tokio::time::timeout(caps.runner, &mut handle)
-            .await
-            .is_err()
-    {
-        // `abort` only schedules cancellation: await it to completion.
-        handle.abort();
-        let _ = handle.await;
+    if let Some(mut handle) = runner {
+        let mut cap = Cap::new(caps.runner, SHUTDOWN_CAPS.runner, shutdown);
+        if cap.run(&mut handle).await.is_none() {
+            // `abort` only schedules cancellation: await it to completion.
+            handle.abort();
+            let _ = handle.await;
+        }
     }
     let snapshot = control.retire();
     drop(client);
@@ -321,7 +394,10 @@ impl<B: Backend> Actor<B> {
 
     pub(super) async fn on_step(&mut self, res: Result<Step<B>, JoinError>) {
         match (res, self.life.phase) {
-            (Ok(Step::Built(Ok(instance))), _) => self.go_live(instance),
+            (Ok(Step::Built(Ok(instance))), _) => {
+                self.go_live(instance);
+                self.after_live().await;
+            }
             (Ok(Step::Built(Err(_))) | Err(_), Phase::Building) => self.build_failed().await,
             (Ok(Step::Retired(retired)), Phase::Retiring(after)) => {
                 self.finish_retire(retired, after).await;
@@ -331,6 +407,17 @@ impl<B: Backend> Actor<B> {
             (Err(_), Phase::Retiring(after)) => {
                 self.admission.release_parked();
                 self.after_retire(after).await;
+            }
+            (Ok(Step::SignedOut { remote, retired }), _) => {
+                self.after_remote_logout(remote, retired);
+            }
+            (Err(_), Phase::LoggingOut(LogoutStage::Remote)) => {
+                self.after_remote_logout(RemoteLogout::Failed(UserError::Internal), None);
+            }
+            (Ok(Step::Deleted(done)), _) => self.finish_logout(done).await,
+            (Err(_), Phase::LoggingOut(LogoutStage::Local)) => {
+                self.finish_logout(LocalDone::failed(StorageError::Internal))
+                    .await;
             }
             _ => {}
         }
@@ -342,7 +429,8 @@ impl<B: Backend> Actor<B> {
         self.start_build(delay);
     }
 
-    /// Starts the instance's runner and update consumer, then bootstraps.
+    /// Starts the instance's runner. A signed-in account bootstraps at once;
+    /// otherwise the instance only serves login calls.
     fn go_live(&mut self, instance: Instance<B>) {
         let Instance {
             client,
@@ -350,20 +438,45 @@ impl<B: Backend> Actor<B> {
             runner,
             control,
         } = instance;
-        let cancel = CancellationToken::new();
-        let mut live = Live {
+        self.live = Some(Live {
             client: Arc::new(client),
             control,
             runner: Some(tokio::spawn(runner)),
+            updates: std::sync::Mutex::new(Some(updates)),
             tasks: JoinSet::new(),
             kinds: HashMap::new(),
-            cancel: cancel.clone(),
+            cancel: CancellationToken::new(),
             cgen: self.cgen,
+        });
+        if self.auth.signed_in {
+            self.start_bootstrap();
+        } else {
+            self.life.phase = Phase::SignedOut;
+        }
+    }
+
+    /// Starts the update consumer, then the bootstrap (plan section 2). The
+    /// stream's first `next` establishes the baseline, so this runs only once
+    /// the account is signed in.
+    pub(super) fn start_bootstrap(&mut self) {
+        let Some(live) = self.live.as_mut() else {
+            return;
         };
-        let consumer = jobs::consume_updates(updates, self.cgen, self.updates_tx.clone(), cancel);
-        let handle = live.tasks.spawn(consumer);
-        live.kinds.insert(handle.id(), TaskKind::Updates);
-        self.live = Some(live);
+        let updates = live
+            .updates
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(updates) = updates {
+            let consumer = jobs::consume_updates(
+                updates,
+                self.cgen,
+                self.updates_tx.clone(),
+                live.cancel.clone(),
+            );
+            let handle = live.tasks.spawn(consumer);
+            live.kinds.insert(handle.id(), TaskKind::Updates);
+        }
         self.life.phase = Phase::Booting;
         self.boot = Some(Boot::full(Instant::now()));
     }
@@ -371,7 +484,10 @@ impl<B: Backend> Actor<B> {
     /// Replaces the instance. Coalesces: a trigger while no instance is up is
     /// ignored, so each failure causes exactly one rebuild.
     pub(super) async fn rebuild(&mut self, reason: Reason) {
-        if !matches!(self.life.phase, Phase::Booting | Phase::Live) {
+        if !matches!(
+            self.life.phase,
+            Phase::Booting | Phase::Live | Phase::SignedOut
+        ) {
             return;
         }
         let Some(live) = self.live.take() else {
@@ -386,8 +502,9 @@ impl<B: Backend> Actor<B> {
             self.emit(Event::Connection(ConnState::Rebuilding { attempt }))
                 .await;
         }
+        let shutdown = self.cancel.clone();
         self.life.step = Some(tokio::spawn(async move {
-            Step::Retired(retire(live, REBUILD_CAPS).await)
+            Step::Retired(retire(live, REBUILD_CAPS, &shutdown).await)
         }));
     }
 
@@ -408,7 +525,7 @@ impl<B: Backend> Actor<B> {
 
     /// Rebuild step 1: stop admission and make every completion of the old
     /// instance stale. Parked permits stay parked until retirement completes.
-    fn begin_retire(&mut self) {
+    pub(super) fn begin_retire(&mut self) {
         self.cgen = ClientGen(self.cgen.0 + 1);
         self.boot = None;
         self.life.timeouts.clear();
@@ -435,8 +552,20 @@ impl<B: Backend> Actor<B> {
             After::Halt => {
                 self.life.phase = Phase::Halted;
                 self.emit(Event::Connection(ConnState::Offline)).await;
+                self.require_relogin().await;
             }
         }
+    }
+
+    /// Clears a migration halt: the next repeated migration rebuilds again.
+    pub(super) fn clear_halt(&mut self) {
+        self.life.migration = Migration::Never;
+    }
+
+    /// Forgets the retired instance's snapshot, so the next build seeds from
+    /// the account (a new generation after logout).
+    pub(super) fn forget_instance_session(&mut self) {
+        self.life.session = None;
     }
 
     /// Bootstrap finished: resume admission and replay unresolved sends.
@@ -451,6 +580,8 @@ impl<B: Backend> Actor<B> {
     pub(super) async fn inspect_call(&mut self, err: CallError) {
         match err {
             CallError::Backend(BackendError::Migrated) => self.rebuild(Reason::Migrated).await,
+            // AUTH_KEY_UNREGISTERED / SESSION_REVOKED: local logout, then sign in.
+            CallError::Backend(BackendError::Unauthorized) => self.session_revoked().await,
             CallError::Timeout => {
                 let now = Instant::now();
                 let t = &mut self.life.timeouts;
@@ -470,18 +601,60 @@ impl<B: Backend> Actor<B> {
         }
     }
 
-    /// Shutdown: retires whatever instance exists, with short caps.
-    pub(super) async fn shut_down_instance(&mut self) {
-        if let Some(mut step) = self.life.step.take()
-            && tokio::time::timeout(SHUTDOWN_CAPS.tasks + SHUTDOWN_CAPS.runner, &mut step)
-                .await
-                .is_err()
-        {
-            step.abort();
-            let _ = step.await;
+    /// Shutdown (plan section 5, steps 3 and 5): retires whatever instance
+    /// exists and finishes a running logout. A running retirement is never
+    /// aborted: it owns the runner and the session's write token, and it
+    /// shortens its own caps once shutdown starts, so it is awaited to the end
+    /// (abort, join, revoke). Finishing after `deadline` makes the save
+    /// unconfirmed.
+    pub(super) async fn shut_down_lifecycle(&mut self, deadline: Instant) -> LifeAtShutdown {
+        let mut out = LifeAtShutdown {
+            retired: true,
+            logout: None,
+        };
+        if let Some(mut step) = self.life.step.take() {
+            match self.life.phase {
+                // Nothing is running yet: an unspawned instance just drops.
+                Phase::Building => {
+                    step.abort();
+                    let _ = step.await;
+                }
+                Phase::LoggingOut(LogoutStage::Local) => {
+                    let res = tokio::time::timeout_at(deadline, &mut step).await;
+                    let done = if let Ok(Ok(Step::Deleted(done))) = res {
+                        Some(done.local)
+                    } else {
+                        step.abort();
+                        let _ = step.await;
+                        None
+                    };
+                    out.logout = Some(self.logout_status(done));
+                }
+                _ => {
+                    let res = step.await;
+                    out.retired = res.is_ok() && Instant::now() <= deadline;
+                    if let Ok(Step::SignedOut { remote, .. }) = res {
+                        self.note_remote_logout(remote);
+                        let local = self.delete_local_until(deadline).await;
+                        out.logout = Some(self.logout_status(local));
+                    }
+                }
+            }
         }
         if let Some(live) = self.live.take() {
-            retire(live, SHUTDOWN_CAPS).await;
+            let shutdown = self.cancel.clone();
+            retire(live, SHUTDOWN_CAPS, &shutdown).await;
+            out.retired &= Instant::now() <= deadline;
         }
+        out
     }
+}
+
+/// What shutdown observed of the lifecycle.
+#[derive(Debug)]
+pub(super) struct LifeAtShutdown {
+    /// Every retirement completed (runner joined, session revoked) within the
+    /// deadline.
+    pub(super) retired: bool,
+    pub(super) logout: Option<LogoutStatus>,
 }

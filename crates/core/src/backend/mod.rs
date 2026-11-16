@@ -25,6 +25,7 @@ use std::pin::Pin;
 
 pub use seed::{CarriedPeers, MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 
+use crate::api::{CredentialError, PasswordBuf};
 use crate::model::{ChatId, ChatSummary, Message, MsgId};
 
 /// Opaque position in the dialogs list, produced by the backend.
@@ -120,8 +121,118 @@ pub enum StreamError {
     Fatal,
 }
 
+/// Why a login call failed (plan section 4, "Error mapping").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthError {
+    /// `FLOOD_WAIT`, transport errors, `AUTH_KEY_UNREGISTERED`/`SESSION_REVOKED`
+    /// (`Unauthorized`), other RPC errors (`Rejected`).
+    Backend(BackendError),
+    /// `PHONE_NUMBER_INVALID`.
+    PhoneInvalid,
+    /// `PHONE_NUMBER_BANNED`.
+    PhoneBanned,
+    /// `API_ID_INVALID` / `API_ID_PUBLISHED_FLOOD` (plan section 17.2).
+    Credentials(CredentialError),
+}
+
+impl From<BackendError> for AuthError {
+    fn from(e: BackendError) -> Self {
+        Self::Backend(e)
+    }
+}
+
+/// The signed-in account, as far as the UI needs it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Account {
+    /// Sanitized display name (`crate::sanitize::display_name`).
+    pub display_name: String,
+}
+
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Account(<redacted>)")
+    }
+}
+
+/// A 2FA challenge: the SRP token (`account.getPassword`) and the hint.
+pub struct PasswordChallenge<P> {
+    pub token: P,
+    pub hint: Option<String>,
+}
+
+impl<P> std::fmt::Debug for PasswordChallenge<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PasswordChallenge(<redacted>)")
+    }
+}
+
+/// Outcome of `sign_in` (grammers `auth.rs:339-362`).
+#[derive(Debug)]
+pub enum SignIn<P> {
+    /// Signed in. The backend has cached the self user (`is_self`), which is a
+    /// critical, persisted write.
+    Done(Account),
+    PasswordRequired(PasswordChallenge<P>),
+    /// Wrong or expired code (`PHONE_CODE_EXPIRED` folds into this).
+    InvalidCode,
+    SignUpRequired,
+}
+
+/// Outcome of `check_password`. Every other outcome consumed the token.
+#[derive(Debug)]
+pub enum CheckPassword<P> {
+    Done(Account),
+    /// Wrong password; carries the server's fresh token.
+    InvalidPassword(PasswordChallenge<P>),
+}
+
 /// Calls bound to one client instance.
+///
+/// The login calls (task 6) are never retried by the backend (retry class
+/// `Auth`). Their futures must be `'static`: core moves the tokens in and
+/// receives them back.
 pub trait Client: Send + Sync + 'static {
+    /// grammers `LoginToken`: proof of a sent code.
+    type LoginToken: Send + Sync + 'static;
+    /// grammers `PasswordToken`: one SRP attempt.
+    type PasswordToken: Send + Sync + 'static;
+
+    /// Whether this instance's session is authorized (grammers `is_authorized`).
+    fn is_authorized(&self) -> impl Future<Output = Result<bool, BackendError>> + Send;
+
+    /// `auth.sendCode` for `phone` with the backend's API credentials. Handles
+    /// a login-time `303` itself.
+    fn request_login_code(
+        &self,
+        phone: &str,
+    ) -> impl Future<Output = Result<Self::LoginToken, AuthError>> + Send;
+
+    fn sign_in(
+        &self,
+        token: &Self::LoginToken,
+        code: &str,
+    ) -> impl Future<Output = Result<SignIn<Self::PasswordToken>, AuthError>> + Send;
+
+    /// Consumes `token` and the password buffer.
+    fn check_password(
+        &self,
+        token: Self::PasswordToken,
+        password: PasswordBuf,
+    ) -> impl Future<Output = Result<CheckPassword<Self::PasswordToken>, AuthError>> + Send;
+
+    /// A fresh challenge (raw `account.getPassword` + `PasswordToken::new`).
+    fn password_challenge(
+        &self,
+    ) -> impl Future<Output = Result<PasswordChallenge<Self::PasswordToken>, AuthError>> + Send;
+
+    /// The self user (raw `users.getUsers([inputUserSelf])`), cached as
+    /// `is_self: Some(true)`: a critical write. `Unauthorized` when the
+    /// session is not authorized.
+    fn fetch_self(&self) -> impl Future<Output = Result<Account, BackendError>> + Send;
+
+    /// `auth.logOut`. The runner must still be running.
+    fn sign_out(&self) -> impl Future<Output = Result<(), BackendError>> + Send;
+
     fn dialogs(
         &self,
         cursor: Option<DialogsCursor>,
@@ -192,6 +303,13 @@ pub trait Backend: Send + Sync + 'static {
     type Client: Client;
     type Updates: UpdateStream;
     type Control: InstanceControl;
+
+    /// The account's live critical state (task 6). Core calls it before the
+    /// first build and again whenever the account generation changes (after a
+    /// logout). A build seeded with [`SessionSeed::Stored`] creates its
+    /// `AbyssSession` from the latest one (`AbyssSession::from_snapshot`,
+    /// which revokes any earlier instance's write token).
+    fn use_account(&self, account: crate::session::SessionSnapshot);
 
     /// Builds a fresh instance from `seed`. Spawns nothing: core spawns the
     /// runner and the update consumer.

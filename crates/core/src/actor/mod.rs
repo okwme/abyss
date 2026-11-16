@@ -4,9 +4,12 @@
 
 mod admission;
 mod apply;
+mod auth;
+mod auth_outcome;
 mod boot;
 mod jobs;
 mod lifecycle;
+mod logout;
 mod merge;
 mod sends;
 #[cfg(all(test, feature = "fake"))]
@@ -23,16 +26,30 @@ use tokio_util::sync::CancellationToken;
 
 use admission::Admission;
 pub use admission::MAX_CONCURRENT;
+use auth::AuthMachine;
 use boot::Boot;
 use jobs::{CallCtx, Done, Job, TaskKind};
 use lifecycle::{Lifecycle, Live, LiveEvent, Phase, Reason};
+pub(crate) use logout::{CacheParts, open_cache};
 
-use crate::api::{ClientGen, Command, ConnState, Event, HistoryDir, UserError, WindowState};
+use crate::api::{
+    AuthState, ClientGen, Command, ConnState, Event, HistoryDir, RemoteLogout, SaveStatus,
+    UserError, WindowState,
+};
 use crate::backend::{Backend, DialogsCursor, HistoryQuery, StreamItem};
 use crate::cache::CacheHandle;
+use crate::core::ShutdownReport;
 use crate::events::EventSender;
 use crate::model::{ChatId, MsgId};
+use crate::session::{PersistHandle, SessionSnapshot};
 use crate::store::{Dialogs, MAX_DIALOGS, ViewGen, Windows};
+
+/// Shutdown's deadline for retirement and the persistence seal, counted from
+/// its start (plan section 5).
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
+/// How long shutdown waits for queued cache writes (best effort; the cache
+/// is disposable and does not affect the save status).
+const CACHE_FLUSH: Duration = Duration::from_secs(3);
 
 /// Per-call deadline for backend calls.
 pub const CALL_DEADLINE: Duration = Duration::from_secs(30);
@@ -87,6 +104,14 @@ pub(crate) struct Actor<B: Backend> {
     sends: sends::PendingSends,
     deadline: Duration,
     updates_tx: mpsc::Sender<(ClientGen, StreamItem)>,
+    persist: PersistHandle,
+    /// The account's live critical state; a new generation after logout.
+    account: SessionSnapshot,
+    /// The cache's directory and key, for crypto-erase on logout.
+    cache_parts: Option<CacheParts>,
+    auth: AuthMachine<B::Client>,
+    /// The remote half of a running logout, until it is reported.
+    logout_remote: Option<RemoteLogout>,
 }
 
 pub(crate) struct ActorChannels {
@@ -103,6 +128,10 @@ pub(crate) struct ActorInit<B> {
     pub commands: mpsc::Receiver<Command>,
     pub internal: mpsc::Receiver<Internal>,
     pub cancel: CancellationToken,
+    pub persist: PersistHandle,
+    /// Loaded at startup (`PersistHandle::load_session`).
+    pub account: SessionSnapshot,
+    pub cache_parts: Option<CacheParts>,
 }
 
 async fn sleep_until(at: Option<Instant>) {
@@ -115,6 +144,8 @@ async fn sleep_until(at: Option<Instant>) {
 impl<B: Backend> Actor<B> {
     pub(crate) fn new(init: ActorInit<B>) -> (Self, ActorChannels) {
         let (updates_tx, updates) = mpsc::channel(UPDATE_QUEUE);
+        init.backend.use_account(init.account.clone());
+        let auth = AuthMachine::new(&init.account);
         let actor = Actor {
             backend: init.backend,
             events: init.events,
@@ -144,6 +175,11 @@ impl<B: Backend> Actor<B> {
             sends: sends::PendingSends::default(),
             deadline: CALL_DEADLINE,
             updates_tx,
+            persist: init.persist,
+            account: init.account,
+            cache_parts: init.cache_parts,
+            auth,
+            logout_remote: None,
         };
         let channels = ActorChannels {
             commands: init.commands,
@@ -153,9 +189,9 @@ impl<B: Backend> Actor<B> {
         (actor, channels)
     }
 
-    /// Runs until cancelled or the command channel closes, then retires the
-    /// client instance and joins every task it spawned.
-    pub(crate) async fn run(mut self, mut ch: ActorChannels) {
+    /// Runs until cancelled or the command channel closes, then shuts down
+    /// (plan section 5) and reports what it observed.
+    pub(crate) async fn run(mut self, mut ch: ActorChannels) -> ShutdownReport {
         let cancel = self.cancel.clone();
         self.start().await;
         let mut flush = tokio::time::interval(READ_FLUSH);
@@ -163,11 +199,15 @@ impl<B: Backend> Actor<B> {
         loop {
             let baseline_by = self.boot.as_ref().and_then(Boot::baseline_deadline);
             let refresh_at = self.refresh_due();
+            let flood_over = self.auth.flood_deadline();
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
                 Some(msg) = ch.internal.recv() => self.on_internal(msg).await,
                 step = lifecycle::next_step(self.life.step_mut()) => self.on_step(step).await,
+                (kind, done) = auth::next_auth(self.auth.task_mut()) => {
+                    self.on_auth(kind, done).await;
+                }
                 ev = lifecycle::next_live(&mut self.live) => self.on_live(ev).await,
                 Some(joined) = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
                     self.on_joined(joined).await;
@@ -183,16 +223,45 @@ impl<B: Backend> Actor<B> {
                 },
                 () = sleep_until(baseline_by) => self.rebuild(Reason::NoBaseline).await,
                 () = sleep_until(refresh_at) => self.refresh().await,
+                () = sleep_until(flood_over) => self.flood_over().await,
                 _ = flush.tick() => self.flush_reads().await,
             }
             self.pump();
         }
+        self.shut_down().await
+    }
+
+    /// Plan section 5, steps 2-6: end the actor's tasks, retire the instance
+    /// (finishing a running retirement or logout), then seal persistence with
+    /// a barrier on the current revision. Never claims a save it did not see.
+    async fn shut_down(&mut self) -> ShutdownReport {
+        let deadline = Instant::now() + SHUTDOWN_DEADLINE;
+        self.auth.abort_task();
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
-        self.shut_down_instance().await;
+        let life = self.shut_down_lifecycle(deadline).await;
+        // After a logout there is nothing to save; its status says the rest.
+        let sealed = life.logout.is_some()
+            || matches!(
+                tokio::time::timeout_at(deadline, self.account.barrier()).await,
+                Ok(Ok(()))
+            );
+        if let Some(cache) = &self.cache {
+            let _ = tokio::time::timeout(CACHE_FLUSH, cache.barrier()).await;
+        }
+        let save = if life.retired && sealed {
+            SaveStatus::Confirmed
+        } else {
+            SaveStatus::Unconfirmed
+        };
+        ShutdownReport {
+            save,
+            logout: life.logout,
+        }
     }
 
     async fn start(&mut self) {
+        self.set_auth(AuthState::Connecting).await;
         self.emit(Event::Connection(ConnState::Connecting)).await;
         if let Some(cache) = self.cache.clone() {
             let cgen = self.cgen;
@@ -373,12 +442,15 @@ impl<B: Backend> Actor<B> {
             Command::DiscardSend(local_id) => self.discard_send(local_id).await,
             Command::Window(state) => self.on_window(state).await,
             Command::MarkRead { chat, max_id } => self.mark_read(chat, max_id).await,
-            Command::SubmitPhone(_)
-            | Command::SubmitCode(_)
-            | Command::SubmitPassword(_)
-            | Command::ResendCode
-            | Command::RetryPasswordParams
-            | Command::Logout => self.error(UserError::Unsupported).await,
+            Command::SubmitPhone(phone) => {
+                let phone = zeroize::Zeroizing::new(phone);
+                self.submit_phone(&phone).await;
+            }
+            Command::SubmitCode(code) => self.submit_code(zeroize::Zeroizing::new(code)).await,
+            Command::SubmitPassword(password) => self.submit_password(password).await,
+            Command::ResendCode => self.resend_code().await,
+            Command::RetryPasswordParams => self.retry_password_params().await,
+            Command::Logout => self.on_logout_command().await,
         }
     }
 

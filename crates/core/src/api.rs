@@ -1,31 +1,29 @@
 //! Commands the UI sends to core and events core sends back.
 
-use zeroize::Zeroizing;
-
 use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId};
 use crate::store::ViewGen;
+
+pub use crate::auth_types::{
+    ApiHash, ApiHashError, AuthState, CredentialError, LocalDeletion, LogoutStatus,
+    PASSWORD_CAPACITY, PasswordBuf, PasswordTooLong, RemoteLogout, SaveStatus, StorageError,
+    mask_phone,
+};
 
 /// Generation of the client instance. Bumps on every rebuild, login and logout;
 /// completions from an older generation are dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClientGen(pub u64);
 
-/// Password bytes for 2FA. Placeholder until task 5/6 replaces it with the fixed
-/// 256-byte secure buffer (plan section 10); already zeroized on drop.
-pub struct PasswordBuf(pub Zeroizing<Vec<u8>>);
-
-impl std::fmt::Debug for PasswordBuf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PasswordBuf(<redacted>)")
-    }
-}
-
-#[derive(Debug)]
+/// `Debug` redacts the phone number, the login code and the message text.
 pub enum Command {
     SubmitPhone(String),
     SubmitCode(String),
+    /// Consumed: the buffer is wiped when core drops it.
     SubmitPassword(PasswordBuf),
+    /// Requests a new login code for the same number (`Code` state).
     ResendCode,
+    /// Refetches the 2FA parameters after the password token was consumed
+    /// (`PasswordTokenUnavailable`).
     RetryPasswordParams,
     /// Loads the first dialogs page, or the next page once one is loaded.
     LoadDialogs,
@@ -51,19 +49,47 @@ pub enum Command {
         chat: ChatId,
         max_id: MsgId,
     },
+    /// Signs out: remote `auth.logOut`, then local deletion of the session
+    /// item and the cache (plan sections 5, 16). While signed out, it retries
+    /// the local deletion only.
     Logout,
+}
+
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SubmitPhone(_) => f.write_str("SubmitPhone(<redacted>)"),
+            Self::SubmitCode(_) => f.write_str("SubmitCode(<redacted>)"),
+            Self::SubmitPassword(_) => f.write_str("SubmitPassword(<redacted>)"),
+            Self::ResendCode => f.write_str("ResendCode"),
+            Self::RetryPasswordParams => f.write_str("RetryPasswordParams"),
+            Self::LoadDialogs => f.write_str("LoadDialogs"),
+            Self::OpenChat(c) => f.debug_tuple("OpenChat").field(c).finish(),
+            Self::CloseChat(c) => f.debug_tuple("CloseChat").field(c).finish(),
+            Self::LoadOlder(c) => f.debug_tuple("LoadOlder").field(c).finish(),
+            Self::LoadNewer(c) => f.debug_tuple("LoadNewer").field(c).finish(),
+            Self::SendText { chat, local_id, .. } => f
+                .debug_struct("SendText")
+                .field("chat", chat)
+                .field("local_id", local_id)
+                .finish_non_exhaustive(),
+            Self::RetrySend(id) => f.debug_tuple("RetrySend").field(id).finish(),
+            Self::DiscardSend(id) => f.debug_tuple("DiscardSend").field(id).finish(),
+            Self::Window(w) => f.debug_tuple("Window").field(w).finish(),
+            Self::MarkRead { chat, max_id } => f
+                .debug_struct("MarkRead")
+                .field("chat", chat)
+                .field("max_id", max_id)
+                .finish(),
+            Self::Logout => f.write_str("Logout"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowState {
     Active,
     Inactive,
-}
-
-/// Login state. Placeholder: tasks 5–6 add the phone/code/password states.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AuthState {
-    SignedIn,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,8 +137,25 @@ pub enum UserError {
     /// The server moved the account to another data center. Core rebuilds once;
     /// if it recurs, the user has to sign in again (plan section 2, risk 6).
     AccountMigrated,
-    /// Not available yet in this build (auth lands in tasks 5–6).
+    /// Not available yet in this build.
     Unsupported,
+    /// Telegram rejected the phone number (`PHONE_NUMBER_INVALID`).
+    PhoneInvalid,
+    /// Telegram banned the phone number (`PHONE_NUMBER_BANNED`).
+    PhoneBanned,
+    /// The login code is wrong or expired; ask for a new one.
+    InvalidCode,
+    /// The 2FA password is wrong.
+    InvalidPassword,
+    /// The number has no Telegram account; create it in an official app.
+    SignUpRequired,
+    /// The server no longer accepts this session (signed out elsewhere or
+    /// revoked). The local session was removed.
+    SessionRevoked,
+    /// The API credentials were rejected (plan section 17.2).
+    Credentials(CredentialError),
+    /// Device-local storage (Keychain, cache) failed.
+    Storage(StorageError),
     /// A bug: a contained panic or broken invariant.
     Internal,
 }

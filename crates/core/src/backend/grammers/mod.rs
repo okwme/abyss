@@ -13,9 +13,11 @@
 //! error names and codes, counts and ids, never a TL value: no `Debug` of a
 //! request, response, peer or update, which could carry text or a phone.
 //!
-//! # TODO(task 6): auth
+//! # TODO(task 6b): auth
 //!
-//! The `Backend` trait has no auth methods yet; task 6 adds them. Over a built
+//! Task 6 added the auth methods to [`Client`] and the state machine in core.
+//! Here they are stubs: every one answers `Rejected` (so a stored session
+//! still starts as signed in, and a login attempt fails visibly). Over a built
 //! instance they map onto grammers as follows (plan section 4):
 //! - `is_authorized` → `Client::is_authorized` (`auth.rs:105-111`).
 //! - `request_login_code(phone)` → `Client::request_login_code(phone, api_hash)`
@@ -49,6 +51,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+use std::future::{Future, ready};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -60,9 +63,11 @@ use grammers_client::sender::{
 pub use stream::GrammersUpdates;
 
 use super::{
-    Backend, BackendError, Client, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance,
-    InstanceControl, Seed, SessionSeed, SessionSnapshot,
+    Account, AuthError, Backend, BackendError, CheckPassword, Client, DialogsCursor, DialogsPage,
+    HistoryPage, HistoryQuery, Instance, InstanceControl, PasswordChallenge, Seed, SessionSeed,
+    SessionSnapshot, SignIn,
 };
+use crate::api::PasswordBuf;
 use crate::model::{ChatId, MsgId};
 use crate::session::{AbyssSession, PersistHandle};
 use calls::Calls;
@@ -88,8 +93,11 @@ fn connection_params() -> ConnectionParams {
 /// Builds grammers client instances for one Telegram application id.
 pub struct GrammersBackend {
     api_id: i32,
-    /// Loads the persisted session for `SessionSeed::Stored` (startup only).
+    /// Loads the persisted session for `SessionSeed::Stored` when core has
+    /// not provided the account (`use_account`).
     persist: PersistHandle,
+    /// The account core loaded at startup or created after a logout.
+    account: std::sync::Mutex<Option<SessionSnapshot>>,
 }
 
 impl std::fmt::Debug for GrammersBackend {
@@ -100,13 +108,27 @@ impl std::fmt::Debug for GrammersBackend {
 
 impl GrammersBackend {
     pub fn new(api_id: i32, persist: PersistHandle) -> Self {
-        Self { api_id, persist }
+        Self {
+            api_id,
+            persist,
+            account: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn account(&self) -> Option<SessionSnapshot> {
+        self.account
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     async fn snapshot(&self, seed: SessionSeed) -> SessionSnapshot {
         match seed {
             SessionSeed::Live(snapshot) => snapshot,
             SessionSeed::Stored => {
+                if let Some(account) = self.account() {
+                    return account;
+                }
                 if let Ok(loaded) = self.persist.load_session().await {
                     loaded.snapshot
                 } else {
@@ -123,6 +145,13 @@ impl Backend for GrammersBackend {
     type Client = GrammersClient;
     type Updates = GrammersUpdates;
     type Control = GrammersControl;
+
+    fn use_account(&self, account: SessionSnapshot) {
+        *self
+            .account
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(account);
+    }
 
     async fn build(&self, seed: Seed) -> Result<Instance<Self>, BackendError> {
         let snapshot = self.snapshot(seed.session).await;
@@ -165,7 +194,64 @@ impl Backend for GrammersBackend {
 #[derive(Debug)]
 pub struct GrammersClient(Calls<grammers_client::Client>);
 
+/// Stub login token (task 6b: grammers `LoginToken` plus the full `SentCode`).
+#[derive(Debug)]
+pub struct GrammersLoginToken(());
+
+/// Stub password token (task 6b: grammers `PasswordToken`).
+#[derive(Debug)]
+pub struct GrammersPasswordToken(());
+
+/// Every auth call until task 6b.
+const AUTH_STUB: AuthError = AuthError::Backend(BackendError::Rejected);
+
 impl Client for GrammersClient {
+    type LoginToken = GrammersLoginToken;
+    type PasswordToken = GrammersPasswordToken;
+
+    fn is_authorized(&self) -> impl Future<Output = Result<bool, BackendError>> + Send {
+        ready(Err(BackendError::Rejected))
+    }
+
+    fn request_login_code(
+        &self,
+        _phone: &str,
+    ) -> impl Future<Output = Result<GrammersLoginToken, AuthError>> + Send {
+        ready(Err(AUTH_STUB))
+    }
+
+    fn sign_in(
+        &self,
+        _token: &GrammersLoginToken,
+        _code: &str,
+    ) -> impl Future<Output = Result<SignIn<GrammersPasswordToken>, AuthError>> + Send {
+        ready(Err(AUTH_STUB))
+    }
+
+    fn check_password(
+        &self,
+        _token: GrammersPasswordToken,
+        password: PasswordBuf,
+    ) -> impl Future<Output = Result<CheckPassword<GrammersPasswordToken>, AuthError>> + Send {
+        drop(password);
+        ready(Err(AUTH_STUB))
+    }
+
+    fn password_challenge(
+        &self,
+    ) -> impl Future<Output = Result<PasswordChallenge<GrammersPasswordToken>, AuthError>> + Send
+    {
+        ready(Err(AUTH_STUB))
+    }
+
+    fn fetch_self(&self) -> impl Future<Output = Result<Account, BackendError>> + Send {
+        ready(Err(BackendError::Rejected))
+    }
+
+    fn sign_out(&self) -> impl Future<Output = Result<(), BackendError>> + Send {
+        ready(Err(BackendError::Rejected))
+    }
+
     async fn dialogs(
         &self,
         cursor: Option<DialogsCursor>,

@@ -5,6 +5,7 @@
 use std::ffi::{OsStr, OsString};
 
 use abyss_core::Credentials;
+use abyss_core::api::ApiHash;
 
 pub(crate) const API_ID_VAR: &str = "ABYSS_API_ID";
 pub(crate) const API_HASH_VAR: &str = "ABYSS_API_HASH";
@@ -12,9 +13,12 @@ pub(crate) const FAKE_FLAG: &str = "--fake";
 
 #[derive(Debug)]
 pub(crate) enum Launch {
-    /// The in-process fake backend with a demo account.
+    /// The in-process fake backend with a demo account, and any faults asked
+    /// for in [`abyss_core::FAKE_FAULTS_VAR`].
     #[cfg(feature = "fake")]
-    Fake,
+    Fake {
+        faults: abyss_core::FakeFaults,
+    },
     Telegram(Credentials),
 }
 
@@ -24,6 +28,8 @@ pub(crate) enum LaunchError {
     MissingCredentials(Vec<&'static str>),
     /// `ABYSS_API_ID` is set but is not a positive integer.
     InvalidApiId,
+    /// `ABYSS_API_HASH` is set but is not 32 hexadecimal characters.
+    InvalidApiHash,
     /// `--fake` was passed to a build without the `fake` feature.
     #[cfg_attr(
         feature = "fake",
@@ -43,7 +49,12 @@ pub(crate) fn resolve(
     // Skip argv[0]; ignore anything else (macOS may add `-psn_…`).
     if args.into_iter().skip(1).any(|a| a == OsStr::new(FAKE_FLAG)) {
         #[cfg(feature = "fake")]
-        return Ok(Launch::Fake);
+        return Ok(Launch::Fake {
+            faults: var(abyss_core::FAKE_FAULTS_VAR)
+                .and_then(|v| v.into_string().ok())
+                .map(|v| abyss_core::FakeFaults::parse(&v))
+                .unwrap_or_default(),
+        });
         #[cfg(not(feature = "fake"))]
         return Err(LaunchError::FakeNotBuilt);
     }
@@ -64,7 +75,10 @@ pub(crate) fn resolve(
         .and_then(|s| s.trim().parse::<i32>().ok())
         .filter(|id| *id > 0)
         .ok_or(LaunchError::InvalidApiId)?;
-    let api_hash = hash.into_string().map_err(|_| LaunchError::InvalidApiId)?;
+    let api_hash = hash
+        .to_str()
+        .and_then(|s| ApiHash::parse(s).ok())
+        .ok_or(LaunchError::InvalidApiHash)?;
     Ok(Launch::Telegram(Credentials { api_id, api_hash }))
 }
 
@@ -100,12 +114,24 @@ mod tests {
         );
     }
 
+    const HASH: &str = "0123456789ABCDEF0123456789abcdef";
+
     #[test]
     fn invalid_api_id() {
         for bad in ["abc", "-1", "0", "99999999999"] {
             assert_eq!(
-                resolve(args(&[]), env(&[(API_ID_VAR, bad), (API_HASH_VAR, "h")])).unwrap_err(),
+                resolve(args(&[]), env(&[(API_ID_VAR, bad), (API_HASH_VAR, HASH)])).unwrap_err(),
                 LaunchError::InvalidApiId
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_api_hash() {
+        for bad in ["h", "0123456789abcdef0123456789abcdeg", &format!("{HASH}0")] {
+            assert_eq!(
+                resolve(args(&[]), env(&[(API_ID_VAR, "1"), (API_HASH_VAR, bad)])).unwrap_err(),
+                LaunchError::InvalidApiHash
             );
         }
     }
@@ -114,15 +140,16 @@ mod tests {
     fn credentials_from_env() {
         let launch = resolve(
             args(&["-psn_0_1"]),
-            env(&[(API_ID_VAR, " 42 "), (API_HASH_VAR, "h")]),
+            env(&[(API_ID_VAR, " 42 "), (API_HASH_VAR, HASH)]),
         );
         match launch.unwrap() {
             Launch::Telegram(c) => {
                 assert_eq!(c.api_id, 42);
-                assert_eq!(c.api_hash, "h");
+                assert_eq!(c.api_hash.expose(), HASH.to_lowercase());
+                assert!(!format!("{c:?}").contains("0123"), "the hash is redacted");
             }
             #[cfg(feature = "fake")]
-            Launch::Fake => panic!("expected credentials"),
+            Launch::Fake { .. } => panic!("expected credentials"),
         }
     }
 
@@ -130,8 +157,23 @@ mod tests {
     fn fake_flag_skips_credentials() {
         let launch = resolve(args(&[FAKE_FLAG]), env(&[]));
         #[cfg(feature = "fake")]
-        assert!(matches!(launch, Ok(Launch::Fake)));
+        assert!(
+            matches!(launch, Ok(Launch::Fake { faults }) if faults == abyss_core::FakeFaults::default())
+        );
         #[cfg(not(feature = "fake"))]
         assert_eq!(launch.unwrap_err(), LaunchError::FakeNotBuilt);
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn fake_faults_from_env() {
+        let launch = resolve(
+            args(&[FAKE_FLAG]),
+            env(&[(abyss_core::FAKE_FAULTS_VAR, "store-stall")]),
+        );
+        let Ok(Launch::Fake { faults }) = launch else {
+            panic!("expected the fake");
+        };
+        assert!(faults.store_stall);
     }
 }

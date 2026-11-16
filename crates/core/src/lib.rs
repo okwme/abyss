@@ -2,6 +2,7 @@
 
 mod actor;
 pub mod api;
+mod auth_types;
 pub mod backend;
 pub mod cache;
 mod core;
@@ -13,8 +14,10 @@ pub mod secret;
 pub mod session;
 pub mod store;
 
-pub use crate::actor::{CALL_DEADLINE, MAX_CONCURRENT, READ_FLUSH};
+pub use crate::actor::{CALL_DEADLINE, MAX_CONCURRENT, READ_FLUSH, SHUTDOWN_DEADLINE};
 pub use crate::core::{
-    BackendChoice, CacheConfig, CoreConfig, CoreHandle, Credentials, SendError, ShutdownReport,
-    StartError, start,
+    BackendChoice, CacheConfig, CoreConfig, CoreEvents, CoreHandle, CoreSender, Credentials,
+    SendError, ShutdownReport, StartError, start,
 };
+#[cfg(feature = "fake")]
+pub use crate::core::{FAKE_FAULTS_VAR, FakeFaults};

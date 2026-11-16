@@ -4,7 +4,7 @@
 //! server-provided password hint).
 
 use abyss_core::StartError;
-use abyss_core::api::UserError;
+use abyss_core::api::{CredentialError, LocalDeletion, RemoteLogout, StorageError, UserError};
 use gpui::SharedString;
 
 use crate::launch::{API_HASH_VAR, API_ID_VAR, LaunchError};
@@ -25,9 +25,32 @@ pub(crate) fn code_detail(phone_hint: &str) -> SharedString {
 
 pub(crate) const PASSWORD_TITLE: &str = "Two-step verification";
 pub(crate) const PASSWORD_PLACEHOLDER: &str = "Password";
-/// The `--fake` demo's stand-in for a server password hint.
+/// `--fake`: the demo account's login code, shown when the code screen opens.
 #[cfg(feature = "fake")]
-pub(crate) const DEMO_PASSWORD_HINT: &str = "demo: any non-empty password";
+pub(crate) const FAKE_CODE_HINT: &str = "Demo account: the code is 12345.";
+/// The password token was used up; Enter fetches new sign-in parameters.
+pub(crate) const PASSWORD_PARAMS: &str =
+    "Press Enter to get new sign-in parameters, then enter your password again.";
+pub(crate) const SIGNED_IN_UNSAVED: &str =
+    "Signed in, but the session couldn't be saved. You'll need to sign in again next time.";
+pub(crate) const LOGGING_OUT: &str = "Signing out…";
+
+/// The result of a logout, as a notice.
+pub(crate) fn logged_out(remote: RemoteLogout, local: LocalDeletion) -> SharedString {
+    let remote = match remote {
+        RemoteLogout::Revoked | RemoteLogout::NotAttempted => "",
+        RemoteLogout::Failed(_) | RemoteLogout::TimedOut => {
+            " Telegram didn't confirm it: end the session from Active Sessions on another device."
+        }
+    };
+    let local = match local {
+        LocalDeletion::Deleted => "",
+        LocalDeletion::Failed(_) => {
+            " Some local data couldn't be deleted; signing out again retries."
+        }
+    };
+    format!("Signed out.{remote}{local}").into()
+}
 
 pub(crate) fn password_detail(hint: Option<&str>) -> SharedString {
     match hint {
@@ -67,6 +90,51 @@ pub(crate) fn user_error(error: UserError) -> SharedString {
         UserError::AccountMigrated => {
             "Telegram moved this account to another data center. Sign in again.".into()
         }
+        UserError::PhoneInvalid => "That phone number isn't valid. Use international format, \
+                                    e.g. +44 20 7946 0000."
+            .into(),
+        UserError::PhoneBanned => "Telegram has banned this phone number.".into(),
+        UserError::InvalidCode => {
+            "That code is wrong or expired. Check it, or ask for a new one.".into()
+        }
+        UserError::InvalidPassword => "That password is wrong.".into(),
+        UserError::SignUpRequired => "This number has no Telegram account. Create one in an \
+                                      official Telegram app first."
+            .into(),
+        UserError::SessionRevoked => {
+            "This session was ended (signed out elsewhere). Sign in again.".into()
+        }
+        UserError::Credentials(e) => credential_error(e),
+        UserError::Storage(e) => storage_error(e),
+    }
+}
+
+fn credential_error(error: CredentialError) -> SharedString {
+    match error {
+        CredentialError::ApiIdInvalid => format!(
+            "Telegram doesn't recognize these API credentials. Check {API_ID_VAR} and \
+             {API_HASH_VAR}, then restart abyss."
+        )
+        .into(),
+        CredentialError::ApiIdPublishedFlood => "Telegram blocked these API credentials because \
+                                                 they were published. Create your own at \
+                                                 my.telegram.org."
+            .into(),
+    }
+}
+
+fn storage_error(error: StorageError) -> SharedString {
+    match error {
+        StorageError::Keychain => "The Keychain refused the request.".into(),
+        StorageError::Corrupt => "Saved data was unreadable and was ignored.".into(),
+        StorageError::Busy => "Too many saves at once; one was dropped.".into(),
+        StorageError::Stopped => "Local storage stopped.".into(),
+        StorageError::Random => "The system random number generator failed.".into(),
+        StorageError::Cache => "The message cache couldn't be closed; nothing was deleted.".into(),
+        StorageError::CacheFiles => {
+            "The message cache is unreadable, but its files couldn't be deleted.".into()
+        }
+        StorageError::Internal => "Something went wrong with local storage.".into(),
     }
 }
 
@@ -95,6 +163,16 @@ pub(crate) fn launch_error(error: &LaunchError) -> (&'static str, Vec<SharedStri
                     .into(),
             ],
         ),
+        LaunchError::InvalidApiHash => (
+            "ABYSS_API_HASH is not valid",
+            vec![
+                format!(
+                    "{API_HASH_VAR} must be the 32-character hexadecimal hash shown on \
+                     my.telegram.org."
+                )
+                .into(),
+            ],
+        ),
         LaunchError::FakeNotBuilt => (
             "This build has no demo backend",
             vec!["--fake needs a build with the `fake` feature. Use `cargo dev`.".into()],
@@ -104,15 +182,5 @@ pub(crate) fn launch_error(error: &LaunchError) -> (&'static str, Vec<SharedStri
 
 /// Title and paragraphs for a core that failed to start.
 pub(crate) fn start_error(error: &StartError) -> (&'static str, Vec<SharedString>) {
-    match error {
-        StartError::NotImplemented => (
-            "Can't connect to Telegram yet",
-            vec![
-                "This build doesn't include the Telegram backend yet. Run with --fake to use \
-                 the demo backend."
-                    .into(),
-            ],
-        ),
-        other => ("abyss couldn't start", vec![other.to_string().into()]),
-    }
+    ("abyss couldn't start", vec![error.to_string().into()])
 }

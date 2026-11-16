@@ -80,6 +80,8 @@ impl StoreOp {
 struct Faults {
     delay_ms: AtomicU64,
     failing: AtomicU8,
+    /// Deletions of these items fail (one bit per item).
+    failing_deletes: AtomicU8,
     calls: AtomicU64,
     held: Mutex<bool>,
     released: Condvar,
@@ -111,6 +113,18 @@ impl FaultControl {
 
     pub fn heal(&self, op: StoreOp) {
         self.0.failing.fetch_and(!op.bit(), Ordering::SeqCst);
+    }
+
+    /// Makes deleting `item` return [`StoreError::Injected`], leaving other
+    /// items' deletions alone.
+    pub fn fail_delete_of(&self, item: SecretItem) {
+        self.0
+            .failing_deletes
+            .fetch_or(item_bit(item), Ordering::SeqCst);
+    }
+
+    fn delete_fails(&self, item: SecretItem) -> bool {
+        self.0.failing_deletes.load(Ordering::SeqCst) & item_bit(item) != 0
     }
 
     /// Blocks every subsequent operation until [`Self::release`] (at most 10 s).
@@ -188,6 +202,16 @@ impl<S: SecretStore> SecretStore for FaultyStore<S> {
 
     fn delete(&self, item: SecretItem) -> Result<(), StoreError> {
         self.control.before(StoreOp::Delete)?;
+        if self.control.delete_fails(item) {
+            return Err(StoreError::Injected);
+        }
         self.inner.delete(item)
+    }
+}
+
+const fn item_bit(item: SecretItem) -> u8 {
+    match item {
+        SecretItem::Session => 1,
+        SecretItem::CacheKey => 2,
     }
 }
