@@ -687,6 +687,15 @@ Open for task 6 (and 5/11):
 | 7 | Visible URL bytes not counted in the URL budget | Budget counts `TextUrl` targets plus visible `Url` text (fixed in code by the coordinator; plan wording aligned). Invalid UTF-16 boundaries are dropped, not clamped (section 6) |
 | Deferred | Full authenticated migration; framework, clipboard and SRP password copies | Recorded as residual risks 6 and 9 (section 14) |
 
+- **Round 4 (code review of task 4, 2026-11-16).** These are open, and are fixed in "Task 4b" after the 6/9/10/11 wave merges, because that wave touches the same files.
+  - **High:** reopening the bootstrap tail chat during bootstrap orphans its snapshot, so `Online` never comes (`boot.rs`, `apply.rs`). Track the snapshot by `(chat, request id)`, complete it even when stale, and queue a replacement through bootstrap.
+  - Refresh never removes a deleted newest message, or anything at all when the server tail is empty, because deletion detection is capped at the returned max id. Fix: reconcile the pre-request window against the authoritative tail, including the newest boundary.
+  - Dialog replay suppression keys on timestamps, so two messages in the same second lose a preview or unread count. Fix: carry the snapshot's top message id.
+  - `contiguous` grows by one entry per visited chat. Fix: bound it with the windows.
+  - A send that gets `Migrated` or `FloodWait` becomes `Failed` and is stranded after the rebuild. Fix: classify both separately and keep the send replayable with the same `random_id`.
+  - The send-replay test only covers an unaccepted attempt. Fix: add an "accepted, response lost" fault plus fake server dedup by `random_id`, and check the 3-attempt cap across several rebuilds.
+  - Shutdown during a retirement skips revoke. This one went to task 6.
+
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 
 History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This supersedes the "nothing on disk except the Keychain item" property in sections 3 and 9. The new property: **nothing plaintext on disk; everything on disk is undecryptable without a device-only Keychain key.**
