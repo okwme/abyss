@@ -4,12 +4,14 @@ use grammers_client::session::types::PeerInfo;
 use grammers_client::tl;
 
 use super::{
-    basic_group, bold, channel, dialog, message, peer_channel, peer_chat, peer_user, reply_header,
-    service, text_url, user, users,
+    basic_group, bold, channel, community, dialog, folder, message, peer_channel, peer_chat,
+    peer_user, reply_header, service, text_url, user, users,
 };
 use crate::backend::grammers::map::lists::{self, DialogsParts, MAX_DELETED_IDS, MessagesParts};
 use crate::backend::grammers::map::message::{self as msg, media_kind, reply_and_topic, rich};
-use crate::backend::grammers::map::peers::{Directory, chat_id, input_peer, user_chat};
+use crate::backend::grammers::map::peers::{
+    Directory, MAX_DIRECTORY, chat_id, input_peer, user_chat,
+};
 use crate::backend::{HistoryQuery, Update};
 use crate::model::{Body, ChatId, ChatKind, MediaKind, MsgId, PeerKind, Preview};
 use crate::rich_text::{LinkTarget, MAX_ENTITIES, MAX_TEXT_BYTES, MAX_URL_BYTES, Style};
@@ -18,6 +20,13 @@ use crate::sanitize::MAX_SERVICE_BYTES;
 fn uid(id: i64) -> ChatId {
     ChatId {
         kind: PeerKind::User,
+        id,
+    }
+}
+
+fn gid(id: i64) -> ChatId {
+    ChatId {
+        kind: PeerKind::Chat,
         id,
     }
 }
@@ -569,7 +578,6 @@ fn dialogs_map_kinds_counts_previews_and_exclude_broadcasts() {
     ));
     assert_eq!(out.chats[4].kind, ChatKind::Group);
     assert!(out.chats.iter().all(crate::model::ChatSummary::is_valid));
-    assert_eq!(out.pins.len(), 5);
 }
 
 #[test]
@@ -610,16 +618,213 @@ fn dialogs_cursor_follows_the_last_raw_dialog() {
 }
 
 #[test]
-fn folders_and_unknown_peers_are_skipped() {
-    let users = users(vec![user(7, "Ann", "")]);
+fn folders_communities_and_unknown_peers_are_skipped() {
+    let users = users(vec![user(7, "Ann", ""), user(8, "Bob", "")]);
     let dialogs = vec![
+        folder(peer_user(8), 4),
         tl::enums::Dialog::Dialog(dialog(peer_user(99), 1)),
+        community(5),
         tl::enums::Dialog::Dialog(dialog(peer_user(7), 2)),
     ];
     let dir = Directory::from_lists(&users, &[]);
     let out = lists::dialogs(&parts(&dialogs, &[], &users, &[]), &dir, 100);
-    assert_eq!(out.chats.len(), 1);
+    let ids: Vec<i64> = out.chats.iter().map(|c| c.id.id).collect();
+    assert_eq!(ids, vec![7], "the folder's peer is not listed as a chat");
     assert_eq!(out.chats[0].last, None);
+}
+
+fn slice<'a>(
+    dialogs: &'a [tl::enums::Dialog],
+    messages: &'a [tl::enums::Message],
+    users: &'a [tl::enums::User],
+) -> DialogsParts<'a> {
+    DialogsParts {
+        complete: false,
+        ..parts(dialogs, messages, users, &[])
+    }
+}
+
+#[test]
+fn a_folder_at_the_page_boundary_continues_the_list() {
+    let users = users(vec![user(7, "Ann", ""), user(8, "Bob", "")]);
+    let messages = vec![
+        tl::enums::Message::Message(message(peer_user(7), 1, "a")),
+        tl::enums::Message::Message(message(peer_user(8), 6, "b")),
+    ];
+    let dir = Directory::from_lists(&users, &[]);
+    // Three raw entries for a limit of three, one of them shown: the page is
+    // full, so more follow, and the cursor continues after the folder.
+    let dialogs = vec![
+        tl::enums::Dialog::Dialog(dialog(peer_user(7), 1)),
+        tl::enums::Dialog::Dialog(dialog(peer_user(99), 3)),
+        folder(peer_user(8), 6),
+    ];
+    let page = lists::dialogs(&slice(&dialogs, &messages, &users), &dir, 3);
+    assert_eq!(page.chats.len(), 1);
+    let next = page.next.expect("a full raw page continues");
+    assert_eq!(next.offset_peer, Some(uid(8)));
+    assert_eq!((next.offset_id, next.offset_date), (6, 1_700_000_006));
+
+    // A folder first and a community last: the cursor is the last entry
+    // that names a peer.
+    let dialogs = vec![
+        folder(peer_user(8), 6),
+        tl::enums::Dialog::Dialog(dialog(peer_user(7), 1)),
+        community(5),
+    ];
+    let page = lists::dialogs(&slice(&dialogs, &messages, &users), &dir, 3);
+    let next = page.next.expect("a full raw page continues");
+    assert_eq!(next.offset_peer, Some(uid(7)));
+    assert_eq!((next.offset_id, next.offset_date), (1, 1_700_000_001));
+
+    // Only folders: nothing shown, and still not the end of the list.
+    let dialogs = vec![folder(peer_user(8), 6), folder(peer_user(7), 1)];
+    let page = lists::dialogs(&slice(&dialogs, &messages, &users), &dir, 2);
+    assert!(page.chats.is_empty());
+    assert_eq!(page.next.map(|n| n.offset_peer), Some(Some(uid(7))));
+}
+
+// --- response bounds ---
+
+fn dialogs_resp(
+    n_dialogs: usize,
+    n_messages: usize,
+    n_users: usize,
+) -> tl::enums::messages::Dialogs {
+    let ids = |n: usize| 1..=i32::try_from(n).unwrap();
+    tl::enums::messages::Dialogs::Slice(tl::types::messages::DialogsSlice {
+        count: 100_000,
+        dialogs: ids(n_dialogs)
+            .map(|i| tl::enums::Dialog::Dialog(dialog(peer_user(i64::from(i)), i)))
+            .collect(),
+        messages: ids(n_messages)
+            .map(|i| tl::enums::Message::Message(message(peer_user(i64::from(i)), i, "m")))
+            .collect(),
+        chats: vec![],
+        users: users(ids(n_users).map(|i| user(i64::from(i), "U", "")).collect()),
+    })
+}
+
+fn history_resp(
+    n_messages: usize,
+    n_users: usize,
+    n_chats: usize,
+) -> tl::enums::messages::Messages {
+    let ids = |n: usize| 1..=i32::try_from(n).unwrap();
+    tl::enums::messages::Messages::Slice(tl::types::messages::MessagesSlice {
+        inexact: false,
+        count: 100_000,
+        next_rate: None,
+        offset_id_offset: None,
+        search_flood: None,
+        messages: ids(n_messages)
+            .map(|i| tl::enums::Message::Message(message(peer_user(7), i, "m")))
+            .collect(),
+        topics: vec![],
+        chats: ids(n_chats)
+            .map(|i| tl::enums::Chat::Chat(basic_group(i64::from(i), "G")))
+            .collect(),
+        users: users(ids(n_users).map(|i| user(i64::from(i), "U", "")).collect()),
+    })
+}
+
+#[test]
+fn oversized_dialog_responses_are_rejected_before_mapping() {
+    let items = 20 + lists::RESPONSE_SLACK;
+    let peers = 20 * lists::PEERS_PER_ITEM + lists::RESPONSE_SLACK;
+    assert!(lists::dialogs_parts(&dialogs_resp(items, 2 * items, peers), 20).is_ok());
+    for resp in [
+        dialogs_resp(items + 1, 0, 0),
+        dialogs_resp(0, 2 * items + 1, 0),
+        dialogs_resp(0, 0, peers + 1),
+        dialogs_resp(5_000, 5_000, 5_000),
+    ] {
+        assert_eq!(
+            lists::dialogs_parts(&resp, 20).err(),
+            Some(lists::Oversized)
+        );
+    }
+}
+
+#[test]
+fn oversized_history_responses_are_rejected_before_mapping() {
+    let items = 10 + lists::RESPONSE_SLACK;
+    let peers = 10 * lists::PEERS_PER_ITEM + lists::RESPONSE_SLACK;
+    assert!(lists::messages_parts(&history_resp(items, peers - 1, 1), 10).is_ok());
+    for resp in [
+        history_resp(items + 1, 0, 0),
+        history_resp(0, peers, 1),
+        history_resp(10_000, 0, 0),
+    ] {
+        assert_eq!(
+            lists::messages_parts(&resp, 10).err(),
+            Some(lists::Oversized)
+        );
+    }
+    // The peer budget never exceeds what a directory holds.
+    let huge = history_resp(0, MAX_DIRECTORY, 1);
+    assert_eq!(
+        lists::messages_parts(&huge, 1_000).err(),
+        Some(lists::Oversized)
+    );
+}
+
+#[test]
+fn the_directory_stops_reading_at_its_bound() {
+    let many: Vec<tl::enums::User> = users(
+        (1..=i64::try_from(MAX_DIRECTORY).unwrap() + 10)
+            .map(|i| user(i, "U", ""))
+            .collect(),
+    );
+    let chats = vec![tl::enums::Chat::Chat(basic_group(3, "late"))];
+    let dir = Directory::from_lists(&many, &chats);
+    assert_eq!(dir.len(), MAX_DIRECTORY);
+    assert!(dir.get(gid(3)).is_none(), "nothing past the bound is read");
+    let past = i64::try_from(MAX_DIRECTORY).unwrap() + 1;
+    assert!(dir.get(uid(past)).is_none());
+}
+
+// --- Debug never shows payloads ---
+
+const MARKER: &str = "zqxMARKERqxz";
+
+#[test]
+fn debug_of_mapping_types_shows_no_names_text_or_phones() {
+    let mut u = user(7, MARKER, MARKER);
+    u.phone = Some(format!("+44{MARKER}"));
+    u.username = Some(MARKER.to_owned());
+    let users = users(vec![u]);
+    let chats = vec![
+        tl::enums::Chat::Channel(channel(10, MARKER)),
+        tl::enums::Chat::Chat(basic_group(3, MARKER)),
+    ];
+    let messages = vec![tl::enums::Message::Message(message(
+        peer_user(7),
+        1,
+        MARKER,
+    ))];
+    let dialogs = vec![tl::enums::Dialog::Dialog(dialog(peer_user(7), 1))];
+    let dir = Directory::from_lists(&users, &chats);
+    let dparts = parts(&dialogs, &messages, &users, &chats);
+    let mapped = lists::dialogs(&dparts, &dir, 10);
+    assert_eq!(mapped.chats.len(), 1, "the fixture maps");
+    let mparts = MessagesParts {
+        messages: &messages,
+        users: &users,
+        chats: &chats,
+        complete: true,
+    };
+    let entry = dir.get(uid(7)).unwrap();
+    for out in [
+        format!("{dparts:?}"),
+        format!("{mparts:?}"),
+        format!("{dir:?}"),
+        format!("{entry:?}"),
+        format!("{mapped:?}"),
+    ] {
+        assert!(!out.contains(MARKER), "payload in Debug: {out}");
+        assert!(!out.contains("+44"), "phone in Debug: {out}");
+    }
 }
 
 // --- history ---

@@ -5,6 +5,7 @@
 mod calls;
 mod errors;
 mod map;
+mod pins;
 mod stream;
 
 use grammers_client::tl;
@@ -254,19 +255,7 @@ pub(super) fn dialog(peer: tl::enums::Peer, top: i32) -> tl::types::Dialog {
         unread_mentions_count: 0,
         unread_reactions_count: 0,
         unread_poll_votes_count: 0,
-        notify_settings: tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
-            show_previews: None,
-            silent: None,
-            mute_until: None,
-            ios_sound: None,
-            android_sound: None,
-            other_sound: None,
-            stories_muted: None,
-            stories_hide_sender: None,
-            stories_ios_sound: None,
-            stories_android_sound: None,
-            stories_other_sound: None,
-        }),
+        notify_settings: notify_settings(),
         pts: None,
         draft: None,
         folder_id: None,
@@ -292,6 +281,51 @@ pub(super) fn reply_header(msg: Option<i32>, top: Option<i32>) -> tl::types::Mes
         poll_option: None,
         quote_rich: None,
     }
+}
+
+fn notify_settings() -> tl::enums::PeerNotifySettings {
+    tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
+        show_previews: None,
+        silent: None,
+        mute_until: None,
+        ios_sound: None,
+        android_sound: None,
+        other_sound: None,
+        stories_muted: None,
+        stories_hide_sender: None,
+        stories_ios_sound: None,
+        stories_android_sound: None,
+        stories_other_sound: None,
+    })
+}
+
+/// The archive folder's entry in the main list, led by `peer`'s top message.
+pub(super) fn folder(peer: tl::enums::Peer, top: i32) -> tl::enums::Dialog {
+    tl::enums::Dialog::Folder(tl::types::DialogFolder {
+        pinned: false,
+        folder: tl::enums::Folder::Folder(tl::types::Folder {
+            autofill_new_broadcasts: false,
+            autofill_public_groups: false,
+            autofill_new_correspondents: false,
+            id: 1,
+            title: "Archived Chats".to_owned(),
+            photo: None,
+        }),
+        peer,
+        top_message: top,
+        unread_muted_peers_count: 0,
+        unread_unmuted_peers_count: 0,
+        unread_muted_messages_count: 0,
+        unread_unmuted_messages_count: 0,
+    })
+}
+
+pub(super) fn community(id: i64) -> tl::enums::Dialog {
+    tl::enums::Dialog::Community(tl::types::DialogCommunity {
+        pinned: false,
+        community_id: id,
+        notify_settings: notify_settings(),
+    })
 }
 
 pub(super) fn bold(offset: i32, length: i32) -> tl::enums::MessageEntity {

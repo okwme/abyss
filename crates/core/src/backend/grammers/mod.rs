@@ -44,6 +44,7 @@ mod calls;
 mod errors;
 mod invoke;
 pub(crate) mod map;
+mod pins;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -65,6 +66,7 @@ use super::{
 use crate::model::{ChatId, MsgId};
 use crate::session::{AbyssSession, PersistHandle};
 use calls::Calls;
+use pins::Pins;
 
 /// Update channel between the runner and the stream (plan section 2; grammers'
 /// default is 100).
@@ -124,6 +126,12 @@ impl Backend for GrammersBackend {
 
     async fn build(&self, seed: Seed) -> Result<Instance<Self>, BackendError> {
         let snapshot = self.snapshot(seed.session).await;
+        // The retired instance's pins (its dialogs, open chats and sends)
+        // stay pinned here until newer dialogs push them out.
+        let pins = Pins::new(
+            seed.peers.as_slice(),
+            snapshot.carried.iter().filter_map(map::info_chat),
+        );
         let session =
             Arc::new(AbyssSession::from_snapshot(snapshot).map_err(|_| BackendError::Transient)?);
         let SenderPool {
@@ -141,9 +149,8 @@ impl Backend for GrammersBackend {
             .stream_updates(updates, UpdatesConfiguration { catch_up: false })
             .await
             .map_err(|_| BackendError::Transient)?;
-        let carried: Arc<[ChatId]> = seed.peers.as_slice().into();
         Ok(Instance {
-            client: GrammersClient(Calls::new(client, Arc::clone(&session), carried)),
+            client: GrammersClient(Calls::new(client, Arc::clone(&session), pins)),
             updates: GrammersUpdates::new(stream, session.baseline_established()),
             runner: Box::pin(runner.run()),
             control: GrammersControl {

@@ -112,8 +112,18 @@ pub(crate) fn input_channel(peer: &tl::enums::InputPeer) -> Option<tl::enums::In
     }
 }
 
-/// What the client shows and needs about one peer of a response.
-#[derive(Clone, Debug)]
+/// Our chat for a peer the session knows, if its id is in range.
+pub(crate) fn info_chat(info: &PeerInfo) -> Option<ChatId> {
+    match info {
+        PeerInfo::User { id, .. } => user_chat(*id),
+        PeerInfo::Chat { id } => group_chat(*id),
+        PeerInfo::Channel { id, .. } => channel_chat(*id),
+    }
+}
+
+/// What the client shows and needs about one peer of a response. `Debug`
+/// shows the chat kind only: names and titles are private.
+#[derive(Clone)]
 pub(crate) struct PeerEntry {
     /// Sender name (sanitized).
     pub(crate) name: String,
@@ -128,16 +138,41 @@ pub(crate) struct PeerEntry {
     pub(crate) info: PeerInfo,
 }
 
+impl std::fmt::Debug for PeerEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerEntry")
+            .field("kind", &self.kind)
+            .field("broadcast", &self.broadcast)
+            .field("can_send", &self.can_send)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Peers of one response, keyed by chat. Bounded by [`MAX_DIRECTORY`].
-#[derive(Debug, Default)]
+/// `Debug` shows the count only.
+#[derive(Default)]
 pub(crate) struct Directory {
     peers: HashMap<ChatId, PeerEntry>,
 }
 
+impl std::fmt::Debug for Directory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Directory")
+            .field("peers", &self.peers.len())
+            .finish()
+    }
+}
+
 impl Directory {
+    /// Reads at most [`MAX_DIRECTORY`] raw entries, users first: nothing past
+    /// the bound is even sanitized. Callers reject responses whose peer count
+    /// exceeds their own, smaller, budget before this runs.
     pub(crate) fn from_lists(users: &[tl::enums::User], chats: &[tl::enums::Chat]) -> Self {
+        let users = users.get(..MAX_DIRECTORY).unwrap_or(users);
+        let room = MAX_DIRECTORY.saturating_sub(users.len());
+        let chats = chats.get(..room).unwrap_or(chats);
         let mut dir = Directory {
-            peers: HashMap::with_capacity((users.len() + chats.len()).min(MAX_DIRECTORY)),
+            peers: HashMap::with_capacity(users.len().saturating_add(chats.len())),
         };
         for user in users {
             dir.insert_user(user);
@@ -146,6 +181,11 @@ impl Directory {
             dir.insert_chat(chat);
         }
         dir
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.peers.len()
     }
 
     pub(crate) fn insert_user(&mut self, user: &tl::enums::User) {

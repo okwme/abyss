@@ -15,6 +15,7 @@ use grammers_client::tl;
 use super::errors::{backend_error, kind};
 use super::invoke::{Invoke, RetryClass, call};
 use super::map::{self, Directory};
+use super::pins::Pins;
 use crate::backend::{BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery};
 use crate::model::{ChatId, MsgId};
 use crate::session::AbyssSession;
@@ -28,6 +29,45 @@ fn page_limit(limit: u32) -> i32 {
 
 fn fail(e: &InvocationError) -> BackendError {
     backend_error(kind(e))
+}
+
+/// A response larger than its request allows: a definite failure, logged
+/// without any of its content.
+fn oversized() -> BackendError {
+    tracing::warn!("oversized telegram response rejected");
+    BackendError::Rejected
+}
+
+/// Where a later dialogs page starts.
+pub(crate) struct DialogsOffset {
+    pub(crate) date: i32,
+    pub(crate) id: i32,
+    pub(crate) peer: tl::enums::InputPeer,
+}
+
+/// The `messages.getDialogs` request for one page: the first page without
+/// an offset. Pinned dialogs come only with the first page; later pages
+/// exclude them, as `iter_dialogs` does
+/// (`grammers-client/src/client/dialogs.rs:119`), or they would repeat.
+pub(crate) fn dialogs_request(
+    offset: Option<DialogsOffset>,
+    limit: i32,
+) -> tl::functions::messages::GetDialogs {
+    let exclude_pinned = offset.is_some();
+    let offset = offset.unwrap_or(DialogsOffset {
+        date: 0,
+        id: 0,
+        peer: tl::enums::InputPeer::Empty,
+    });
+    tl::functions::messages::GetDialogs {
+        exclude_pinned,
+        folder_id: None,
+        offset_date: offset.date,
+        offset_id: offset.id,
+        offset_peer: offset.peer,
+        limit,
+        hash: 0,
+    }
 }
 
 /// The `messages.sendMessage` request for one attempt of a logical send.
@@ -78,26 +118,30 @@ pub(crate) fn history_offsets(query: HistoryQuery, limit: i32) -> (i32, i32, i32
 pub(crate) struct Calls<I> {
     invoker: I,
     session: Arc<AbyssSession>,
-    /// Chats carried across the rebuild that built this instance; they stay
-    /// pinned when the first dialogs page replaces the pins.
-    carried: Arc<[ChatId]>,
+    /// What stays pinned in `session`, so the retired snapshot carries every
+    /// access hash core may still need (see [`Pins`]). Held across the
+    /// session update, so concurrent calls cannot interleave two updates.
+    pins: tokio::sync::Mutex<Pins>,
 }
 
 impl<I> std::fmt::Debug for Calls<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Calls")
-            .field("carried", &self.carried.len())
-            .finish_non_exhaustive()
+        f.debug_struct("Calls").finish_non_exhaustive()
     }
 }
 
 impl<I: Invoke> Calls<I> {
-    pub(crate) fn new(invoker: I, session: Arc<AbyssSession>, carried: Arc<[ChatId]>) -> Self {
+    pub(crate) fn new(invoker: I, session: Arc<AbyssSession>, pins: Pins) -> Self {
         Self {
             invoker,
             session,
-            carried,
+            pins: tokio::sync::Mutex::new(pins),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session(&self) -> &Arc<AbyssSession> {
+        &self.session
     }
 
     async fn info(&self, chat: ChatId) -> Option<PeerInfo> {
@@ -120,16 +164,30 @@ impl<I: Invoke> Calls<I> {
         }
     }
 
-    /// The first page replaces the pinned set (as `DialogsReset` replaces the
-    /// list), keeping the carried chats pinned.
-    async fn replace_pins(&self, pins: Vec<PeerInfo>) {
-        let mut all = pins;
-        for &chat in self.carried.iter() {
+    /// Applies `change` to the tracked chats and, when the set changed,
+    /// re-pins exactly that set in the session (peers that fell out return
+    /// to the session's bounded unpinned cache).
+    async fn update_pins(&self, change: impl FnOnce(&mut Pins) -> bool) {
+        let mut pins = self.pins.lock().await;
+        if !change(&mut pins) {
+            return;
+        }
+        let chats = pins.all();
+        let mut infos: Vec<PeerInfo> = Vec::with_capacity(chats.len());
+        for chat in chats {
             if let Some(info) = self.info(chat).await {
-                all.push(info);
+                infos.push(info);
             }
         }
-        self.session.replace_pinned_peers(all);
+        self.session.replace_pinned_peers(infos);
+    }
+
+    /// Pins a chat about to be addressed, before the request: a rebuild
+    /// during the call must still carry its access hash.
+    async fn resolve_used(&self, chat: ChatId) -> Result<tl::enums::InputPeer, BackendError> {
+        let peer = self.resolve(chat).await?;
+        self.update_pins(|p| p.use_chat(chat)).await;
+        Ok(peer)
     }
 
     pub(crate) async fn dialogs(
@@ -138,45 +196,36 @@ impl<I: Invoke> Calls<I> {
         limit: u32,
     ) -> Result<DialogsPage, BackendError> {
         let limit = page_limit(limit);
-        let first_page = cursor.is_none();
-        let (offset_date, offset_id, offset_peer) = match cursor {
-            None => (0, 0, tl::enums::InputPeer::Empty),
+        let offset = match cursor {
+            None => None,
             Some(c) => {
                 let peer = match c.offset_peer {
                     Some(chat) => self.resolve(chat).await.ok(),
                     None => None,
                 };
-                (
-                    c.offset_date,
-                    c.offset_id,
-                    peer.unwrap_or(tl::enums::InputPeer::Empty),
-                )
+                Some(DialogsOffset {
+                    date: c.offset_date,
+                    id: c.offset_id,
+                    peer: peer.unwrap_or(tl::enums::InputPeer::Empty),
+                })
             }
         };
-        let request = tl::functions::messages::GetDialogs {
-            exclude_pinned: false,
-            folder_id: None,
-            offset_date,
-            offset_id,
-            offset_peer,
-            limit,
-            hash: 0,
-        };
+        let request = dialogs_request(offset, limit);
         let resp = call(&self.invoker, RetryClass::Read, &request)
             .await
             .map_err(|e| fail(&e))?;
-        let parts = map::dialogs_parts(&resp);
+        let limit = usize::try_from(limit).unwrap_or(0);
+        let parts = map::dialogs_parts(&resp, limit).map_err(|map::Oversized| oversized())?;
         let dir = Directory::from_lists(parts.users, parts.chats);
         self.remember(&dir).await;
-        let mapped = map::dialogs(&parts, &dir, usize::try_from(limit).unwrap_or(0));
+        let mapped = map::dialogs(&parts, &dir, limit);
         if mapped.excluded > 0 {
             tracing::debug!(excluded = mapped.excluded, "broadcast channels left out");
         }
-        if first_page {
-            self.replace_pins(mapped.pins).await;
-        } else {
-            self.session.pin_peers(mapped.pins);
-        }
+        // Every page adds to the pins, the first one too: core keeps older
+        // pages across a refresh, and their chats must survive a rebuild.
+        self.update_pins(|p| p.list(mapped.chats.iter().map(|c| c.id)))
+            .await;
         Ok(DialogsPage {
             chats: mapped.chats,
             next: mapped.next,
@@ -189,7 +238,7 @@ impl<I: Invoke> Calls<I> {
         query: HistoryQuery,
         limit: u32,
     ) -> Result<HistoryPage, BackendError> {
-        let peer = self.resolve(chat).await?;
+        let peer = self.resolve_used(chat).await?;
         let limit = page_limit(limit);
         let (offset_id, add_offset, min_id) = history_offsets(query, limit);
         let request = tl::functions::messages::GetHistory {
@@ -205,10 +254,10 @@ impl<I: Invoke> Calls<I> {
         let resp = call(&self.invoker, RetryClass::Read, &request)
             .await
             .map_err(|e| fail(&e))?;
-        let parts = map::messages_parts(&resp);
+        let limit = usize::try_from(limit).unwrap_or(0);
+        let parts = map::messages_parts(&resp, limit).map_err(|map::Oversized| oversized())?;
         let dir = Directory::from_lists(parts.users, parts.chats);
         self.remember(&dir).await;
-        let limit = usize::try_from(limit).unwrap_or(0);
         Ok(map::history(&parts, &dir, chat, query, limit))
     }
 
@@ -220,7 +269,7 @@ impl<I: Invoke> Calls<I> {
         text: String,
         random_id: i64,
     ) -> Result<MsgId, BackendError> {
-        let peer = self.resolve(chat).await?;
+        let peer = self.resolve_used(chat).await?;
         let request = send_request(peer, text, random_id);
         let resp = call(&self.invoker, RetryClass::Never, &request)
             .await
@@ -237,7 +286,7 @@ impl<I: Invoke> Calls<I> {
         chat: ChatId,
         max_id: MsgId,
     ) -> Result<(), BackendError> {
-        let peer = self.resolve(chat).await?;
+        let peer = self.resolve_used(chat).await?;
         let res = if let Some(channel) = map::input_channel(&peer) {
             let request = tl::functions::channels::ReadHistory {
                 channel,

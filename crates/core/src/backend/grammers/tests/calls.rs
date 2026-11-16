@@ -15,6 +15,8 @@ use grammers_client::tl::{self, Deserializable as _, Serializable as _};
 use super::{dialog, message, peer_user, user, users};
 use crate::backend::grammers::calls::{Calls, history_offsets};
 use crate::backend::grammers::invoke::Invoke;
+use crate::backend::grammers::map::info_chat;
+use crate::backend::grammers::pins::Pins;
 use crate::backend::grammers::{GrammersControl, connection_params};
 use crate::backend::{BackendError, HistoryQuery, InstanceControl, SessionSnapshot};
 use crate::model::{ChatId, MsgId, PeerKind};
@@ -147,7 +149,7 @@ async fn setup(mock: &Arc<Mock>) -> Calls<Arc<Mock>> {
         })
         .await
         .unwrap();
-    Calls::new(Arc::clone(mock), session, Arc::from([]))
+    Calls::new(Arc::clone(mock), session, Pins::new(&[], []))
 }
 
 #[tokio::test(start_paused = true)]
@@ -339,6 +341,142 @@ async fn dialogs_teach_the_session_hashes_for_later_calls() {
         history.peer,
         tl::enums::InputPeer::User(p) if p.user_id == 8 && p.access_hash == 56
     ));
+}
+
+fn uid(id: i64) -> ChatId {
+    ChatId {
+        kind: PeerKind::User,
+        id,
+    }
+}
+
+/// A full dialogs slice listing users `ids` (top message id = user id).
+fn dialogs_slice(ids: &[i64]) -> Vec<u8> {
+    let top = |id: i64| i32::try_from(id).unwrap();
+    tl::enums::messages::Dialogs::Slice(tl::types::messages::DialogsSlice {
+        count: 1_000,
+        dialogs: ids
+            .iter()
+            .map(|&id| tl::enums::Dialog::Dialog(dialog(peer_user(id), top(id))))
+            .collect(),
+        messages: ids
+            .iter()
+            .map(|&id| tl::enums::Message::Message(message(peer_user(id), top(id), "m")))
+            .collect(),
+        chats: vec![],
+        users: users(ids.iter().map(|&id| user(id, "U", "")).collect()),
+    })
+    .to_bytes()
+}
+
+fn retire(session: &Arc<AbyssSession>) -> SessionSnapshot {
+    let pool = SenderPool::with_configuration(Arc::clone(session), 1, connection_params());
+    GrammersControl {
+        handle: pool.handle.thin,
+        session: Arc::clone(session),
+    }
+    .retire()
+}
+
+/// The peer a rebuilt instance addresses `chat` with, if it can.
+async fn rebuilt_peer(snapshot: SessionSnapshot, carried: &[ChatId], chat: ChatId) -> Option<i64> {
+    let inherited: Vec<ChatId> = snapshot.carried.iter().filter_map(info_chat).collect();
+    let session = Arc::new(AbyssSession::from_snapshot(snapshot).unwrap());
+    let mock = Mock::with(vec![Ok(history_reply(&[]))]);
+    let calls = Calls::new(Arc::clone(&mock), session, Pins::new(carried, inherited));
+    calls.history(chat, HistoryQuery::Tail, 5).await.ok()?;
+    let request = mock.requests().pop()?;
+    match tl::functions::messages::GetHistory::from_boxed_bytes(&request)
+        .unwrap()
+        .peer
+    {
+        tl::enums::InputPeer::User(p) if p.user_id == chat.id => Some(p.access_hash),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_refreshed_first_page_keeps_later_pages_and_open_chats_across_a_rebuild() {
+    let mock = Mock::with(vec![
+        Ok(dialogs_slice(&[21, 22])),
+        Ok(dialogs_slice(&[23, 24])),
+        Ok(history_reply(&[])),
+        // The refresh: page one again, with a newcomer on top.
+        Ok(dialogs_slice(&[25, 21])),
+    ]);
+    let calls = setup(&mock).await;
+    let first = calls.dialogs(None, 2).await.unwrap();
+    let second = calls.dialogs(first.next, 2).await.unwrap();
+    assert_eq!(second.chats.len(), 2);
+    // Open a chat from page two, then refresh page one.
+    calls.history(uid(24), HistoryQuery::Tail, 5).await.unwrap();
+    calls.dialogs(None, 2).await.unwrap();
+
+    let session = Arc::clone(calls.session());
+    let snapshot = retire(&session);
+    // Core carries the open chat; page-two and page-one chats it still lists
+    // must be addressable too.
+    for (id, hash) in [(24, 24 * 7), (23, 23 * 7), (22, 22 * 7), (25, 25 * 7)] {
+        assert_eq!(
+            rebuilt_peer(snapshot.clone(), &[uid(24)], uid(id)).await,
+            Some(hash),
+            "chat {id} lost its access hash"
+        );
+    }
+}
+
+#[tokio::test]
+async fn later_dialog_pages_exclude_pinned_chats() {
+    let mut pinned = dialog(peer_user(21), 21);
+    pinned.pinned = true;
+    let page_one = tl::enums::messages::Dialogs::Slice(tl::types::messages::DialogsSlice {
+        count: 1_000,
+        dialogs: vec![
+            tl::enums::Dialog::Dialog(pinned),
+            tl::enums::Dialog::Dialog(dialog(peer_user(22), 22)),
+        ],
+        messages: vec![
+            tl::enums::Message::Message(message(peer_user(21), 21, "p")),
+            tl::enums::Message::Message(message(peer_user(22), 22, "q")),
+        ],
+        chats: vec![],
+        users: users(vec![user(21, "P", ""), user(22, "Q", "")]),
+    });
+    let mock = Mock::with(vec![Ok(page_one.to_bytes()), Ok(dialogs_slice(&[23, 24]))]);
+    let calls = setup(&mock).await;
+    let first = calls.dialogs(None, 2).await.unwrap();
+    assert!(first.chats[0].pinned);
+    let next = first.next.expect("a full page continues");
+    let second = calls.dialogs(Some(next), 2).await.unwrap();
+    assert!(second.chats.iter().all(|c| !c.pinned && c.id != uid(21)));
+
+    let requests = mock.requests();
+    let one = tl::functions::messages::GetDialogs::from_boxed_bytes(&requests[0]).unwrap();
+    assert!(
+        !one.exclude_pinned,
+        "the first page carries the pinned chats"
+    );
+    let two = tl::functions::messages::GetDialogs::from_boxed_bytes(&requests[1]).unwrap();
+    assert!(two.exclude_pinned, "later pages must not repeat them");
+    assert_eq!((two.offset_id, two.offset_date), (22, 1_700_000_022));
+    assert!(matches!(
+        two.offset_peer,
+        tl::enums::InputPeer::User(p) if p.user_id == 22 && p.access_hash == 22 * 7
+    ));
+}
+
+#[tokio::test]
+async fn oversized_responses_are_backend_errors() {
+    let many: Vec<i32> = (1..=200).collect();
+    let mock = Mock::with(vec![Ok(history_reply(&many))]);
+    let calls = setup(&mock).await;
+    assert_eq!(
+        calls
+            .history(ANN, HistoryQuery::Tail, 10)
+            .await
+            .unwrap_err(),
+        BackendError::Rejected
+    );
 }
 
 #[tokio::test]

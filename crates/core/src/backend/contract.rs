@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::{
     Backend, BackendError, CarriedPeers, Client, HistoryQuery, Instance, InstanceControl, Seed,
-    SessionSeed, StreamError, StreamItem, Update, UpdateStream,
+    SessionSeed, SessionSnapshot, StreamError, StreamItem, Update, UpdateStream,
 };
 use crate::model::{ChatId, Message, MsgId};
 
@@ -23,6 +23,9 @@ const BASELINE_WAIT: Duration = Duration::from_secs(10);
 const RUNNER_WAIT: Duration = Duration::from_secs(5);
 const PAGE: u32 = 20;
 const HISTORY: u32 = 10;
+/// The target chat must hold this many messages, so `After` has known
+/// successors to return.
+const MIN_FIXTURE_MESSAGES: usize = 3;
 /// Errors the background consumer tolerates before it stops reading.
 const MAX_STREAM_ERRORS: usize = 3;
 
@@ -106,6 +109,10 @@ async fn check_history(client: &impl Client, chat: ChatId) -> Option<MsgId> {
         .await
         .expect("tail");
     assert_history(&tail.messages, chat, HISTORY);
+    assert!(
+        tail.messages.len() >= MIN_FIXTURE_MESSAGES,
+        "the contract chat needs at least {MIN_FIXTURE_MESSAGES} messages"
+    );
     let first = tail.messages.first()?;
     let older = client
         .history(chat, HistoryQuery::Before(first.id), 5)
@@ -124,11 +131,60 @@ async fn check_history(client: &impl Client, chat: ChatId) -> Option<MsgId> {
         .await
         .expect("newer");
     assert_history(&newer.messages, chat, 5);
-    assert!(newer.messages.iter().all(|m| m.id > first.id));
-    if let (Some(n), Some(t)) = (newer.messages.first(), tail.messages.get(1)) {
-        assert_eq!(n.id, t.id, "After starts right after the anchor");
-    }
+    // The anchor's successors are known from the tail: After must return
+    // exactly them, in order (a message arriving meanwhile may follow them
+    // when the tail had fewer than five).
+    let expected: Vec<MsgId> = tail.messages.iter().skip(1).take(5).map(|m| m.id).collect();
+    let got: Vec<MsgId> = newer.messages.iter().map(|m| m.id).collect();
+    assert!(
+        got.starts_with(&expected),
+        "After returns the anchor's successors: {got:?} vs {expected:?}"
+    );
     tail.messages.last().map(|m| m.id)
+}
+
+/// Builds a new instance from the retired one's snapshot, carrying `chat`
+/// as core does for an open window, and proves it usable: a baseline, and
+/// `chat` addressable without a dialogs reload, still holding `newest`.
+async fn check_rebuild<B: Backend>(
+    backend: &B,
+    snapshot: SessionSnapshot,
+    chat: ChatId,
+    newest: Option<MsgId>,
+) -> SessionSnapshot {
+    let seed = Seed {
+        session: SessionSeed::Live(snapshot),
+        peers: CarriedPeers::new([chat]),
+    };
+    let Instance {
+        client,
+        mut updates,
+        runner,
+        control,
+    } = backend
+        .build(seed)
+        .await
+        .expect("rebuild from the snapshot");
+    let runner = tokio::spawn(runner);
+    let first = tokio::time::timeout(BASELINE_WAIT, updates.next())
+        .await
+        .expect("baseline after a rebuild")
+        .expect("stream");
+    assert!(matches!(first, StreamItem::Baseline));
+    let tail = client
+        .history(chat, HistoryQuery::Tail, HISTORY)
+        .await
+        .expect("the carried chat is addressable after a rebuild");
+    assert_history(&tail.messages, chat, HISTORY);
+    if let Some(id) = newest {
+        assert!(tail.messages.iter().any(|m| m.id == id), "same history");
+    }
+    control.quit();
+    tokio::time::timeout(RUNNER_WAIT, runner)
+        .await
+        .expect("the rebuilt runner stops after quit")
+        .expect("the rebuilt runner did not panic");
+    control.retire()
 }
 
 /// One logical send, attempted twice with the same `random_id`, is one message.
@@ -201,11 +257,13 @@ pub(crate) async fn run<B: Backend>(backend: &B, target: Option<ChatId>, sends: 
         .expect("the runner stops after quit")
         .expect("the runner did not panic");
     let snapshot = control.retire();
-    assert!(snapshot.rev().is_ok(), "a usable snapshot");
+    let rev = snapshot.rev().expect("a readable snapshot");
     consumer.abort();
     if let Err(e) = consumer.await {
         assert!(e.is_cancelled(), "the stream consumer panicked");
     }
+    let again = check_rebuild(backend, snapshot, chat, newest).await;
+    assert!(again.rev().expect("a readable snapshot") >= rev);
 }
 
 #[cfg(feature = "fake")]
@@ -213,8 +271,9 @@ pub(crate) async fn run<B: Backend>(backend: &B, target: Option<ChatId>, sends: 
 async fn fake_backend_passes_the_contract() {
     let (backend, fake) = super::fake::FakeBackend::new(super::fake::FakeScript::demo(25, 30));
     run(&backend, None, Sends::Check).await;
-    assert_eq!(fake.retired(), 1);
-    assert_eq!(fake.runners_finished(), 1);
+    assert_eq!(fake.builds(), 2, "the suite rebuilds once");
+    assert_eq!(fake.retired(), 2);
+    assert_eq!(fake.runners_finished(), 2);
 }
 
 /// Needs `ABYSS_API_ID` and a signed-in session in the Keychain. With
