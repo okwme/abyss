@@ -1,42 +1,34 @@
-use gpui::{App, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*, px, size};
+//! abyss: a minimal-attack-surface Telegram client for macOS.
+
+mod launch;
+mod logging;
+mod shell;
+mod ui;
+
+use gpui::App;
 use gpui_platform::application;
 
-struct Root;
-
-impl Render for Root {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<'_, Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .justify_center()
-            .items_center()
-            .child("abyss")
-    }
-}
-
 fn main() {
-    application().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
-        let opened = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| Root),
-        );
-        if let Err(err) = opened {
-            report_startup_error(&err);
-            cx.quit();
-            return;
+    logging::init();
+    let launch = launch::resolve(std::env::args_os(), |name| std::env::var_os(name));
+    application().run(move |cx: &mut App| {
+        cx.bind_keys(ui::text_input::key_bindings());
+        cx.bind_keys(shell::key_bindings());
+        cx.set_menus(shell::menus());
+        // Single-window app: once the window is gone (after shutdown, or on
+        // the error screen), quit.
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        match shell::open(launch, cx) {
+            Ok(()) => cx.activate(true),
+            Err(error) => {
+                tracing::error!(%error, "failed to open the main window");
+                cx.quit();
+            }
         }
-        cx.activate(true);
     });
-}
-
-#[expect(
-    clippy::print_stderr,
-    reason = "no logger exists before the first window; tracing lands with plan section 11"
-)]
-fn report_startup_error(err: &dyn std::fmt::Display) {
-    eprintln!("abyss: failed to open main window: {err:#}");
 }
