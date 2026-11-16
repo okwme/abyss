@@ -78,12 +78,12 @@ pub enum WorkerError {
 }
 
 impl CacheHandle {
-    /// Opens the cache and starts the worker thread `tgx-cache`.
+    /// Opens the cache and starts the worker thread `abyss-cache`.
     pub fn spawn(dir: PathBuf, key: &CacheKey) -> Result<CacheHandle, CacheError> {
         let cache = Cache::open(&dir, key)?;
         let (tx, rx) = mpsc::channel(CACHE_QUEUE);
         std::thread::Builder::new()
-            .name("tgx-cache".into())
+            .name("abyss-cache".into())
             .spawn(move || run(cache, &dir, rx))
             .map_err(CacheError::Io)?;
         Ok(CacheHandle { tx })

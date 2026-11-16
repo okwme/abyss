@@ -3,6 +3,34 @@
 version = 4
 
 [[package]]
+name = "abyss"
+version = "0.1.0"
+dependencies = [
+ "abyss-core",
+ "gpui",
+ "gpui_platform",
+]
+
+[[package]]
+name = "abyss-core"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "grammers-client",
+ "grammers-mtsender",
+ "grammers-session",
+ "libc",
+ "postcard",
+ "proptest",
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "zeroize",
+]
+
+[[package]]
 name = "accesskit"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5232,34 +5260,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "tgx"
-version = "0.1.0"
-dependencies = [
- "gpui",
- "gpui_platform",
- "tgx-core",
-]
-
-[[package]]
-name = "tgx-core"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.4.3",
- "grammers-client",
- "grammers-mtsender",
- "grammers-session",
- "libc",
- "postcard",
- "proptest",
- "rusqlite",
- "serde",
- "tempfile",
- "tokio",
- "tokio-util",
- "zeroize",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-//! Starting core: a dedicated `tgx-core` OS thread running a small multi-thread
+//! Starting core: a dedicated `abyss-core` OS thread running a small multi-thread
 //! tokio runtime, plus the handle the UI talks to.
 
 use std::path::PathBuf;
@@ -157,7 +157,7 @@ pub fn start(config: CoreConfig, backend: BackendChoice) -> Result<CoreHandle, S
 fn start_with<B: Backend>(config: CoreConfig, backend: B) -> Result<CoreHandle, StartError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKERS)
-        .thread_name("tgx-rt")
+        .thread_name("abyss-rt")
         .enable_all()
         .build()
         .map_err(StartError::Runtime)?;
@@ -180,7 +180,7 @@ fn start_with<B: Backend>(config: CoreConfig, backend: B) -> Result<CoreHandle, 
     );
     let token = cancel.clone();
     std::thread::Builder::new()
-        .name("tgx-core".into())
+        .name("abyss-core".into())
         .spawn(move || {
             let report = runtime.block_on(async move {
                 // Spawned so a panic in the actor itself is contained and reported.

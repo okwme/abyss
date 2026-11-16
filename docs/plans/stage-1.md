@@ -1,4 +1,4 @@
-# tgx Stage 1 plan: login, chat list, text messages
+# abyss Stage 1 plan: login, chat list, text messages
 
 Status: **v3.1** (2026-11-16). This document is self-contained. It has been through three GPT-6 Astra review rounds; round 3's verdict was "ready after fixes", and v3.1 applies them (section 15).
 
@@ -28,9 +28,9 @@ Design principle: **persist little, recover one way.** Only the critical login s
 ## 1. Crates and threading
 
 ```
-crates/core  (tgx-core)  no GPUI. Owns the core thread + tokio runtime, backend, client lifecycle,
+crates/core  (abyss-core)  no GPUI. Owns the core thread + tokio runtime, backend, client lifecycle,
                          in-memory store, persistence worker, domain model.
-crates/app   (tgx)       GPUI only. Views and view-models; talks to core only through CoreHandle.
+crates/app   (abyss)       GPUI only. Views and view-models; talks to core only through CoreHandle.
 ```
 
 ```rust
@@ -54,7 +54,7 @@ pub enum Event   { Auth(AuthState), Connection(ConnState), DialogsReset(Vec<Chat
 
 `BackendChoice` is either `Grammers(Credentials)` or `Fake(FakeScript)`. `Fake` exists only with the `fake` cargo feature (section 12).
 
-**Core thread.** `start` spawns an OS thread named `tgx-core`. That thread builds a 2-worker tokio runtime, runs `rt.block_on(supervisor(..))`, then calls `rt.shutdown_timeout(1s)`. That call is legal there because the thread has already left the runtime's async context.
+**Core thread.** `start` spawns an OS thread named `abyss-core`. That thread builds a 2-worker tokio runtime, runs `rt.block_on(supervisor(..))`, then calls `rt.shutdown_timeout(1s)`. That call is legal there because the thread has already left the runtime's async context.
 
 The GPUI main thread never blocks on core. Dropping `CoreHandle` cancels the token and detaches the thread; it never joins.
 
@@ -86,7 +86,7 @@ Release builds keep `panic = "unwind"`.
 One "client instance" is `{ Session object, SenderPool runner task, Client, UpdateStream task }`, tagged with a `ClientGen`.
 
 **Build.**
-1. Create a **fresh** `TgxSession` object (section 3), seeded from:
+1. Create a **fresh** `AbyssSession` object (section 3), seeded from:
    - at process startup only, the critical state loaded from the Keychain;
    - on an in-process rebuild, the **live critical snapshot** from the retired instance (section 3). The Keychain is never re-read during a rebuild, so a `SignedInUnsaved` status and pending durability results carry over. The bounded carried `PeerRef` set is seeded as well.
 2. `SenderPool::with_configuration(session, api_id, params)`. `params` sets `retry_policy: NoRetries` (`G/grammers-mtsender/src/configuration.rs:61, 106`) and `updates_channel_capacity: 1024` (`configuration.rs:63-66`; the default is 100, `:156`).
@@ -104,7 +104,7 @@ How grammers sets the baseline:
 
 So:
 1. Create the stream and spawn the consumer task **first**. Its first `next()` call starts `getState`.
-2. `TgxSession::set_update_state` signals `BaselineEstablished` on its first `UpdateState::All` for this instance. That call site is the only one we reach, because we never call `sync_update_state` (`updates_receiver.rs:244`).
+2. `AbyssSession::set_update_state` signals `BaselineEstablished` on its first `UpdateState::All` for this instance. That call site is the only one we reach, because we never call `sync_update_state` (`updates_receiver.rs:244`).
 3. Bootstrap waits for that signal, for at most 10 s. A timeout counts as a stall, which triggers a rebuild.
 4. While bootstrap runs, the consumer **buffers** decoded updates instead of applying them. The buffer is capped at 4,096 updates; overflow aborts this bootstrap and rebuilds.
 5. After the baseline, fetch the snapshots: the first page of dialogs, then the tail of each open chat. Then apply the buffered updates **merged over** the snapshots:
@@ -133,7 +133,7 @@ Tests: a new message, an edit and a delete each arriving during bootstrap (befor
 3. Send `pool.handle.quit()` (`sender_pool.rs:175`) and await the runner `JoinHandle`, capped at 5 s.
    - A clean `run()` returns only after clearing connections and `join_all` (`sender_pool.rs:324-325`).
    - If the cap expires, call `abort()`, then **await the `JoinHandle` again** until it reports completion or cancellation. `abort()` only schedules the cancellation. Dropping the runner future also drops its `JoinSet`, which aborts the connection tasks without joining them. Those tasks (`run_sender`, `sender_pool.rs:524+`) never touch the session. Only runner methods write DC options: `create_connection` at `:394` and `update_config` at `:472-518`. So once the runner future has completed or been dropped, grammers can't make any more critical writes.
-4. Revoke the retired `TgxSession`'s write token. Any late call into it is dropped (section 3).
+4. Revoke the retired `AbyssSession`'s write token. Any late call into it is dropped (section 3).
 5. Capture the live critical snapshot and the carried `PeerRef` set: the open chats (at most 8) plus the peers of entries in the pending-send table (at most 256).
 6. Only now drop the `Client` and `UpdateStream` and **recycle parked permits**. Requests left in grammers' queues have already received `InvocationError::Dropped` (`sender_pool.rs:156-159`).
 7. Build again (section 2, "Build") with exponential backoff: 1 s up to 60 s plus jitter, reset after 5 minutes of stable operation.
@@ -187,9 +187,9 @@ struct SelfUser { id: i64, access_hash: i64, bot: bool }
 - There's no peer cache, no update state, no periodic snapshot and no ticker.
 - Peers and update state live in memory and die with the client instance. The one exception is the bounded carried `PeerRef` set (section 2, rebuild step 5), which is passed to the next instance.
 - Format: postcard with a `version: u16` prefix. An unknown version is discarded, which forces a new login.
-- Item: Keychain generic password, service `dev.tgx.session`, never iCloud-synced. The crate is `security-framework` (`passwords::{set,get,delete}_generic_password`), the same backend `keyring` uses on macOS, minus the cross-platform layer.
+- Item: Keychain generic password, service `dev.abyss.session`, never iCloud-synced. The crate is `security-framework` (`passwords::{set,get,delete}_generic_password`), the same backend `keyring` uses on macOS, minus the cross-platform layer.
 
-**`TgxSession: grammers_session::Session`.** `SessionData` and `MemorySession` can't export their data (`G/grammers-session/src/storages/memory.rs:23`), so we write our own.
+**`AbyssSession: grammers_session::Session`.** `SessionData` and `MemorySession` can't export their data (`G/grammers-session/src/storages/memory.rs:23`), so we write our own.
 
 - **Critical fields** live in an account-level `CriticalCell`, owned by the actor, that outlives client instances:
 
@@ -199,7 +199,7 @@ struct SelfUser { id: i64, access_hash: i64, bot: bool }
   ```
 
   - **`AccountGen`** is the persistence generation. It starts at login (or at process startup with a loaded item) and ends at logout. It is separate from `ClientGen`: rebuilds don't change it, and `rev` keeps increasing across rebuilds within one `AccountGen`.
-  - **Write tokens.** Each `TgxSession` instance holds a write token for the cell. The token is revoked at retirement (section 2, rebuild step 4), so a late mutation from a retired instance is dropped. The new instance gets a fresh token and starts from the same cell. That is the "live critical snapshot".
+  - **Write tokens.** Each `AbyssSession` instance holds a write token for the cell. The token is revoked at retirement (section 2, rebuild step 4), so a late mutation from a retired instance is dropped. The new instance gets a fresh token and starts from the same cell. That is the "live critical snapshot".
   - **Revisions.** Every critical mutation, *under the cell lock*, applies the change and serializes the state. **Only if the bytes differ from `last_blob`** does it increment `rev`, store `last_blob`, set `Pending{rev}` and send `PersistMsg::Write { gen, rev, blob }`. An identical mutation leaves `rev` unchanged. This covers the runner re-setting the same DC option on every reconnect (`create_connection` copies the stored option, sets the same auth key and calls `set_dc_option`; `sender_pool.rs:386-394`).
   - **Already-loaded state.** At startup, the state loaded from the Keychain becomes `rev = 0`, `last_blob = loaded bytes`, `Durable{0}`. A Barrier on `rev = 0` resolves `Ok` immediately.
   - Critical mutations are `set_home_dc_id`, `set_dc_option` (called by the runner when it creates a connection, `sender_pool.rs:394`, and on config refresh, `:518`), and `cache_peer` of the self user. `complete_login` caches the self user with `is_self: Some(true)` (`auth.rs:113-131`), and that makes the login critical.
@@ -297,7 +297,7 @@ pub enum AuthState { MissingCredentials, Connecting,
    - `remote` is `Revoked`, `Failed(reason)` or `TimedOut`.
    - `local` is `Deleted` or `Failed(err)`.
    - The UI reports the two separately. If `local` failed, it shows **Logout incomplete** with a retry, and never "logged out". If `remote` failed, it tells the user to end the session from Active Sessions on another device.
-7. The next login uses a fresh `TgxSession` and a new `gen`.
+7. The next login uses a fresh `AbyssSession` and a new `gen`.
 
 **Shutdown.** GPUI waits at most 200 ms for `on_app_quit` futures (`SHUTDOWN_TIMEOUT`, `Z/src/app.rs:78-80`), so shutdown starts earlier:
 - Window close is intercepted by `window.on_window_should_close` (`Z/src/window.rs:7352`). It returns `false` while core is running.
@@ -459,9 +459,9 @@ GPUI has no text-field widget at this commit. `Z/examples/input.rs` (912 lines) 
 
 ## 11. Logging
 
-- `tracing` + `tracing-subscriber` with `EnvFilter`. The default is `warn,tgx=info,tgx_core=info`. Output goes to stderr only, with no log files.
+- `tracing` + `tracing-subscriber` with `EnvFilter`. The default is `warn,abyss=info,abyss_core=info`. Output goes to stderr only, with no log files.
 - **All `grammers*` events are dropped** by a per-layer `filter_fn` on the target prefix, with no allowlist. The reason: grammers' send-failure path clones and logs the whole `Updates` at WARN (`G/grammers-client/src/client/messages.rs:664-672`).
-  - In debug builds, `TGX_DEBUG_PROTOCOL=1` lifts the filter.
+  - In debug builds, `ABYSS_DEBUG_PROTOCOL=1` lifts the filter.
   - Follow-up: an upstream patch moving payload dumps to TRACE.
 - **Our own sanitized events** cover RPC error *names* and codes, durations, ids, `ClientGen`/`ConnState` changes, rebuild causes, and persistence outcomes.
 - A `Redacted<T>` wrapper prints `<redacted>`. Phone numbers, codes, passwords, message text, titles and usernames are never logged.
@@ -472,17 +472,17 @@ GPUI has no text-field widget at this commit. `Z/examples/input.rs` (912 lines) 
 ## 12. Build, features, testing, CI
 
 - **Features:**
-  - `tgx-core`: `fake = []`.
-  - `tgx`: `fake = ["tgx-core/fake"]` and `runtime-shaders = ["gpui_platform/runtime_shaders"]` (default).
+  - `abyss-core`: `fake = []`.
+  - `abyss`: `fake = ["abyss-core/fake"]` and `runtime-shaders = ["gpui_platform/runtime_shaders"]` (default).
   - Nothing toggles by profile.
 - **Aliases** in `.cargo/config.toml`:
-  - `cargo dev` = `run -p tgx --features fake -- --fake`
+  - `cargo dev` = `run -p abyss --features fake -- --fake`
   - `cargo t` = `test --workspace --features fake`
-- **Production build:** `cargo build --release -p tgx --no-default-features`. It has precompiled shaders (which needs the Metal toolchain) and no fake backend. CI checks that `fake` is absent with `cargo tree -e features`.
-- **Credentials:** `TGX_API_ID` / `TGX_API_HASH` are read at runtime only. If they're missing, the app shows a full-window error screen naming them. `--fake` skips credentials.
+- **Production build:** `cargo build --release -p abyss --no-default-features`. It has precompiled shaders (which needs the Metal toolchain) and no fake backend. CI checks that `fake` is absent with `cargo tree -e features`.
+- **Credentials:** `ABYSS_API_ID` / `ABYSS_API_HASH` are read at runtime only. If they're missing, the app shows a full-window error screen naming them. `--fake` skips credentials.
 - **GPUI tests:** the app's dev-dependency is `gpui = { workspace = true, features = ["test-support"] }`, which provides `TestAppContext` (`Z/src/app.rs:69-75`).
 - **Lints:**
-  - `tgx-core` non-test code denies `clippy::unwrap_used`, `expect_used`, `panic` and `indexing_slicing`.
+  - `abyss-core` non-test code denies `clippy::unwrap_used`, `expect_used`, `panic` and `indexing_slicing`.
   - `clippy.toml` sets `too-many-lines-threshold = 70`.
   - CI runs `-D warnings`.
 - **Contract suite:** `contract::run(impl Backend)` runs against `FakeBackend` in CI, and against `GrammersBackend` under `#[ignore]` once credentials exist.
@@ -494,9 +494,9 @@ GPUI has no text-field widget at this commit. `Z/examples/input.rs` (912 lines) 
 
 1. **Repo hygiene.** Add the toolchain pin, lints, aliases, CI, LICENSE (Apache-2.0) and NOTICE, and `git init` once the repo location is chosen. *Done when:* CI is green and both feature configurations build.
 2. **Domain model, normalization, store** (pure code). *Done when:* the formatting proptests, the headless `with_runs` test, and the bound, LRU and byte-budget tests pass.
-3. **Core skeleton:** core thread, actor (admission, generations, parked permits), control plane, `FakeBackend` with fault injection. *Done when:* the admission, stale-completion and panic-containment tests pass, and `cargo tree -p tgx-core` shows no gpui.
+3. **Core skeleton:** core thread, actor (admission, generations, parked permits), control plane, `FakeBackend` with fault injection. *Done when:* the admission, stale-completion and panic-containment tests pass, and `cargo tree -p abyss-core` shows no gpui.
 4. **Client lifecycle:** build, rebuild and reconcile. *Done when:* every fault-injection test in section 2 passes, and the parked permits are released by rebuild.
-5. **Persistence:** `TgxSession`, worker, `SecretStore`s. *Done when:* every section 3 test passes.
+5. **Persistence:** `AbyssSession`, worker, `SecretStore`s. *Done when:* every section 3 test passes.
 6. **Login, logout, shutdown** state machines. *Done when:* every section 4 and section 5 test passes.
 7. **App bridge:** auth router, missing-credentials screen, `Quit` action, the should-close hook. *Done when:* `cargo dev` goes from login to the chat list, and closing shows "Closing…" then exits, or shows the unconfirmed-save message when `FaultyStore` stalls.
 8. **Text input:** normal, composer and password. *Done when:* the section 10 tests pass, and manual Pinyin/Japanese IME testing works in the composer.
@@ -509,9 +509,9 @@ GPUI has no text-field widget at this commit. `Z/examples/input.rs` (912 lines) 
     - send and receive work;
     - the app recovers from sleep and wake;
     - a remote session revocation wipes the local session;
-    - after logout, `security find-generic-password -s dev.tgx.session` fails.
+    - after logout, `security find-generic-password -s dev.abyss.session` fails.
 
-**Task 3 status (2026-11-16): done.** Implemented the core thread, the actor (admission, parked permits, `ClientGen`/`ViewGen` staleness, single-flight history and dialogs, coalesced read marks, sends with retries), `FakeBackend` with fault injection, and the cache worker (section 16), with the cache wired into OpenChat, scrolling and live updates. Verified: fmt, clippy in both feature configs, 77 core tests, and no gpui in `cargo tree -p tgx-core`.
+**Task 3 status (2026-11-16): done.** Implemented the core thread, the actor (admission, parked permits, `ClientGen`/`ViewGen` staleness, single-flight history and dialogs, coalesced read marks, sends with retries), `FakeBackend` with fault injection, and the cache worker (section 16), with the cache wired into OpenChat, scrolling and live updates. Verified: fmt, clippy in both feature configs, 77 core tests, and no gpui in `cargo tree -p abyss-core`.
 
 Deviations:
 - `BackendChoice::Fake` takes a `FakeBackend`, not a `FakeScript`, so tests keep the `FakeHandle`.
@@ -599,7 +599,7 @@ Open for task 4:
 History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This supersedes the "nothing on disk except the Keychain item" property in sections 3 and 9. The new property: **nothing plaintext on disk; everything on disk is undecryptable without a device-only Keychain key.**
 
 - **Engine:** SQLite + SQLCipher via `rusqlite` `bundled-sqlcipher`. On macOS this links CommonCrypto/Security.framework, not OpenSSL (`libsqlite3-sys` build.rs: `SQLCIPHER_CRYPTO_CC` when no `OPENSSL_DIR` is set). `Cache::open` asserts `PRAGMA cipher_provider = commoncrypto`, so a build that silently picked up OpenSSL fails closed.
-- **Key:** 256-bit random (`getrandom`), handed to SQLCipher through `sqlite3_key_v2` as a raw key (`x'..'`, no KDF) from a fixed-size zeroizing buffer, so no SQL string ever contains it. `cipher_memory_security` is enabled before keying. Keychain reads hand over a `Zeroizing<[u8; 32]>`. Stored as its own Keychain item (`dev.tgx.cachekey`, device-only, non-synchronizable) through the `SecretStore`/persistence worker, separate from the session item.
+- **Key:** 256-bit random (`getrandom`), handed to SQLCipher through `sqlite3_key_v2` as a raw key (`x'..'`, no KDF) from a fixed-size zeroizing buffer, so no SQL string ever contains it. `cipher_memory_security` is enabled before keying. Keychain reads hand over a `Zeroizing<[u8; 32]>`. Stored as its own Keychain item (`dev.abyss.cachekey`, device-only, non-synchronizable) through the `SecretStore`/persistence worker, separate from the session item.
 - **Pragmas:** `cipher_memory_security = ON`, `temp_store = MEMORY` (no plaintext temp files), `secure_delete = ON`, WAL (the WAL is encrypted too).
 - **Location:** a 0700 directory in Application Support (later the sandbox container), excluded from backups with the same sticky xattr `tmutil addexclusion` writes.
 - **Contents:** only our validated domain model (`postcard`). Bodies over 64 KiB are filtered in SQL (`length(body)`), so they never reach Rust memory. Every decoded row must match its SQL key (message id, chat) and pass `is_valid()` (sanitized names, bounded previews and service text); the same check gates writes. Decoding re-validates `RichText` invariants (`#[serde(try_from)]`), so a corrupted or tampered row can never reach `StyledText::with_runs`. Bad rows are deleted and skipped.

@@ -24,9 +24,9 @@ jobs:
       - run: rustup show
       # Release builds ship precompiled shaders, which need Xcode's Metal toolchain.
       - run: xcodebuild -downloadComponent MetalToolchain
-      - run: cargo build --release -p tgx --no-default-features
+      - run: cargo build --release -p abyss --no-default-features
       - name: Fake backend must not be in the production feature graph
         run: |
-          if cargo tree -p tgx --no-default-features -e features | grep -q 'tgx-core feature "fake"'; then
+          if cargo tree -p abyss --no-default-features -e features | grep -q 'abyss-core feature "fake"'; then
             echo "fake feature leaked into production build"; exit 1
           fi

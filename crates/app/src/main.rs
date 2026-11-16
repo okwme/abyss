@@ -10,7 +10,7 @@ impl Render for Root {
             .flex()
             .justify_center()
             .items_center()
-            .child("tgx")
+            .child("abyss")
     }
 }
 
@@ -38,5 +38,5 @@ fn main() {
     reason = "no logger exists before the first window; tracing lands with plan section 11"
 )]
 fn report_startup_error(err: &dyn std::fmt::Display) {
-    eprintln!("tgx: failed to open main window: {err:#}");
+    eprintln!("abyss: failed to open main window: {err:#}");
 }

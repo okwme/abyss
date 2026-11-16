@@ -75,7 +75,7 @@ too_many_lines = "warn"
 
 # Pedantic lints that don't fit this application.
 must_use_candidate = "allow"  # noise on getters; #[must_use] goes where dropping is a bug
-missing_errors_doc = "allow"  # application code; tgx-core's API has one in-workspace caller
+missing_errors_doc = "allow"  # application code; abyss-core's API has one in-workspace caller
 missing_panics_doc = "allow"  # non-test code cannot panic: the panicking lints are denied
 
 [profile.release]

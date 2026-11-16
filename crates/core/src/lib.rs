@@ -1,4 +1,4 @@
-//! tgx-core: Telegram client core. No UI dependencies.
+//! abyss-core: Telegram client core. No UI dependencies.
 
 mod actor;
 pub mod api;
