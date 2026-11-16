@@ -812,6 +812,19 @@ Open items:
   - The users-plus-chats budget of 16 × limit + 16 rejects legitimate responses, such as a service message adding 32 users. Bound auxiliary peers by `MAX_DIRECTORY` instead.
   - **Direction for 11c:** core owns the required-peer set and tells the backend exactly which peers to keep pinned: retained dialogs, open windows and pending sends. The backend stops guessing.
 
+- **Round 8 (code review of task 6, 2026-11-16).**
+  - **Auth-machine findings, sent to task 6b:**
+    - A failed probe is treated as signed out.
+    - Auth outcomes aren't generation-tagged or joined on retirement.
+    - Revocation during login doesn't tear down.
+    - Auth calls bypass admission.
+  - **Open for task 6c (after 4b and 6b merge):**
+    - **High:** a retained cache (key-delete failed, or the session is missing or corrupt) is opened while signed out and can show the previous account's history after the next login. Bind the cache to a verified account id, and quarantine it until that id is verified or the cache is erased.
+    - **High:** the second-migration relogin reuses the retired snapshot, cache and pending sends. Do a full account teardown, or constrain relogin to the same verified account.
+    - A failed logout is forgotten and shown as "Signed out". Keep an incomplete-logout state with Retry, report it at shutdown, and use the copy "Logout incomplete".
+    - Startup waits ignore cancellation, so a stalled Keychain blocks the shutdown acknowledgement. Make them cancellation-aware.
+    - Tests: seed recognizable old auth keys and assert they are absent after logout. Add shutdown with a full *command* queue.
+
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 
 History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This supersedes the "nothing on disk except the Keychain item" property in sections 3 and 9. The new property: **nothing plaintext on disk; everything on disk is undecryptable without a device-only Keychain key.**
