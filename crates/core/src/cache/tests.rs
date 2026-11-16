@@ -467,3 +467,30 @@ fn eviction_uses_index_not_table_scan() {
         .unwrap();
     assert!(plan.contains("cached_chats_lru"), "plan: {plan}");
 }
+
+/// Task 6c: a cache is served only to the account it is bound to.
+#[test]
+fn bind_claims_an_empty_cache_and_refuses_another_account() {
+    let (_t, dir, key) = setup();
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert_eq!(db.bind(None).unwrap(), Binding::Blank);
+    assert_eq!(db.bind(Some(7)).unwrap(), Binding::Claimed);
+    db.put_messages(user(1), &[msg(user(1), 1, "a")]).unwrap();
+    assert_eq!(db.bind(Some(7)).unwrap(), Binding::Same);
+    assert_eq!(db.bind(Some(8)).unwrap(), Binding::Foreign);
+    assert_eq!(db.bind(None).unwrap(), Binding::Foreign, "owned");
+    drop(db);
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert_eq!(db.bind(Some(7)).unwrap(), Binding::Same, "persisted");
+}
+
+/// Rows without a recorded owner (a cache from before binding) belong to
+/// nobody that can be verified.
+#[test]
+fn unowned_rows_are_foreign() {
+    let (_t, dir, key) = setup();
+    let mut db = Cache::open(&dir, &key).unwrap();
+    db.put_chats(&[summary(user(1), "x")]).unwrap();
+    assert_eq!(db.bind(Some(7)).unwrap(), Binding::Foreign);
+    assert_eq!(db.bind(None).unwrap(), Binding::Foreign);
+}

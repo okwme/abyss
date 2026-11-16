@@ -93,6 +93,9 @@ pub(super) enum LogoutStage {
     Remote,
     /// Deleting the session item, then crypto-erasing the cache.
     Local,
+    /// The local step failed: "Logout incomplete" until a Retry succeeds.
+    /// No instance, no login.
+    Unfinished,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,7 +545,7 @@ impl<B: Backend> Actor<B> {
             After::Halt => {
                 self.life.phase = Phase::Halted;
                 self.emit(Event::Connection(ConnState::Offline)).await;
-                self.require_relogin().await;
+                self.abandon_account().await;
             }
         }
     }
@@ -635,6 +638,9 @@ impl<B: Backend> Actor<B> {
             let shutdown = self.cancel.clone();
             retire(live, SHUTDOWN_CAPS, &shutdown).await;
             out.retired &= Instant::now() <= deadline;
+        }
+        if out.logout.is_none() {
+            out.logout = self.unfinished_logout_status();
         }
         out
     }

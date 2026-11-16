@@ -21,8 +21,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::Actor;
-use super::binding::{Rebinding, finish_rebinding};
 use super::apply::user_error;
+use super::binding::{Rebinding, finish_rebinding};
 use super::jobs::CallError;
 use super::lifecycle::{LogoutStage, Phase, REBUILD_CAPS, Retired, Step, retire};
 use crate::api::{
@@ -213,6 +213,12 @@ pub(crate) async fn open_cache(
 
 impl<B: Backend> Actor<B> {
     pub(super) async fn on_logout_command(&mut self) {
+        if self.life.phase == Phase::LoggingOut(LogoutStage::Unfinished) {
+            let remote = self
+                .unfinished_logout
+                .map_or(RemoteLogout::NotAttempted, |(remote, _)| remote);
+            return self.retry_logout(remote).await;
+        }
         let plan = if self.auth.signed_in {
             RemotePlan::Attempt
         } else {
@@ -291,12 +297,15 @@ impl<B: Backend> Actor<B> {
     fn local_step(&mut self) -> impl Future<Output = LocalDone> + Send + 'static {
         let persist = self.persist.clone();
         let account = self.account.generation().ok();
-        let cache = self.cache.take();
-        let parts = self
-            .cache_parts
-            .as_mut()
-            .map(|p| (p.dir.clone(), p.key.take()));
-        delete_local(persist, account, cache, parts)
+        let served = self.cache.take();
+        let (open, parts) = match self.cache_parts.as_mut() {
+            Some(p) => (
+                p.take_open(served),
+                Some((p.dir.clone(), p.rebinding.take())),
+            ),
+            None => (None, None),
+        };
+        delete_local(persist, account, open, parts)
     }
 
     /// Shutdown: runs the local step inline, bounded by `deadline`.
@@ -319,18 +328,23 @@ impl<B: Backend> Actor<B> {
     }
 
     /// The local step finished: start a fresh account generation and build a
-    /// signed-out instance for the next login (plan section 5, step 7).
+    /// signed-out instance for the next login (plan section 5, step 7). A
+    /// failed deletion instead stays "Logout incomplete" (no instance, no
+    /// login) until a Retry deletes everything.
     pub(super) async fn finish_logout(&mut self, done: LocalDone) {
         let remote = self
             .logout_remote
             .take()
             .unwrap_or(RemoteLogout::NotAttempted);
-        if let Some((handle, key)) = done.cache {
-            self.cache = Some(handle);
-            if let Some(parts) = self.cache_parts.as_mut() {
-                parts.key = Some(key);
-            }
+        // The next account's cache is quarantined until a login binds it.
+        if let (Some((handle, key)), Some(parts)) = (done.cache, self.cache_parts.as_mut()) {
+            parts.quarantined = Some(handle);
+            parts.key = Some(key);
         }
+        if let LocalDeletion::Failed(_) = done.local {
+            return self.logout_unfinished(remote, done.local).await;
+        }
+        self.unfinished_logout = None;
         self.account = self.persist.fresh_session();
         self.backend.use_account(self.account.clone());
         self.forget_instance_session();
@@ -339,6 +353,42 @@ impl<B: Backend> Actor<B> {
         let local = done.local;
         self.set_auth(AuthState::LoggedOut { remote, local }).await;
         self.start_build(Duration::ZERO);
+    }
+
+    /// The local deletion failed: the session item or the cache key may
+    /// remain. No instance is built and no login is accepted until a Retry
+    /// (`Command::Logout`) deletes them; shutdown reports it.
+    async fn logout_unfinished(&mut self, remote: RemoteLogout, local: LocalDeletion) {
+        tracing::warn!("logout incomplete: local data remains");
+        self.unfinished_logout = Some((remote, local));
+        self.life.phase = Phase::LoggingOut(LogoutStage::Unfinished);
+        self.auth.reset_signed_out();
+        self.set_auth(AuthState::LoggedOut { remote, local }).await;
+    }
+
+    /// Retry of an incomplete logout: the local step only. The remote result
+    /// of the first attempt is the one reported.
+    async fn retry_logout(&mut self, remote: RemoteLogout) {
+        self.set_auth(AuthState::LoggingOut).await;
+        self.note_remote_logout(remote);
+        self.life.phase = Phase::LoggingOut(LogoutStage::Local);
+        let local = self.local_step();
+        *self.life.step_mut() = Some(tokio::spawn(async move { Step::Deleted(local.await) }));
+    }
+
+    /// An incomplete logout, for the shutdown report.
+    pub(super) fn unfinished_logout_status(&self) -> Option<LogoutStatus> {
+        self.unfinished_logout
+            .map(|(remote, local)| LogoutStatus::Done { remote, local })
+    }
+
+    /// A second migration (plan section 2): the account is torn down like a
+    /// logout without the remote call (the instance is already retired), so
+    /// the next login, possibly to another account, starts from a fresh
+    /// generation, an erased cache and no pending sends.
+    pub(super) async fn abandon_account(&mut self) {
+        self.auth.phone_error = Some(UserError::AccountMigrated);
+        self.start_logout(RemotePlan::Skip).await;
     }
 
     /// Forgets everything of the old account: chats, windows, pending sends

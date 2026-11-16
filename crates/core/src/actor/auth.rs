@@ -184,8 +184,16 @@ pub(super) enum AuthStep<C: Client> {
 
 /// Messages from login and credential tasks to the actor.
 pub(super) enum AuthMsg<C: Client> {
-    Step { tag: AuthTag, step: AuthStep<C> },
-    Cred { attempt: AttemptId, done: CredDone },
+    Step {
+        tag: AuthTag,
+        step: AuthStep<C>,
+    },
+    Cred {
+        attempt: AttemptId,
+        done: CredDone,
+    },
+    /// A background cache re-binding finished (see `binding`).
+    CacheSettled,
 }
 
 /// The running login task.
@@ -594,15 +602,6 @@ impl<B: Backend> Actor<B> {
         });
     }
 
-    /// After a repeated migration: the user signs in again (plan section 2).
-    pub(super) async fn require_relogin(&mut self) {
-        self.auth.reset_signed_out();
-        self.set_auth(AuthState::Phone {
-            error: Some(UserError::AccountMigrated),
-        })
-        .await;
-    }
-
     /// A login command while a reconciliation is pending: the probe answers
     /// first (started now if it is waiting for a retry).
     async fn await_reconcile(&mut self) {
@@ -918,6 +917,9 @@ impl<B: Backend> Actor<B> {
             }
         };
         self.set_auth(state).await;
+        // Before the bootstrap writes anything: rows are served only from a
+        // cache bound to this account.
+        self.bind_cache().await;
         if self.life.phase == Phase::SignedOut {
             self.start_bootstrap();
         }

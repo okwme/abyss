@@ -190,8 +190,9 @@ impl FakeClient {
     /// Caches the self user like grammers' `complete_login`: a critical write.
     async fn cache_self(&self) -> Result<(), AuthError> {
         let session = &self.session;
+        let id = self.shared.with(|s| s.auth.login.self_id);
         let info = PeerInfo::User {
-            id: FAKE_SELF_ID,
+            id,
             auth: Some(PeerAuth::from_hash(FAKE_SELF_HASH)),
             bot: Some(false),
             is_self: Some(true),
@@ -362,6 +363,11 @@ impl FakeHandle {
     /// The server revokes the session (`AUTH_KEY_UNREGISTERED` from now on).
     pub fn revoke_session(&self) {
         self.shared.with(|s| s.auth.authorized = false);
+    }
+
+    /// The next login signs in to another account: the self user `self_id`.
+    pub fn sign_in_as(&self, self_id: i64) {
+        self.shared.with(|s| s.auth.login.self_id = self_id);
     }
 
     /// The last code expires (grammers folds `PHONE_CODE_EXPIRED` into

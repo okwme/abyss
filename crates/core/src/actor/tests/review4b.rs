@@ -312,7 +312,10 @@ async fn stream_migration_applies_the_migration_policy() {
     h.until(|e| matches!(e, Event::Connection(ConnState::Offline)))
         .await;
     tokio::time::sleep(Duration::from_secs(300)).await;
-    assert_eq!(h.fake.builds(), 2, "halted after a repeated migration");
+    // Task 6c: the halt tears the account down; the only build after it is
+    // the signed-out instance for the next login.
+    assert_eq!(h.fake.builds(), 3, "halted after a repeated migration");
+    assert!(h.fake.seeds().last().unwrap().session.is_stored());
     h.stop().await;
 }
 

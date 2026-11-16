@@ -138,6 +138,8 @@ pub struct FakeLogin {
     /// The number has no account: `sign_in` answers `SignUpRequired`.
     pub sign_up_required: bool,
     pub display_name: String,
+    /// The self user a login caches (the account the session belongs to).
+    pub self_id: i64,
     /// Where a first code request says the code went. `None` scripts an
     /// unsupported flow (email setup): `OfficialAppRequired`.
     pub sent: Option<SentCode>,
@@ -151,6 +153,7 @@ impl Default for FakeLogin {
             hint: None,
             sign_up_required: false,
             display_name: "Fake User".into(),
+            self_id: auth::FAKE_SELF_ID,
             sent: Some(SentCode {
                 delivery: CodeDelivery::App,
                 length: Some(5),

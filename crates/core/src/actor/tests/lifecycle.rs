@@ -181,7 +181,10 @@ async fn second_migration_halts_offline() {
     h.until(|e| matches!(e, Event::Connection(ConnState::Offline)))
         .await;
     tokio::time::sleep(Duration::from_secs(300)).await;
-    assert_eq!(h.fake.builds(), 2, "no rebuild after a repeated migration");
+    // Task 6c: no signed-in rebuild; the account is torn down and one
+    // signed-out instance waits for a new login.
+    assert_eq!(h.fake.builds(), 3, "no rebuild after a repeated migration");
+    assert!(h.fake.seeds().last().unwrap().session.is_stored());
     assert_eq!(h.fake.runners_finished(), 2);
     h.stop().await;
 }

@@ -236,7 +236,11 @@ impl<B: Backend> Actor<B> {
         let Some(parts) = self.cache_parts.as_mut() else {
             return;
         };
-        if !parts.rebinding.as_ref().is_some_and(JoinHandle::is_finished) {
+        if !parts
+            .rebinding
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
             return;
         }
         let Some(task) = parts.rebinding.take() else {

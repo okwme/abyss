@@ -6,6 +6,7 @@ mod admission;
 mod apply;
 mod auth;
 mod auth_outcome;
+mod binding;
 mod boot;
 mod jobs;
 mod lifecycle;
@@ -29,10 +30,11 @@ use tokio_util::sync::CancellationToken;
 use admission::Admission;
 pub use admission::MAX_CONCURRENT;
 use auth::AuthMachine;
+pub(crate) use binding::{Identity, provision_cache};
 use boot::Boot;
 use jobs::{CallCtx, Done, Job, Load, ReqId, TaskKind};
 use lifecycle::{Lifecycle, Live, LiveEvent, Phase, Reason};
-pub(crate) use logout::{CacheParts, open_cache};
+pub(crate) use logout::CacheParts;
 
 use crate::api::{
     AuthState, ClientGen, Command, ConnState, Event, HistoryDir, RemoteLogout, SaveStatus,
@@ -119,6 +121,8 @@ pub(crate) struct Actor<B: Backend> {
     auth: AuthMachine<B::Client>,
     /// The remote half of a running logout, until it is reported.
     logout_remote: Option<RemoteLogout>,
+    /// A logout whose local deletion failed, until a Retry succeeds.
+    unfinished_logout: Option<(RemoteLogout, crate::api::LocalDeletion)>,
 }
 
 pub(crate) struct ActorChannels {
@@ -189,6 +193,7 @@ impl<B: Backend> Actor<B> {
             cache_parts: init.cache_parts,
             auth,
             logout_remote: None,
+            unfinished_logout: None,
         };
         let channels = ActorChannels {
             commands: init.commands,
