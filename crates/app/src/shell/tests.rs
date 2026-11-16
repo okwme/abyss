@@ -11,7 +11,7 @@ use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use gpui::{Entity, TestAppContext, VisualTestContext};
 
-use super::bridge::{CoreLink, DRAIN_MAX, SharedCore, ShutdownAck, drain};
+use super::bridge::{CoreLink, DRAIN_MAX, EventSource, ShutdownAck, drain};
 use super::shutdown::Closing;
 use super::{Failure, Root, State};
 use crate::launch::{API_HASH_VAR, API_ID_VAR, LaunchError};
@@ -23,11 +23,14 @@ struct Sent {
     full: bool,
 }
 
+/// The command half of the double.
 struct TestLink {
-    events: mpsc::UnboundedReceiver<Event>,
     sent: Rc<RefCell<Sent>>,
     ack: Option<oneshot::Receiver<ShutdownReport>>,
 }
+
+/// The event half of the double, fed by [`Harness::events`].
+struct TestEvents(mpsc::UnboundedReceiver<Event>);
 
 impl CoreLink for TestLink {
     fn send(&self, cmd: Command) -> Result<(), SendError> {
@@ -39,23 +42,28 @@ impl CoreLink for TestLink {
         Ok(())
     }
 
-    fn poll_recv(&mut self, task: &mut task::Context<'_>) -> Poll<Option<Event>> {
-        self.events.poll_next_unpin(task)
-    }
-
-    fn try_recv(&mut self) -> Option<Event> {
-        self.events.try_recv().ok()
-    }
-
     fn begin_shutdown(&mut self) -> Option<ShutdownAck> {
         let ack = self.ack.take()?;
         Some(Box::pin(async move { ack.await.ok() }))
     }
 }
 
+impl EventSource for TestEvents {
+    fn poll_recv(&mut self, task: &mut task::Context<'_>) -> Poll<Option<Event>> {
+        self.0.poll_next_unpin(task)
+    }
+
+    fn try_recv(&mut self) -> Option<Event> {
+        self.0.try_recv().ok()
+    }
+}
+
 #[cfg_attr(
     not(feature = "fake"),
-    expect(dead_code, reason = "only the fake-login tests send commands and acks")
+    expect(
+        dead_code,
+        reason = "only the fake-backed tests send commands and acks"
+    )
 )]
 struct Harness {
     events: mpsc::UnboundedSender<Event>,
@@ -63,12 +71,11 @@ struct Harness {
     ack: Option<oneshot::Sender<ShutdownReport>>,
 }
 
-fn link() -> (Box<dyn CoreLink>, Harness) {
+fn link() -> (Box<dyn CoreLink>, Box<dyn EventSource>, Harness) {
     let (events_tx, events) = mpsc::unbounded();
     let (ack_tx, ack) = oneshot::channel();
     let sent = Rc::new(RefCell::new(Sent::default()));
     let link = TestLink {
-        events,
         sent: Rc::clone(&sent),
         ack: Some(ack),
     };
@@ -77,7 +84,7 @@ fn link() -> (Box<dyn CoreLink>, Harness) {
         sent,
         ack: Some(ack_tx),
     };
-    (Box::new(link), harness)
+    (Box::new(link), Box::new(TestEvents(events)), harness)
 }
 
 fn closing(root: &Entity<Root>, cx: &mut VisualTestContext) -> Option<Closing> {
@@ -107,37 +114,36 @@ fn missing_credentials_show_the_error_screen_and_close_freely(cx: &mut TestAppCo
 
 #[test]
 fn drain_takes_at_most_drain_max_per_wake() {
-    let (link, harness) = link();
-    let core: SharedCore = Rc::new(RefCell::new(link));
+    let (_link, mut events, harness) = link();
     for _ in 0..DRAIN_MAX + 10 {
         harness
             .events
             .unbounded_send(Event::DialogsReset(Vec::new()))
             .unwrap();
     }
-    let first = core.borrow_mut().try_recv().unwrap();
-    assert_eq!(drain(&core, first).len(), DRAIN_MAX);
-    let first = core.borrow_mut().try_recv().unwrap();
-    assert_eq!(drain(&core, first).len(), 10);
+    let first = events.try_recv().unwrap();
+    assert_eq!(drain(events.as_mut(), first).len(), DRAIN_MAX);
+    let first = events.try_recv().unwrap();
+    assert_eq!(drain(events.as_mut(), first).len(), 10);
 }
 
 #[cfg(feature = "fake")]
 mod fake {
-    use abyss_core::api::UserError;
+    use abyss_core::api::{AuthState, PasswordBuf, UserError};
     use abyss_core::backend::fake::{FakeScript, summary};
     use abyss_core::model::{ChatId, PeerKind};
 
     use super::*;
     use crate::shell::auth::AuthView;
-    use crate::shell::session::{LoginDriver, Started};
+    use crate::shell::session::Started;
     use crate::ui::text_input;
 
     fn open(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {
         cx.update(|cx| cx.bind_keys(text_input::key_bindings()));
-        let (core, harness) = link();
+        let (commands, events, harness) = link();
         let started = Started {
-            core,
-            driver: LoginDriver::Demo,
+            commands,
+            events,
             fake: None,
         };
         let (root, cx) =
@@ -157,32 +163,156 @@ mod fake {
         })
     }
 
-    fn sign_in(root: &Entity<Root>, cx: &mut VisualTestContext) {
-        assert_eq!(
-            read(root, cx, |s| s.auth.clone()),
-            AuthView::Phone { error: None }
-        );
+    fn auth(root: &Entity<Root>, cx: &mut VisualTestContext) -> AuthView {
+        read(root, cx, |s| s.auth.clone())
+    }
+
+    /// Core moves to `state`.
+    fn core_says(harness: &Harness, cx: &mut VisualTestContext, state: AuthState) {
+        harness.events.unbounded_send(Event::Auth(state)).unwrap();
+        cx.run_until_parked();
+    }
+
+    fn last_command(harness: &Harness) -> Option<Command> {
+        let sent = harness.sent.borrow();
+        sent.commands.last().map(|c| match c {
+            // `Command` is not `Clone` (it may carry a password).
+            Command::SubmitPhone(p) => Command::SubmitPhone(p.clone()),
+            Command::SubmitCode(c) => Command::SubmitCode(c.clone()),
+            Command::SubmitPassword(p) => {
+                Command::SubmitPassword(PasswordBuf::from_slice(p.as_bytes()).unwrap())
+            }
+            Command::RetryPasswordParams => Command::RetryPasswordParams,
+            _ => Command::Logout,
+        })
+    }
+
+    /// The router follows core's states; each form sends its command.
+    fn sign_in(root: &Entity<Root>, cx: &mut VisualTestContext, harness: &Harness) {
+        assert_eq!(auth(root, cx), AuthView::Connecting);
+        core_says(harness, cx, AuthState::Phone { error: None });
+        assert_eq!(auth(root, cx), AuthView::Phone { error: None });
         cx.simulate_input("+15550100");
         cx.simulate_keystrokes("enter");
-        assert!(matches!(
-            read(root, cx, |s| s.auth.clone()),
-            AuthView::Code { .. }
-        ));
+        assert!(matches!(last_command(harness), Some(Command::SubmitPhone(p)) if p == "+15550100"));
+        let phone_hint = abyss_core::api::mask_phone("+15550100");
+        core_says(
+            harness,
+            cx,
+            AuthState::Code {
+                phone_hint: phone_hint.clone(),
+                error: None,
+            },
+        );
+        assert_eq!(
+            auth(root, cx),
+            AuthView::Code {
+                phone_hint: phone_hint.into(),
+                error: None
+            }
+        );
         cx.simulate_input("12345");
         cx.simulate_keystrokes("enter");
-        assert!(matches!(
-            read(root, cx, |s| s.auth.clone()),
-            AuthView::Password { .. }
-        ));
+        assert!(matches!(last_command(harness), Some(Command::SubmitCode(c)) if c == "12345"));
+        core_says(
+            harness,
+            cx,
+            AuthState::Password {
+                hint: Some("demo".into()),
+                error: None,
+            },
+        );
+        assert!(matches!(auth(root, cx), AuthView::Password { .. }));
         cx.simulate_input("hunter2");
         cx.simulate_keystrokes("enter");
-        assert_eq!(read(root, cx, |s| s.auth.clone()), AuthView::SignedIn);
+        assert!(matches!(
+            last_command(harness),
+            Some(Command::SubmitPassword(p)) if p.as_bytes() == b"hunter2"
+        ));
+        core_says(
+            harness,
+            cx,
+            AuthState::SignedIn {
+                display_name: "Demo User".into(),
+            },
+        );
+        assert_eq!(auth(root, cx), AuthView::SignedIn);
+    }
+
+    #[gpui::test]
+    fn used_up_password_token_asks_for_new_params_first(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        core_says(
+            &harness,
+            cx,
+            AuthState::Password {
+                hint: Some("h".into()),
+                error: None,
+            },
+        );
+        core_says(
+            &harness,
+            cx,
+            AuthState::PasswordTokenUnavailable {
+                error: UserError::Network,
+            },
+        );
+        assert_eq!(
+            auth(&root, cx),
+            AuthView::Password {
+                hint: Some("h".into()),
+                error: Some(UserError::Network)
+            }
+        );
+        cx.simulate_input("pw");
+        cx.simulate_keystrokes("enter");
+        assert!(matches!(
+            last_command(&harness),
+            Some(Command::RetryPasswordParams)
+        ));
+        core_says(
+            &harness,
+            cx,
+            AuthState::Password {
+                hint: Some("h".into()),
+                error: None,
+            },
+        );
+        cx.simulate_keystrokes("enter");
+        assert!(matches!(
+            last_command(&harness),
+            Some(Command::SubmitPassword(p)) if p.as_bytes() == b"pw"
+        ));
+    }
+
+    #[gpui::test]
+    fn states_without_a_screen_show_a_notice(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        core_says(
+            &harness,
+            cx,
+            AuthState::SignedInUnsaved {
+                display_name: String::new(),
+            },
+        );
+        assert_eq!(auth(&root, cx), AuthView::SignedIn);
+        assert_eq!(
+            read(&root, cx, |s| s.notice.clone()),
+            Some(crate::ui::copy::SIGNED_IN_UNSAVED.into())
+        );
+        core_says(&harness, cx, AuthState::SignUpRequired);
+        assert_eq!(
+            auth(&root, cx),
+            AuthView::Phone {
+                error: Some(UserError::SignUpRequired)
+            }
+        );
     }
 
     #[gpui::test]
     fn demo_login_then_chats_then_send(cx: &mut TestAppContext) {
         let (root, cx, harness) = open(cx);
-        sign_in(&root, cx);
+        sign_in(&root, cx, &harness);
         let script = FakeScript::demo(3, 0);
         harness
             .events
@@ -241,7 +371,7 @@ mod fake {
     #[gpui::test]
     fn full_queue_shows_busy(cx: &mut TestAppContext) {
         let (root, cx, harness) = open(cx);
-        sign_in(&root, cx);
+        sign_in(&root, cx, &harness);
         harness.sent.borrow_mut().full = true;
         let script = FakeScript::demo(1, 0);
         harness
@@ -279,7 +409,7 @@ mod fake {
             .ack
             .take()
             .unwrap()
-            .send(ShutdownReport::Unconfirmed)
+            .send(ShutdownReport::UNCONFIRMED)
             .unwrap();
         cx.run_until_parked();
         assert_eq!(closing(&root, cx), Some(Closing::Unconfirmed));

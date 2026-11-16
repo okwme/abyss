@@ -9,6 +9,7 @@ use std::pin::pin;
 use std::time::Duration;
 
 use abyss_core::ShutdownReport;
+use abyss_core::api::{LocalDeletion, LogoutStatus, SaveStatus};
 use futures::future::{Either, select};
 
 /// The UI gives up waiting for core after this long and quits anyway.
@@ -58,27 +59,58 @@ pub(crate) enum Next {
 pub(crate) fn next(outcome: Outcome) -> Next {
     match outcome {
         // A confirmed save quits; so does the UI timeout (plan section 5).
-        Outcome::Ack(ShutdownReport::Confirmed) | Outcome::TimedOut => Next::Quit,
-        // We never claim a save we didn't observe.
-        Outcome::Ack(ShutdownReport::Unconfirmed) | Outcome::NoAck => Next::ShowUnconfirmed,
+        Outcome::Ack(report) if confirmed(report) => Next::Quit,
+        Outcome::TimedOut => Next::Quit,
+        // We never claim a save (or a logout's deletion) we didn't observe.
+        Outcome::Ack(_) | Outcome::NoAck => Next::ShowUnconfirmed,
     }
+}
+
+/// The session is saved and any logout that ran finished its local deletion.
+fn confirmed(report: ShutdownReport) -> bool {
+    let logout_done = match report.logout {
+        None => true,
+        Some(LogoutStatus::Done { local, .. }) => local == LocalDeletion::Deleted,
+        Some(LogoutStatus::Incomplete) => false,
+    };
+    report.save == SaveStatus::Confirmed && logout_done
 }
 
 #[cfg(test)]
 mod tests {
+    use abyss_core::api::RemoteLogout;
     use futures::executor::block_on;
     use futures::future::{pending, ready};
 
     use super::*;
 
+    const CONFIRMED: ShutdownReport = ShutdownReport {
+        save: SaveStatus::Confirmed,
+        logout: None,
+    };
+
     #[test]
     fn ack_wins_over_a_pending_timer() {
-        let out = block_on(await_ack(
-            Some(ready(Some(ShutdownReport::Confirmed))),
-            pending(),
-        ));
-        assert_eq!(out, Outcome::Ack(ShutdownReport::Confirmed));
+        let out = block_on(await_ack(Some(ready(Some(CONFIRMED))), pending()));
+        assert_eq!(out, Outcome::Ack(CONFIRMED));
         assert_eq!(next(out), Next::Quit);
+    }
+
+    #[test]
+    fn an_unfinished_logout_is_not_confirmed() {
+        let incomplete = ShutdownReport {
+            logout: Some(LogoutStatus::Incomplete),
+            ..CONFIRMED
+        };
+        assert_eq!(next(Outcome::Ack(incomplete)), Next::ShowUnconfirmed);
+        let done = ShutdownReport {
+            logout: Some(LogoutStatus::Done {
+                remote: RemoteLogout::TimedOut,
+                local: LocalDeletion::Deleted,
+            }),
+            ..CONFIRMED
+        };
+        assert_eq!(next(Outcome::Ack(done)), Next::Quit);
     }
 
     #[test]
@@ -93,10 +125,11 @@ mod tests {
 
     #[test]
     fn unconfirmed_or_missing_ack_is_shown() {
-        let out = block_on(await_ack(
-            Some(ready(Some(ShutdownReport::Unconfirmed))),
-            pending(),
-        ));
+        let unconfirmed = ShutdownReport {
+            save: SaveStatus::Unconfirmed,
+            logout: None,
+        };
+        let out = block_on(await_ack(Some(ready(Some(unconfirmed))), pending()));
         assert_eq!(next(out), Next::ShowUnconfirmed);
         let out = block_on(await_ack(Some(ready(None::<ShutdownReport>)), pending()));
         assert_eq!(out, Outcome::NoAck);

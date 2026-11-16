@@ -4,13 +4,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use abyss_core::api::{Command, ConnState, Event, PasswordBuf, UserError};
+use abyss_core::api::{AuthState, Command, ConnState, Event, PasswordBuf, UserError};
 use abyss_core::{BackendChoice, CoreConfig, SendError, StartError};
 use gpui::{AppContext, Context, Entity, Focusable, SharedString, Subscription, Task, Window};
 
 use super::Root;
-use super::auth::AuthView;
-use super::bridge::{CoreLink, SharedCore, spawn_pump};
+use super::auth::{AuthView, project};
+use super::bridge::{CoreLink, EventSource, SharedCore, spawn_pump};
 use super::shutdown::{self, Closing, Next};
 use crate::chat::ChatShell;
 use crate::launch::Launch;
@@ -21,55 +21,61 @@ use crate::ui::text_input::{Limits, TextInput, TextInputEvent, text_input};
 /// How long a notice (toast) stays up.
 const NOTICE_FOR: Duration = Duration::from_secs(5);
 
-/// Who answers login submissions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LoginDriver {
-    Core,
-    /// `--fake`: login is simulated in the UI (see `auth::demo`).
-    #[cfg(feature = "fake")]
-    Demo,
-}
-
+/// A started core, split into its command and event halves.
 pub(crate) struct Started {
-    pub(super) core: Box<dyn CoreLink>,
-    pub(super) driver: LoginDriver,
+    pub(super) commands: Box<dyn CoreLink>,
+    pub(super) events: Box<dyn EventSource>,
     /// Keeps the fake's update channel open; dropping it ends core's update
     /// stream.
     #[cfg(feature = "fake")]
     pub(super) fake: Option<abyss_core::backend::fake::FakeHandle>,
 }
 
+impl Started {
+    fn new(core: abyss_core::CoreHandle) -> Self {
+        let (commands, events) = core.split();
+        Self {
+            commands: Box::new(commands),
+            events: Box::new(events),
+            #[cfg(feature = "fake")]
+            fake: None,
+        }
+    }
+}
+
 pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
     match launch {
         #[cfg(feature = "fake")]
-        Launch::Fake => {
-            use abyss_core::backend::fake::FakeBackend;
-            let script = crate::chat::demo::script(crate::chat::format::now());
+        Launch::Fake { faults } => {
+            use abyss_core::backend::fake::{FakeBackend, FakeScript};
+            let mut script = crate::chat::demo::script(crate::chat::format::now());
+            // The demo account's login: code `FAKE_CODE`, 2FA password with a hint.
+            script.login = FakeScript::demo(0, 0).login;
             let (backend, handle) = FakeBackend::new(script);
-            let core = abyss_core::start(CoreConfig::default(), BackendChoice::Fake(backend))?;
+            let config = CoreConfig {
+                fake_faults: faults,
+                ..CoreConfig::default()
+            };
+            let core = abyss_core::start(config, BackendChoice::Fake(backend))?;
             Ok(Started {
-                core: Box::new(core),
-                driver: LoginDriver::Demo,
                 fake: Some(handle),
+                ..Started::new(core)
             })
         }
         Launch::Telegram(credentials) => {
             let core =
                 abyss_core::start(CoreConfig::default(), BackendChoice::Grammers(credentials))?;
-            Ok(Started {
-                core: Box::new(core),
-                driver: LoginDriver::Core,
-                #[cfg(feature = "fake")]
-                fake: None,
-            })
+            Ok(Started::new(core))
         }
     }
 }
 
 pub(crate) struct Session {
     pub(super) core: SharedCore,
-    pub(super) driver: LoginDriver,
     pub(super) auth: AuthView,
+    /// Core said the password token is gone: the next submission asks for new
+    /// parameters first.
+    needs_params: bool,
     pub(super) phone: Entity<TextInput>,
     pub(super) code: Entity<TextInput>,
     pub(super) password: Entity<PasswordInput>,
@@ -82,14 +88,14 @@ pub(crate) struct Session {
     pub(super) closing: Closing,
     _pump: Task<()>,
     #[cfg(feature = "fake")]
-    _fake: Option<abyss_core::backend::fake::FakeHandle>,
+    fake: Option<abyss_core::backend::fake::FakeHandle>,
     _subscriptions: [Subscription; 4],
     _chat_wiring: [Subscription; 2],
 }
 
 impl Session {
     pub(crate) fn new(started: Started, window: &mut Window, cx: &mut Context<'_, Root>) -> Self {
-        let shared: SharedCore = Rc::new(RefCell::new(started.core));
+        let shared: SharedCore = Rc::new(RefCell::new(started.commands));
         let phone = text_input(Limits::PHONE, copy::PHONE_PLACEHOLDER, cx);
         let code = text_input(Limits::CODE, copy::CODE_PLACEHOLDER, cx);
         let composer = text_input(Limits::COMPOSER, copy::COMPOSER_PLACEHOLDER, cx);
@@ -116,18 +122,13 @@ impl Session {
                 },
             ),
         ];
-        let auth = match started.driver {
-            LoginDriver::Core => AuthView::Connecting,
-            #[cfg(feature = "fake")]
-            LoginDriver::Demo => AuthView::Phone { error: None },
-        };
-        let pump = spawn_pump(Rc::clone(&shared), window, cx);
+        let pump = spawn_pump(started.events, window, cx);
         let shell = ChatShell::default();
         let chat_wiring = super::chats::wire(shell.rows(), window, cx);
         let session = Self {
             core: shared,
-            driver: started.driver,
-            auth,
+            auth: AuthView::Connecting,
+            needs_params: false,
             phone,
             code,
             password,
@@ -139,7 +140,7 @@ impl Session {
             closing: Closing::Open,
             _pump: pump,
             #[cfg(feature = "fake")]
-            _fake: started.fake,
+            fake: started.fake,
             _subscriptions: subscriptions,
             _chat_wiring: chat_wiring,
         };
@@ -241,14 +242,8 @@ impl Session {
             return;
         }
         let phone = self.phone.read(cx).text().to_owned();
-        match self.driver {
-            LoginDriver::Core => {
-                self.auth = self.auth.cleared();
-                self.send(Command::SubmitPhone(phone), window, cx);
-            }
-            #[cfg(feature = "fake")]
-            LoginDriver::Demo => self.set_auth(super::auth::demo::phone(&phone), window, cx),
-        }
+        self.auth = self.auth.cleared();
+        self.send(Command::SubmitPhone(phone), window, cx);
         cx.notify();
     }
 
@@ -259,36 +254,34 @@ impl Session {
         let code = self
             .code
             .update(cx, |input, cx| input.take_text(window, cx));
-        match self.driver {
-            LoginDriver::Core => {
-                self.auth = self.auth.cleared();
-                self.send(Command::SubmitCode(code), window, cx);
-            }
-            #[cfg(feature = "fake")]
-            LoginDriver::Demo => {
-                let next = super::auth::demo::code(&self.auth, &code, Instant::now());
-                self.set_auth(next, window, cx);
-            }
-        }
+        self.auth = self.auth.cleared();
+        self.send(Command::SubmitCode(code), window, cx);
         cx.notify();
     }
 
+    /// Sends the password, or, when core has no password token, asks for new
+    /// parameters and leaves the typed password in place for the next Enter.
     pub(super) fn submit_password(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         if !matches!(self.auth, AuthView::Password { .. }) {
             return;
         }
+        self.auth = self.auth.cleared();
+        if std::mem::take(&mut self.needs_params) {
+            self.send(Command::RetryPasswordParams, window, cx);
+            cx.notify();
+            return;
+        }
         let secret = self.password.update(cx, PasswordInput::take_secret);
-        match self.driver {
-            LoginDriver::Core => {
-                self.auth = self.auth.cleared();
-                self.send(Command::SubmitPassword(PasswordBuf(secret)), window, cx);
-            }
-            #[cfg(feature = "fake")]
-            LoginDriver::Demo => {
-                let next = super::auth::demo::password(&self.auth, secret.len());
-                drop(secret);
-                self.set_auth(next, window, cx);
-            }
+        let buf = PasswordBuf::from_slice(&secret);
+        drop(secret);
+        if let Ok(buf) = buf {
+            self.send(Command::SubmitPassword(buf), window, cx);
+        } else if let Some(next) = self
+            .auth
+            .with_error(UserError::InvalidPassword, Instant::now())
+        {
+            // Longer than any password Telegram accepts.
+            self.set_auth(next, window, cx);
         }
         cx.notify();
     }
@@ -300,15 +293,30 @@ impl Session {
         cx: &mut Context<'_, Root>,
     ) {
         match event {
-            Event::Auth(state) => {
-                if self.driver == LoginDriver::Core {
-                    self.set_auth(state.into(), window, cx);
-                }
-            }
+            Event::Auth(state) => self.on_auth(state, window, cx),
             Event::Connection(state) => self.conn = Some(state),
             Event::Error(error) => self.on_error(error, window, cx),
             // Chat list, message view and sends: `shell::chats`.
             chat => self.apply_chat_event(chat, window, cx),
+        }
+    }
+
+    fn on_auth(&mut self, state: AuthState, window: &mut Window, cx: &mut Context<'_, Root>) {
+        let hint = match &self.auth {
+            AuthView::Password { hint, .. } => hint.clone(),
+            _ => None,
+        };
+        #[cfg(feature = "fake")]
+        let fake_code = self.fake.is_some() && matches!(state, AuthState::Code { error: None, .. });
+        let projection = project(state, hint, Instant::now());
+        self.needs_params = projection.needs_params;
+        self.set_auth(projection.view, window, cx);
+        if let Some(notice) = projection.notice {
+            self.show_notice(notice, window, cx);
+        }
+        #[cfg(feature = "fake")]
+        if fake_code {
+            self.show_notice(copy::FAKE_CODE_HINT.into(), window, cx);
         }
     }
 

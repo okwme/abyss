@@ -1,23 +1,18 @@
-//! The login screens' view of auth state (plan section 4, UI side).
+//! The login screens' view of core's auth state (plan section 4, UI side).
 //!
-//! Core's `AuthState` has only `SignedIn` so far (tasks 5–6 add the rest), so
-//! the router keeps its own view of the plan's states. With `--fake`, login is
-//! simulated here ([`demo`]) because core rejects login commands with
-//! `Unsupported` until task 6.
+//! Core's [`AuthState`] is the source of truth; [`project`] maps it onto the
+//! screens the view draws. States without a screen of their own (sign-up
+//! required, logout, an unsaved login) land on the nearest screen plus a
+//! notice.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use abyss_core::api::{AuthState, UserError};
 use gpui::SharedString;
 
+use crate::ui::copy;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(feature = "fake"),
-    expect(
-        dead_code,
-        reason = "core's AuthState has only SignedIn until tasks 5-6; the --fake demo builds the rest"
-    )
-)]
 pub(crate) enum AuthView {
     Connecting,
     Phone {
@@ -38,10 +33,82 @@ pub(crate) enum AuthView {
     SignedIn,
 }
 
-impl From<AuthState> for AuthView {
-    fn from(state: AuthState) -> Self {
-        match state {
-            AuthState::SignedIn => AuthView::SignedIn,
+/// One core auth state, as the UI shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Projection {
+    pub(crate) view: AuthView,
+    /// Shown as a toast, for states without a screen of their own.
+    pub(crate) notice: Option<SharedString>,
+    /// The password token is gone: the next submission asks core for new
+    /// parameters instead of sending the password.
+    pub(crate) needs_params: bool,
+}
+
+impl Projection {
+    fn view(view: AuthView) -> Self {
+        Self {
+            view,
+            notice: None,
+            needs_params: false,
+        }
+    }
+
+    fn with_notice(view: AuthView, notice: SharedString) -> Self {
+        Self {
+            view,
+            notice: Some(notice),
+            needs_params: false,
+        }
+    }
+}
+
+/// Maps core's state onto a screen. `hint` is the last password hint shown,
+/// kept for `PasswordTokenUnavailable`, which carries none.
+pub(crate) fn project(state: AuthState, hint: Option<SharedString>, now: Instant) -> Projection {
+    match state {
+        AuthState::Connecting => Projection::view(AuthView::Connecting),
+        AuthState::NeedCredentials { error } => Projection::view(AuthView::Phone {
+            error: error.map(UserError::Credentials),
+        }),
+        AuthState::Phone { error } => Projection::view(AuthView::Phone { error }),
+        AuthState::Code { phone_hint, error } => Projection::view(AuthView::Code {
+            phone_hint: phone_hint.into(),
+            error,
+        }),
+        AuthState::Password { hint, error } => Projection::view(AuthView::Password {
+            hint: hint.map(Into::into),
+            error,
+        }),
+        AuthState::PasswordTokenUnavailable { error } => Projection {
+            view: AuthView::Password {
+                hint,
+                error: Some(error),
+            },
+            notice: Some(copy::PASSWORD_PARAMS.into()),
+            needs_params: true,
+        },
+        AuthState::FloodWait { until, resume } => {
+            let left = until
+                .duration_since(SystemTime::now())
+                .unwrap_or(Duration::ZERO);
+            let resume = project(*resume, hint, now).view;
+            Projection::view(AuthView::FloodWait {
+                until: now + left,
+                resume: Box::new(resume),
+            })
+        }
+        AuthState::SignUpRequired => Projection::view(AuthView::Phone {
+            error: Some(UserError::SignUpRequired),
+        }),
+        AuthState::SignedIn { .. } => Projection::view(AuthView::SignedIn),
+        AuthState::SignedInUnsaved { .. } => {
+            Projection::with_notice(AuthView::SignedIn, copy::SIGNED_IN_UNSAVED.into())
+        }
+        AuthState::LoggingOut => {
+            Projection::with_notice(AuthView::Connecting, copy::LOGGING_OUT.into())
+        }
+        AuthState::LoggedOut { remote, local } => {
+            Projection::with_notice(AuthView::Connecting, copy::logged_out(remote, local))
         }
     }
 }
@@ -88,90 +155,11 @@ impl AuthView {
     }
 }
 
-/// Masks a phone number for display: country prefix and last two digits,
-/// e.g. `+44 •••• ••12`. Short input is masked entirely.
-#[cfg(any(feature = "fake", test))]
-pub(crate) fn mask_phone(phone: &str) -> SharedString {
-    let chars: Vec<char> = phone.chars().collect();
-    let n = chars.len();
-    if n <= 5 {
-        return "•".repeat(n).into();
-    }
-    let head: String = chars.iter().take(3).collect();
-    let tail: String = chars.iter().skip(n - 2).collect();
-    let hidden = n - 5;
-    let first = hidden.min(4);
-    let rest = hidden - first;
-    format!("{head} {} {}{tail}", "•".repeat(first), "•".repeat(rest)).into()
-}
-
-/// Simulated login for `--fake`: any phone with 5+ digits, any 5+ digit code
-/// (`00000` triggers a flood wait), any non-empty password.
-#[cfg(feature = "fake")]
-pub(crate) mod demo {
-    use super::{AuthView, Duration, Instant, UserError, mask_phone};
-
-    pub(crate) const FLOOD_CODE: &str = "00000";
-    const FLOOD: Duration = Duration::from_secs(10);
-    const MIN_DIGITS: usize = 5;
-
-    pub(crate) fn phone(phone: &str) -> AuthView {
-        if phone.chars().filter(char::is_ascii_digit).count() < MIN_DIGITS {
-            return AuthView::Phone {
-                error: Some(UserError::Rejected),
-            };
-        }
-        AuthView::Code {
-            phone_hint: mask_phone(phone),
-            error: None,
-        }
-    }
-
-    pub(crate) fn code(current: &AuthView, code: &str, now: Instant) -> AuthView {
-        let AuthView::Code { phone_hint, .. } = current else {
-            return current.clone();
-        };
-        if code == FLOOD_CODE {
-            return AuthView::FloodWait {
-                until: now + FLOOD,
-                resume: Box::new(current.cleared()),
-            };
-        }
-        if code.len() < MIN_DIGITS {
-            return AuthView::Code {
-                phone_hint: phone_hint.clone(),
-                error: Some(UserError::Rejected),
-            };
-        }
-        AuthView::Password {
-            hint: Some(crate::ui::copy::DEMO_PASSWORD_HINT.into()),
-            error: None,
-        }
-    }
-
-    pub(crate) fn password(current: &AuthView, len: usize) -> AuthView {
-        match current {
-            AuthView::Password { .. } if len == 0 => current
-                .with_error(UserError::Rejected, Instant::now())
-                .unwrap_or_else(|| current.clone()),
-            AuthView::Password { .. } => AuthView::SignedIn,
-            _ => current.clone(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use abyss_core::api::{CredentialError, LocalDeletion, RemoteLogout};
 
-    #[test]
-    fn masks_phone_numbers() {
-        assert_eq!(mask_phone("+442079460012"), "+44 •••• ••••12");
-        assert_eq!(mask_phone("+15550100"), "+15 •••• 00");
-        assert_eq!(mask_phone("+155501"), "+15 •• 01");
-        assert_eq!(mask_phone("12345"), "•••••");
-        assert_eq!(mask_phone(""), "");
-    }
+    use super::*;
 
     #[test]
     fn errors_land_on_the_current_form() {
@@ -194,34 +182,67 @@ mod tests {
     }
 
     #[test]
-    fn core_signed_in_maps() {
-        assert_eq!(AuthView::from(AuthState::SignedIn), AuthView::SignedIn);
+    fn core_states_project_onto_screens() {
+        let now = Instant::now();
+        let signed_in = AuthState::SignedIn {
+            display_name: "A".into(),
+        };
+        assert_eq!(project(signed_in, None, now).view, AuthView::SignedIn);
+        let unsaved = project(
+            AuthState::SignedInUnsaved {
+                display_name: "A".into(),
+            },
+            None,
+            now,
+        );
+        assert_eq!(unsaved.view, AuthView::SignedIn);
+        assert!(unsaved.notice.is_some());
+        let creds = AuthState::NeedCredentials {
+            error: Some(CredentialError::ApiIdInvalid),
+        };
+        assert_eq!(
+            project(creds, None, now).view,
+            AuthView::Phone {
+                error: Some(UserError::Credentials(CredentialError::ApiIdInvalid))
+            }
+        );
+        let gone = AuthState::LoggedOut {
+            remote: RemoteLogout::Revoked,
+            local: LocalDeletion::Deleted,
+        };
+        assert!(project(gone, None, now).notice.is_some());
     }
 
-    #[cfg(feature = "fake")]
     #[test]
-    fn demo_flow_reaches_signed_in() {
+    fn token_unavailable_keeps_the_hint_and_asks_for_params() {
+        let state = AuthState::PasswordTokenUnavailable {
+            error: UserError::Network,
+        };
+        let p = project(state, Some("h".into()), Instant::now());
+        assert!(p.needs_params);
+        assert_eq!(
+            p.view,
+            AuthView::Password {
+                hint: Some("h".into()),
+                error: Some(UserError::Network)
+            }
+        );
+    }
+
+    #[test]
+    fn flood_wait_counts_down_to_the_resume_screen() {
         let now = Instant::now();
-        assert!(matches!(
-            demo::phone("+1 2"),
-            AuthView::Phone { error: Some(_) }
-        ));
-        let code = demo::phone("+15550100");
-        assert!(matches!(code, AuthView::Code { error: None, .. }));
-        assert!(matches!(
-            demo::code(&code, "12", now),
-            AuthView::Code { error: Some(_), .. }
-        ));
-        match demo::code(&code, demo::FLOOD_CODE, now) {
-            AuthView::FloodWait { resume, .. } => assert_eq!(*resume, code),
+        let state = AuthState::FloodWait {
+            until: SystemTime::now() + Duration::from_secs(60),
+            resume: Box::new(AuthState::Phone { error: None }),
+        };
+        match project(state, None, now).view {
+            AuthView::FloodWait { until, resume } => {
+                assert!(until - now <= Duration::from_secs(60));
+                assert!(until - now > Duration::from_secs(50));
+                assert_eq!(*resume, AuthView::Phone { error: None });
+            }
             other => panic!("{other:?}"),
         }
-        let password = demo::code(&code, "12345", now);
-        assert!(matches!(password, AuthView::Password { error: None, .. }));
-        assert!(matches!(
-            demo::password(&password, 0),
-            AuthView::Password { error: Some(_), .. }
-        ));
-        assert_eq!(demo::password(&password, 3), AuthView::SignedIn);
     }
 }
