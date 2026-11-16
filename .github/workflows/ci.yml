@@ -1,0 +1,32 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --features fake -- -D warnings
+      - run: cargo test --workspace --features fake
+
+  production-build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      # Release builds ship precompiled shaders, which need Xcode's Metal toolchain.
+      - run: xcodebuild -downloadComponent MetalToolchain
+      - run: cargo build --release -p tgx --no-default-features
+      - name: Fake backend must not be in the production feature graph
+        run: |
+          if cargo tree -p tgx --no-default-features -e features | grep -q 'tgx-core feature "fake"'; then
+            echo "fake feature leaked into production build"; exit 1
+          fi

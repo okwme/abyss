@@ -1,0 +1,82 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/app"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Git dependencies are pinned to exact commits for reproducible builds.
+# Bump deliberately: update the rev, review the upstream diff, run `cargo update -p <crate>`.
+[workspace.dependencies]
+# zed-industries/zed @ main, 2026-11-16
+gpui = { git = "https://github.com/zed-industries/zed", rev = "917559da35dd4d626205da705b071c800c9c2553" }
+# codeberg.org/Lonami/grammers @ main (== v0.12.0), 2026-11-08
+grammers-client = { git = "https://codeberg.org/Lonami/grammers", rev = "e61cf8585e1e9969ab81eda9fb4725a1500e2d86" }
+grammers-session = { git = "https://codeberg.org/Lonami/grammers", rev = "e61cf8585e1e9969ab81eda9fb4725a1500e2d86", default-features = false, features = ["serde"] }
+grammers-mtsender = { git = "https://codeberg.org/Lonami/grammers", rev = "e61cf8585e1e9969ab81eda9fb4725a1500e2d86" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "917559da35dd4d626205da705b071c800c9c2553", features = ["font-kit"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = { version = "0.7.20", default-features = false }
+
+# Lints follow BeautifulRust (lints/lints.toml), tightened for untrusted network
+# input: panicking constructs are denied in non-test code, because a panic on
+# server data is a denial of service (plan section 12).
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Panics: denied outright (BeautifulRust only warns on unwrap and allows expect).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+panic_in_result_fn = "warn"
+
+# Suppressions must explain themselves and expire: #[expect(.., reason = "..")].
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+# Unsafe must be justified, one operation at a time.
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+# API shape.
+fn_params_excessive_bools = "warn"
+struct_excessive_bools = "warn"
+clone_on_ref_ptr = "warn"
+redundant_clone = "warn"
+rc_buffer = "warn"
+
+# Idioms.
+string_add = "warn"
+wildcard_imports = "warn"
+
+# Leftovers and output. Core logs through tracing (plan section 11), never prints.
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+
+# Casts that silently lose information: use From / TryFrom.
+as_conversions = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+
+# Function size; clippy.toml sets the threshold to 70 lines.
+too_many_lines = "warn"
+
+# Pedantic lints that don't fit this application.
+must_use_candidate = "allow"  # noise on getters; #[must_use] goes where dropping is a bug
+missing_errors_doc = "allow"  # application code; tgx-core's API has one in-workspace caller
+missing_panics_doc = "allow"  # non-test code cannot panic: the panicking lints are denied
+
+[profile.release]
+panic = "unwind"

@@ -1,0 +1,6 @@
+tgx
+Copyright 2026 the tgx contributors.
+
+This product includes software derived from Zed (https://github.com/zed-industries/zed),
+licensed under the Apache License, Version 2.0:
+  - crates/app/src/ui/text_input.rs (from crates/gpui/examples/input.rs)

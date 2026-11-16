@@ -1,0 +1,3 @@
+[alias]
+dev = "run -p tgx --features fake -- --fake"
+t = "test --workspace --features fake"
