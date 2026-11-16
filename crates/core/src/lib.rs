@@ -9,6 +9,8 @@ pub mod events;
 pub mod model;
 pub mod rich_text;
 pub mod sanitize;
+pub mod secret;
+pub mod session;
 pub mod store;
 
 pub use crate::actor::{CALL_DEADLINE, MAX_CONCURRENT, READ_FLUSH};
