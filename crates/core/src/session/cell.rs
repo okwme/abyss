@@ -141,6 +141,15 @@ impl SessionSnapshot {
         account: AccountGen,
         persist: &PersistHandle,
     ) -> Self {
+        Self::with_sender(state, blob, account, persist.sender())
+    }
+
+    pub(crate) fn with_sender(
+        state: CriticalState,
+        blob: Zeroizing<Vec<u8>>,
+        account: AccountGen,
+        tx: mpsc::Sender<PersistMsg>,
+    ) -> Self {
         let inner = CellInner {
             state,
             rev: 0,
@@ -149,7 +158,7 @@ impl SessionSnapshot {
             writer: NO_WRITER,
             last_writer: NO_WRITER,
             unqueued: None,
-            tx: persist.sender(),
+            tx,
         };
         Self {
             cell: Cell(Arc::new(Mutex::new(inner))),

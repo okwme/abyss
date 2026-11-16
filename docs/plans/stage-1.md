@@ -617,6 +617,34 @@ Open for task 6 (and 5/11):
 - A retirement step that panics keeps the previous snapshot and recycles parked permits.
 - `SentUnconfirmed` and `updateMessageID` correlation are not modelled yet (task 10/11).
 
+**Task 11 status (2026-11-16): done offline; live verification is task 12.** `GrammersBackend` lives in `crates/core/src/backend/grammers/`:
+- **Snapshot unification.** `backend/seed.rs` re-exports `crate::session::SessionSnapshot`; the placeholder is gone. `SessionSnapshot::detached()` (test/`fake` only) gives the fake a snapshot without a persistence worker. `FakeBackend::build` now builds a real `AbyssSession` from the seed and makes one critical write per build (`set_home_dc_id`), so `rev` advances across rebuilds; `FakeControl::retire` revokes, then snapshots. `GrammersControl::retire` does the same (a poisoned cell is logged, the snapshot is still returned).
+- **Instance.** `GrammersBackend::new(api_id, PersistHandle)`. `build`: `SessionSeed::Stored` → `PersistHandle::load_session` (an unreadable store falls back to `fresh_session`, logged without details); `Live` → `AbyssSession::from_snapshot`. `SenderPool::with_configuration` with `NoRetries` and `updates_channel_capacity` 1024; `Client` with `auto_cache_peers`; `stream_updates` with `catch_up = false`. Runner = `pool.runner.run()`; `quit` = `pool.handle.quit()`.
+- **Update stream** (`stream.rs`): the baseline comes from `AbyssSession::baseline_established()`. The pull future owns the stream and hands it back, so racing the baseline watch never cancels a pull mid-way; `Baseline` is reported once, before any update pulled in the same wake. Errors are classified `Transient`/`Fatal` (`errors::stream_error`); panics are contained by the actor's join handles.
+- **Calls** (`calls.rs`, `invoke.rs`): raw TL over an `Invoke` trait (implemented for `grammers_client::Client`, mocked in tests). Retry classes: `Read` sleeps floods of at most 5 s, twice at most, and retries I/O once; `Never` (sends, and auth later) never retries. `303` → `Migrated`. `messages.sendMessage` with the caller's `random_id` and `no_webpage`; the id comes from `UpdateShortSentMessage` or the `updateMessageID` matching the `random_id`, else `SentUnconfirmed`. `messages.readHistory` / `channels.readHistory` with `max_id`. Peers resolve only through the session's cached access hashes (unknown → `Rejected`, no request); every dialogs/history response re-caches the hashes it carries, and the first dialogs page re-pins the page plus the carried peers.
+- **Mapping** (`map/`, pure functions): ids are range-checked before grammers' `PeerId` constructors (which debug-panic or overflow out of range); names/titles sanitized; text through `RichText::from_entities` (plain when oversized or with too many entities; URLs bounded); media to inert `MediaKind` placeholders (no download); service messages to sanitized strings naming the actor; broadcast channels excluded (by `post` flag or directory) and counted; forum replies fill `ThreadKey.topic`; deletes bounded to 10,000 ids; dialogs cursor from the last raw dialog.
+- **Logging:** only RPC error names matching `[A-Z0-9_]{1,64}` and codes are logged; never payloads, text, names or phones. A test captures `tracing` output at TRACE across failing and succeeding calls and asserts no text, name or phone appears.
+- **Contract suite** (`backend/contract.rs`): `contract::run(&impl Backend, target, Sends)` checks build from stored state, baseline first (10 s), no second baseline, dialog paging without overlap, history Tail/Before/After anchors, one `random_id` → one message, read marks, `quit` stopping the runner (5 s) and `retire` returning a usable snapshot. Runs on `FakeBackend` in CI; on `GrammersBackend` under `#[ignore]` (`ABYSS_API_ID`, optional `ABYSS_CONTRACT_CHAT=user:<id>` to enable the send check).
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (173 core tests, 3 ignored; 55 app), no gpui in `cargo tree -p abyss-core`. Grammers module: 45 tests (mapping incl. UTF-16, oversized text, bidi, media, service, broadcast, topics; the RPC error table; retry classes with paused time; byte-identical resends; log redaction; the baseline race).
+
+Deviations:
+- Raw TL requests and our own mapping instead of grammers' high-level iterators and message wrappers, so retries, `random_id` and sanitizing stay in our hands.
+- New `BackendError::SentUnconfirmed` (accepted without an id mapping, or `RANDOM_ID_DUPLICATE`); core marks the send `SentUnconfirmed` and drops it from the pending table at once. Core maps it to `UserError::Network` where a user error is needed.
+- `ThreadKey.topic` is filled for forum messages (Stage 1 still never keys windows on it).
+- `Preview::of` moved from `actor/apply.rs` to `model.rs`.
+- The fake now deduplicates `(chat, random_id)` (second send → `SentUnconfirmed`) and makes one critical write per build.
+- `updateMessageID` arriving on the update stream (rather than in the send response) is not correlated; the send response is authoritative.
+- `GrammersBackend` is not wired into `core.rs`/`api.rs` (task 6 owns that, together with auth).
+
+Remaining for task 12 (live):
+- Run the ignored contract test against a real account (and the test DC, if usable).
+- Confirm `getHistory` After semantics (`add_offset = -limit`, `min_id`) and the dialogs cursor at page boundaries with excluded broadcasts.
+- Confirm the baseline arrives within 10 s on a fresh and on a stored session, and that `quit` stops the runner promptly.
+- Watch for grammers-internal panics on odd peers in the update path (contained by core, but each one costs a rebuild).
+
+Auth TODOs for task 6 (listed in `grammers/mod.rs`): `is_authorized`, `request_login_code` (needs `api_hash`), `sign_in`, `check_password` (re-fetch via `account.getPassword` on `SRP_ID_INVALID`), `users.getUsers` self after sign-in, `sign_out`. All auth calls use `RetryClass::Never` with typed error mapping; `Unauthorized` from any call must trigger a local logout; no bootstrap while signed out.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.

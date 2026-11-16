@@ -1,8 +1,12 @@
 //! What a client instance is built from (plan section 2, "Build" step 1).
 //!
-//! [`SessionSnapshot`] is a placeholder: task 5 replaces its contents with the
-//! live critical snapshot of the account-level `CriticalCell`. Core only carries
-//! it from a retired instance to the next one; it never inspects it.
+//! The session part is the account-level [`SessionSnapshot`] (task 5): core
+//! only carries it from a retired instance to the next one and never inspects
+//! it. A snapshot is a live handle on the critical cell, not a value, so seeds
+//! are not comparable; tests use [`SessionSeed::is_stored`] and the snapshot's
+//! accessors instead.
+
+pub use crate::session::SessionSnapshot;
 
 use crate::model::ChatId;
 
@@ -10,32 +14,20 @@ use crate::model::ChatId;
 /// plus the chats of pending sends (at most 256).
 pub const MAX_CARRIED_PEERS: usize = 8 + 256;
 
-/// Live critical session state, captured from a retired instance after its
-/// runner has stopped and its write token was revoked.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SessionSnapshot {
-    /// Placeholder for the critical-state revision (plan section 3).
-    rev: u64,
-}
-
-impl SessionSnapshot {
-    pub fn new(rev: u64) -> Self {
-        Self { rev }
-    }
-
-    pub fn rev(&self) -> u64 {
-        self.rev
-    }
-}
-
 /// Where the next instance's session comes from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum SessionSeed {
-    /// Process startup: load the persisted critical state (the Keychain, task 5).
+    /// Process startup: load the persisted critical state (the Keychain).
     Stored,
     /// In-process rebuild: the live snapshot of the retired instance. Persistent
     /// storage is never re-read during a rebuild.
     Live(SessionSnapshot),
+}
+
+impl SessionSeed {
+    pub fn is_stored(&self) -> bool {
+        matches!(self, SessionSeed::Stored)
+    }
 }
 
 /// Chats whose peers (access hashes) the next instance must know without a
@@ -64,7 +56,7 @@ impl CarriedPeers {
 }
 
 /// Everything a build needs from core.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Seed {
     pub session: SessionSeed,
     pub peers: CarriedPeers,
