@@ -1,5 +1,6 @@
 //! abyss: a minimal-attack-surface Telegram client for macOS.
 
+mod chat;
 mod launch;
 mod logging;
 mod shell;

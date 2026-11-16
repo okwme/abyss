@@ -32,6 +32,8 @@ pub(crate) trait CoreLink {
     fn try_recv(&mut self) -> Option<Event>;
     /// Asks core to stop; `None` if already asked.
     fn begin_shutdown(&mut self) -> Option<ShutdownAck>;
+    /// The system woke from sleep; core rebuilds its client. Never blocks.
+    fn notify_wake(&self) {}
 }
 
 impl CoreLink for CoreHandle {
@@ -53,6 +55,10 @@ impl CoreLink for CoreHandle {
     fn begin_shutdown(&mut self) -> Option<ShutdownAck> {
         let done = CoreHandle::begin_shutdown(self)?;
         Some(Box::pin(async move { done.await.ok() }))
+    }
+
+    fn notify_wake(&self) {
+        CoreHandle::notify_wake(self);
     }
 }
 

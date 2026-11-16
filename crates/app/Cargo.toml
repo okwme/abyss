@@ -10,6 +10,8 @@ abyss-core = { path = "../core" }
 gpui.workspace = true
 gpui_platform.workspace = true
 futures = { version = "0.3", default-features = false, features = ["std"] }
+# Local times and dates (plan section 8); already in the tree via grammers.
+jiff = "0.2.40"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
 unicode-segmentation = "1"

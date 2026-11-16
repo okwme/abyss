@@ -8,7 +8,7 @@ use crate::api::{Event, HistoryDir, UserError};
 use crate::backend::{Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, Update};
 use crate::cache::CacheCmd;
 use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview};
-use crate::store::{Bump, Change, Unread, ViewGen};
+use crate::store::{Bump, Change, Rest, Unread, ViewGen};
 
 pub(super) fn user_error(e: CallError) -> UserError {
     match e {
@@ -161,16 +161,29 @@ impl<B: Backend> Actor<B> {
     async fn on_dialogs(&mut self, step: DialogsStep, res: CallResult<DialogsPage>) {
         self.dialogs_busy = false;
         match res {
-            Ok(page) => {
+            Ok(DialogsPage { chats, next }) => {
                 let event = match step {
                     DialogsStep::First => {
                         if let Some(boot) = self.boot.as_mut() {
-                            boot.note_dialogs(&page.chats);
+                            boot.note_dialogs(&chats);
                         }
-                        self.dialogs.reset(page.chats);
+                        let rest = if next.is_some() {
+                            Rest::More
+                        } else {
+                            Rest::Last
+                        };
+                        let kept = self.dialogs.merge_first_page(chats, rest);
+                        // Chats kept from later server pages: loading continues
+                        // after them, so the cursor stays where it was.
+                        if kept == 0 || !self.dialogs_loaded {
+                            self.dialogs_next = next;
+                        }
                         Event::DialogsReset(self.dialogs.as_slice().to_vec())
                     }
-                    DialogsStep::Next => Event::DialogsAppended(self.dialogs.append(page.chats)),
+                    DialogsStep::Next => {
+                        self.dialogs_next = next;
+                        Event::DialogsAppended(self.dialogs.append(chats))
+                    }
                 };
                 // `PutChats` replaces the cached list, so it always gets the whole list.
                 if self.cache.is_some() {
@@ -178,7 +191,6 @@ impl<B: Backend> Actor<B> {
                     self.cache_write(CacheCmd::PutChats(all)).await;
                 }
                 self.dialogs_loaded = true;
-                self.dialogs_next = page.next;
                 self.emit(event).await;
             }
             Err(e) => self.error(user_error(e)).await,

@@ -189,7 +189,7 @@ mod fake {
             .unbounded_send(Event::DialogsReset(script.dialogs))
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(read(&root, cx, |s| s.chats.as_slice().len()), 3);
+        assert_eq!(read(&root, cx, |s| s.shell.list.as_slice().len()), 3);
 
         let chat = ChatId {
             kind: PeerKind::User,
@@ -204,8 +204,14 @@ mod fake {
         cx.simulate_input("there");
         cx.simulate_keystrokes("enter");
         let sent = harness.sent.borrow();
-        let [Command::SendText { chat: to, text, .. }] = sent.commands.as_slice() else {
-            panic!("expected one SendText");
+        // The short list also asks for the next dialogs page (LoadDialogs).
+        let [
+            ..,
+            Command::OpenChat(_),
+            Command::SendText { chat: to, text, .. },
+        ] = sent.commands.as_slice()
+        else {
+            panic!("expected OpenChat, then one SendText");
         };
         assert_eq!(*to, chat);
         assert_eq!(text, "hello\nthere");
@@ -219,13 +225,15 @@ mod fake {
             "Bumped",
         );
         bumped.unread = 4;
+        // A new message moves the chat up; read-state changes alone do not.
+        bumped.last_date = i64::from(i32::MAX);
         harness
             .events
             .unbounded_send(Event::ChatBumped(bumped))
             .unwrap();
         cx.run_until_parked();
         assert_eq!(
-            read(&root, cx, |s| s.chats.as_slice()[0].title.clone()),
+            read(&root, cx, |s| s.shell.list.as_slice()[0].title.clone()),
             "Bumped"
         );
     }

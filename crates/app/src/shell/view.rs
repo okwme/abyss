@@ -1,30 +1,28 @@
 //! Rendering for the main window. Placeholder styling: a light palette and
 //! system font until the design pass.
 
-use std::ops::Range;
 use std::time::Instant;
 
-use abyss_core::api::{ConnState, SendState, UserError};
-use abyss_core::model::{ChatSummary, Preview};
+use abyss_core::api::UserError;
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, FontWeight, Rgba, SharedString, Stateful, Window, div,
-    prelude::*, px, rgb, rgba, uniform_list, white,
+    AnyElement, ClickEvent, Context, Div, FontWeight, SharedString, Stateful, Window, div,
+    prelude::*, px, rgb, rgba, white,
 };
 
 use super::auth::AuthView;
+use super::chat_view::chat_shell;
 use super::session::Session;
 use super::shutdown::Closing;
 use super::{Failure, Root, State};
 use crate::ui::copy;
 
-const FG: u32 = 0x1f_2328;
-const MUTED: u32 = 0x65_6d76;
-const BORDER: u32 = 0xd0_d7de;
-const SURFACE: u32 = 0xf6_f8fa;
-const ACCENT: u32 = 0x09_69da;
+pub(super) const FG: u32 = 0x1f_2328;
+pub(super) const MUTED: u32 = 0x65_6d76;
+pub(super) const BORDER: u32 = 0xd0_d7de;
+pub(super) const SURFACE: u32 = 0xf6_f8fa;
+pub(super) const ACCENT: u32 = 0x09_69da;
 const ERROR: u32 = 0xcf_222e;
-const SELECTED: u32 = 0xdd_f4ff;
-const CHAT_ROW_HEIGHT: f32 = 44.;
+pub(super) const SELECTED: u32 = 0xdd_f4ff;
 
 type SubmitFn = fn(&mut Session, &mut Window, &mut Context<'_, Root>);
 
@@ -49,7 +47,7 @@ impl Render for Root {
     }
 }
 
-fn centered() -> Div {
+pub(super) fn centered() -> Div {
     div()
         .size_full()
         .flex()
@@ -69,7 +67,7 @@ fn title(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-fn muted(text: impl Into<SharedString>) -> Div {
+pub(super) fn muted(text: impl Into<SharedString>) -> Div {
     div().text_color(rgb(MUTED)).child(text.into())
 }
 
@@ -161,7 +159,7 @@ fn password_screen(
     form.render(cx)
 }
 
-fn field(input: AnyElement) -> Div {
+pub(super) fn field(input: AnyElement) -> Div {
     div()
         .w_full()
         .px_3()
@@ -248,150 +246,6 @@ fn toast(text: SharedString) -> Div {
                 .bg(rgb(FG))
                 .text_color(white())
                 .child(text),
-        )
-}
-
-fn conn_label(conn: Option<ConnState>) -> SharedString {
-    match conn {
-        None | Some(ConnState::Connecting) => "Connecting…".into(),
-        Some(ConnState::Online) => "Online".into(),
-        Some(ConnState::Rebuilding { attempt }) => {
-            format!("Reconnecting (attempt {attempt})…").into()
-        }
-        Some(ConnState::Offline) => "Offline. Retrying…".into(),
-    }
-}
-
-fn chat_shell(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
-    let count = session.chats.as_slice().len();
-    let list = uniform_list("chats", count, cx.processor(chat_rows)).flex_1();
-    let sidebar = div()
-        .w(px(280.))
-        .h_full()
-        .flex()
-        .flex_col()
-        .border_r_1()
-        .border_color(rgb(BORDER))
-        .bg(rgb(SURFACE))
-        .child(
-            div()
-                .p_3()
-                .flex()
-                .justify_between()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Chats"))
-                .child(muted(conn_label(session.conn))),
-        )
-        .child(list);
-    div()
-        .size_full()
-        .flex()
-        .flex_row()
-        .child(sidebar)
-        .child(chat_pane(session))
-        .into_any_element()
-}
-
-fn chat_rows(
-    root: &mut Root,
-    range: Range<usize>,
-    _window: &mut Window,
-    cx: &mut Context<'_, Root>,
-) -> Vec<Stateful<Div>> {
-    let State::Running(session) = &root.state else {
-        return Vec::new();
-    };
-    let chats = session.chats.as_slice();
-    let rows = chats.get(range.clone()).unwrap_or_default();
-    rows.iter()
-        .zip(range)
-        .map(|(chat, ix)| {
-            let bg = if session.selected == Some(chat.id) {
-                rgb(SELECTED)
-            } else {
-                rgba(0)
-            };
-            chat_row(chat, ix, bg, cx)
-        })
-        .collect()
-}
-
-fn chat_row(chat: &ChatSummary, ix: usize, bg: Rgba, cx: &mut Context<'_, Root>) -> Stateful<Div> {
-    let id = chat.id;
-    let preview: SharedString = match &chat.last {
-        Some(Preview::Text(text)) => text.clone().into(),
-        Some(Preview::Media(kind)) => format!("[{kind:?}]").into(),
-        Some(Preview::Service) | None => "".into(),
-    };
-    div()
-        .id(ix)
-        .h(px(CHAT_ROW_HEIGHT))
-        .px_3()
-        .flex()
-        .flex_col()
-        .justify_center()
-        .bg(bg)
-        .cursor_pointer()
-        .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
-            root.with_session(|s, cx| s.select_chat(id, window, cx), cx);
-        }))
-        .child(
-            div()
-                .flex()
-                .justify_between()
-                .child(div().truncate().child(chat.title.clone()))
-                .children((chat.unread > 0).then(|| muted(chat.unread.to_string()))),
-        )
-        .child(muted(preview).text_xs().truncate())
-}
-
-fn send_label(state: SendState) -> SharedString {
-    match state {
-        SendState::Sending => "Sending…".into(),
-        SendState::Sent { .. } => "Sent".into(),
-        SendState::SentUnconfirmed => "Sent (unconfirmed)".into(),
-        SendState::Unknown { attempts } => {
-            format!("Not sure it was sent ({attempts} attempts)").into()
-        }
-        SendState::Failed => "Not sent".into(),
-    }
-}
-
-fn chat_pane(session: &Session) -> Div {
-    let Some(chat) = session.selected.and_then(|id| session.chats.get(id)) else {
-        return centered().child(muted("Select a chat"));
-    };
-    div()
-        .flex_1()
-        .h_full()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .p_3()
-                .border_b_1()
-                .border_color(rgb(BORDER))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(chat.title.clone()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .justify_center()
-                .items_center()
-                .child(muted("Message history arrives in a later build.")),
-        )
-        .children(
-            session
-                .last_send
-                .map(|s| muted(send_label(s)).px_3().text_xs()),
-        )
-        .child(
-            div()
-                .p_3()
-                .border_t_1()
-                .border_color(rgb(BORDER))
-                .child(field(session.composer.clone().into_any_element())),
         )
 }
 
