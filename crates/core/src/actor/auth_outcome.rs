@@ -1,171 +1,163 @@
-//! Applying login task outcomes (plan section 4, "Flow" and "Error mapping").
-
-use tokio::task::JoinError;
+//! Applying login task outcomes (plan section 4, "Flow" and "Error mapping";
+//! section 17.2a).
 
 use super::Actor;
-use super::auth::{Ambiguous, AuthDone, AuthFail, AuthInFlight, AuthKind, AuthStep, SignInNext};
-use super::lifecycle::Phase;
+use super::auth::{AuthFail, AuthKind, AuthMsg, AuthStep, Probed, Resume, SignInNext, sent_info};
 use crate::api::{AuthState, UserError};
-use crate::backend::{Account, AuthError, Backend, BackendError, Client, PasswordChallenge};
+use crate::backend::{Account, AuthError, Backend, Client, CodeRequest, PasswordChallenge};
 
 type Token<B> = <<B as Backend>::Client as Client>::LoginToken;
 type Challenge<B> = PasswordChallenge<<<B as Backend>::Client as Client>::PasswordToken>;
+type Next<B> = SignInNext<<<B as Backend>::Client as Client>::PasswordToken>;
 
 impl<B: Backend> Actor<B> {
-    pub(super) async fn on_auth(
-        &mut self,
-        kind: AuthKind,
-        joined: Result<AuthDone<B::Client>, JoinError>,
-    ) {
-        // A logout aborted the login; nothing it found applies any more.
-        if matches!(self.life.phase, Phase::LoggingOut(_)) {
-            return;
-        }
-        let AuthDone { guard, step } = match joined {
-            Ok(done) => done,
-            Err(e) => {
-                if e.is_panic() {
-                    self.auth_panicked(kind).await;
-                }
-                return;
-            }
-        };
-        match step {
-            AuthStep::SignIn(res) => self.on_sign_in(guard, res).await,
-            AuthStep::Password(res) => self.on_password(guard, res).await,
-            other => {
-                drop(guard);
-                self.on_settled(kind, other).await;
-            }
+    pub(super) async fn on_auth(&mut self, msg: AuthMsg<B::Client>) {
+        match msg {
+            AuthMsg::Step { tag, step } => self.on_auth_step(tag, step).await,
+            AuthMsg::Cred { attempt, done } => self.on_cred(attempt, done).await,
         }
     }
 
-    /// Outcomes that release the pending flag.
-    async fn on_settled(&mut self, kind: AuthKind, step: AuthStep<B::Client>) {
+    /// A current task's result.
+    pub(super) async fn apply_auth(&mut self, kind: AuthKind, step: AuthStep<B::Client>) {
         match step {
             AuthStep::Startup(res) => self.on_startup(res).await,
             AuthStep::CodeSent(res) => self.on_code_sent(kind, res).await,
+            AuthStep::SignIn(res) => self.on_sign_in(res).await,
+            AuthStep::Password(res) => self.on_password(res).await,
             AuthStep::Challenge(res) => self.on_challenge(res).await,
-            AuthStep::Confirmed { account, durable } => self.finish_login(account, durable).await,
-            AuthStep::Unresolved(Ambiguous::Code) => {
-                self.code_state(Some(UserError::Network)).await;
-            }
-            AuthStep::Unresolved(Ambiguous::Password) => {
-                self.token_unavailable(UserError::Network).await;
-            }
-            AuthStep::SignIn(_) | AuthStep::Password(_) => {}
+            AuthStep::Confirmed {
+                account,
+                durable,
+                new_login,
+            } => self.finish_login(account, durable, new_login).await,
+            AuthStep::Probe(Probed::NotAuthorized) => self.reconcile_not_authorized().await,
+            AuthStep::Probe(Probed::Unknown(fail)) => self.reconcile_failed(fail).await,
         }
     }
 
     async fn on_startup(&mut self, res: Result<Account, AuthFail>) {
-        if res
-            == Err(AuthFail::Auth(AuthError::Backend(
-                BackendError::Unauthorized,
-            )))
-        {
-            return self.session_revoked().await;
+        match res {
+            Err(fail) if fail.is_revoked() => return self.session_revoked().await,
+            Ok(_) => self.credentials_proven(),
+            Err(_) => {}
         }
         if self.auth.state != AuthState::Connecting {
             return;
         }
         // Offline: still signed in; the name follows on a later start.
         let display_name = res.map(|a| a.display_name).unwrap_or_default();
-        self.set_auth(AuthState::SignedIn { display_name }).await;
+        self.set_auth(AuthState::SignedIn {
+            display_name,
+            new_login: None,
+        })
+        .await;
     }
 
-    async fn on_code_sent(&mut self, kind: AuthKind, res: Result<Token<B>, AuthFail>) {
+    async fn on_code_sent(&mut self, kind: AuthKind, res: Result<CodeRequest<Token<B>>, AuthFail>) {
         let fail = match res {
-            Ok(token) => {
+            Ok(CodeRequest { token, sent }) => {
                 self.auth.login_token = Some(std::sync::Arc::new(token));
+                self.auth.sent = Some(sent_info(sent));
+                // The first successful code request proves the pair.
+                self.credentials_proven();
                 return self.code_state(None).await;
             }
             Err(fail) => fail,
         };
-        let resume = if kind == AuthKind::ResendCode {
-            AuthState::Code {
-                phone_hint: self.auth.phone_hint.clone(),
-                error: None,
-            }
-        } else {
-            AuthState::Phone { error: None }
-        };
+        if fail.is_revoked() {
+            return self.login_revoked().await;
+        }
+        let resend = kind == AuthKind::ResendCode;
         if let Some(seconds) = fail.flood_seconds() {
+            let resume = if resend {
+                self.code_resume()
+            } else {
+                AuthState::Phone { error: None }
+            };
             return self.flood_wait(seconds, resume).await;
         }
-        let error = fail.user_error();
-        let next = match (fail, resume) {
+        match fail {
             // Plan section 17.2: back to credentials; the session is untouched.
-            (AuthFail::Auth(AuthError::Credentials(e)), _) => {
+            AuthFail::Auth(AuthError::Credentials(e)) => self.credentials_rejected(e).await,
+            AuthFail::Auth(AuthError::OfficialAppRequired) => {
                 self.auth.clear_login();
-                AuthState::NeedCredentials { error: Some(e) }
+                self.set_auth(AuthState::OfficialAppRequired).await;
             }
-            (AuthFail::Auth(AuthError::PhoneInvalid | AuthError::PhoneBanned), _)
-            | (_, AuthState::Phone { .. }) => AuthState::Phone { error: Some(error) },
-            (_, resume) => with_error(resume, error),
-        };
-        self.set_auth(next).await;
-    }
-
-    async fn on_sign_in(
-        &mut self,
-        guard: AuthInFlight,
-        res: Result<SignInNext<<B::Client as Client>::PasswordToken>, AuthFail>,
-    ) {
-        match res {
-            Ok(SignInNext::Password(challenge)) => {
-                drop(guard);
-                self.auth.login_token = None;
-                self.password_state(challenge, None).await;
+            AuthFail::Auth(
+                AuthError::PhoneInvalid | AuthError::PhoneBanned | AuthError::PhoneFlood,
+            ) => {
+                let error = Some(fail.user_error());
+                self.set_auth(AuthState::Phone { error }).await;
             }
-            Ok(SignInNext::InvalidCode) => {
-                drop(guard);
-                self.code_state(Some(UserError::InvalidCode)).await;
-            }
-            Ok(SignInNext::SignUpRequired) => {
-                drop(guard);
-                self.auth.clear_login();
-                self.set_auth(AuthState::SignUpRequired).await;
-            }
-            Err(fail) => {
-                if fail.is_ambiguous() {
-                    // Keep the pending flag until the probe has answered.
-                    return self.probe(Ambiguous::Code, guard);
-                }
-                drop(guard);
-                if let Some(seconds) = fail.flood_seconds() {
-                    let resume = AuthState::Code {
-                        phone_hint: self.auth.phone_hint.clone(),
-                        error: None,
-                    };
-                    return self.flood_wait(seconds, resume).await;
-                }
-                self.code_state(Some(fail.user_error())).await;
+            _ if resend => self.code_state(Some(fail.user_error())).await,
+            _ => {
+                let error = Some(fail.user_error());
+                self.set_auth(AuthState::Phone { error }).await;
             }
         }
+    }
+
+    fn code_resume(&self) -> AuthState {
+        AuthState::Code {
+            phone_hint: self.auth.phone_hint.clone(),
+            sent: self.auth.sent,
+            error: None,
+        }
+    }
+
+    async fn on_sign_in(&mut self, res: Result<Next<B>, AuthFail>) {
+        let fail = match res {
+            Ok(SignInNext::Password(challenge)) => {
+                self.auth.login_token = None;
+                return self.password_state(challenge, None).await;
+            }
+            Ok(SignInNext::InvalidCode) => {
+                return self.code_state(Some(UserError::InvalidCode)).await;
+            }
+            Ok(SignInNext::SignUpRequired) => {
+                self.auth.clear_login();
+                return self.set_auth(AuthState::SignUpRequired).await;
+            }
+            Err(fail) => fail,
+        };
+        if fail.is_revoked() {
+            return self.login_revoked().await;
+        }
+        if fail.is_ambiguous() {
+            return self.begin_reconcile(Resume::Code).await;
+        }
+        if let Some(seconds) = fail.flood_seconds() {
+            let resume = self.code_resume();
+            return self.flood_wait(seconds, resume).await;
+        }
+        self.code_state(Some(fail.user_error())).await;
     }
 
     /// `check_password` answered. Anything but a wrong password consumed the
     /// token.
-    async fn on_password(&mut self, guard: AuthInFlight, res: Result<Challenge<B>, AuthFail>) {
+    async fn on_password(&mut self, res: Result<Challenge<B>, AuthFail>) {
         let fail = match res {
             Ok(challenge) => {
-                drop(guard);
                 return self
                     .password_state(challenge, Some(UserError::InvalidPassword))
                     .await;
             }
             Err(fail) => fail,
         };
-        if fail.is_ambiguous() {
-            return self.probe(Ambiguous::Password, guard);
+        if fail.is_revoked() {
+            return self.login_revoked().await;
         }
-        drop(guard);
+        if fail.is_ambiguous() {
+            return self.begin_reconcile(Resume::Password).await;
+        }
         self.token_consumed(fail).await;
     }
 
     async fn on_challenge(&mut self, res: Result<Challenge<B>, AuthFail>) {
         match res {
             Ok(challenge) => self.password_state(challenge, None).await,
+            Err(fail) if fail.is_revoked() => self.login_revoked().await,
             Err(fail) => self.token_consumed(fail).await,
         }
     }
@@ -190,9 +182,9 @@ impl<B: Backend> Actor<B> {
         self.set_auth(AuthState::Password { hint, error }).await;
     }
 
-    /// A login task panicked (a bug in the Telegram library). Its guard was
-    /// dropped while unwinding, so the user can retry.
-    async fn auth_panicked(&mut self, kind: AuthKind) {
+    /// A login task panicked. Its permit was released while unwinding, so
+    /// the user can retry.
+    pub(super) async fn auth_panicked(&mut self, kind: AuthKind) {
         let error = UserError::Internal;
         match kind {
             AuthKind::Startup => {
@@ -202,22 +194,10 @@ impl<B: Backend> Actor<B> {
             AuthKind::RequestCode => {
                 self.set_auth(AuthState::Phone { error: Some(error) }).await;
             }
-            AuthKind::ResendCode | AuthKind::SignIn | AuthKind::Probe(Ambiguous::Code) => {
-                self.code_state(Some(error)).await;
-            }
-            AuthKind::Password | AuthKind::Challenge | AuthKind::Probe(Ambiguous::Password) => {
-                self.token_unavailable(error).await;
-            }
+            AuthKind::ResendCode | AuthKind::SignIn => self.code_state(Some(error)).await,
+            AuthKind::Password | AuthKind::Challenge => self.token_unavailable(error).await,
+            // Still unresolved: retry the probe with backoff.
+            AuthKind::Probe => self.reconcile_failed(AuthFail::Dropped).await,
         }
-    }
-}
-
-fn with_error(state: AuthState, error: UserError) -> AuthState {
-    match state {
-        AuthState::Code { phone_hint, .. } => AuthState::Code {
-            phone_hint,
-            error: Some(error),
-        },
-        other => other,
     }
 }

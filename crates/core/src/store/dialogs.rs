@@ -9,11 +9,32 @@ pub const MAX_DIALOGS: usize = 1000;
 
 /// Ordered chat list: pinned chats first in server order, then unpinned chats by
 /// recency. Bounded by [`MAX_DIALOGS`].
+///
+/// After a refreshed first page, the chats kept from earlier pages are
+/// *provisional*: they form the tail of the list (from `confirmed` on) until
+/// the restarted traversal reaches them again. Rows the traversal returns are
+/// *confirmed*, in server order, ahead of every provisional row, so a chat
+/// found below the first page is admitted even at capacity, evicting the
+/// lowest-ranked provisional row.
 #[derive(Debug, Default)]
 pub struct Dialogs {
     list: Vec<ChatSummary>,
-    /// Bumped by every call that can change which chats are listed.
+    /// `list[..confirmed]` is confirmed, `list[confirmed..]` provisional.
+    confirmed: usize,
+    /// Bumped by every call that can change which chats are listed, or
+    /// their order.
     rev: u64,
+}
+
+/// What a later page did to the list.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Appended {
+    /// The chats added or changed, in server order.
+    pub changed: Vec<ChatSummary>,
+    /// The page did more than update rows in place and append at the end
+    /// (it placed a chat before provisional rows, or evicted or dropped
+    /// one): the caller should resend the whole list.
+    pub reordered: bool,
 }
 
 /// What a new message did to the chat list.
@@ -82,6 +103,7 @@ impl Dialogs {
     pub fn reset(&mut self, chats: Vec<ChatSummary>) {
         self.list.clear();
         self.extend(chats);
+        self.confirmed = self.list.len();
     }
 
     /// Applies a freshly loaded *first* page (bootstrap or refresh) without
@@ -94,6 +116,7 @@ impl Dialogs {
     pub fn merge_first_page(&mut self, page: Vec<ChatSummary>, rest: Rest) -> usize {
         let old = std::mem::take(&mut self.list);
         self.extend(page);
+        self.confirmed = self.list.len();
         if rest == Rest::Last {
             return 0;
         }
@@ -120,27 +143,63 @@ impl Dialogs {
         self.list.len() - before
     }
 
-    /// Applies a later page in server order: chats already listed are updated
-    /// in place, new ones are appended. Returns the chats added or changed.
-    pub fn append(&mut self, chats: Vec<ChatSummary>) -> Vec<ChatSummary> {
+    /// Applies a later page in server order. Confirmed chats are updated in
+    /// place; provisional and new ones become confirmed at the end of the
+    /// confirmed rows, a new one evicting the lowest-ranked provisional row
+    /// when the list is full (it is dropped only when every row is
+    /// confirmed). A page that ends the server's list drops the provisional
+    /// rows the traversal never reached: they are gone from the server.
+    pub fn append(&mut self, chats: Vec<ChatSummary>, rest: Rest) -> Appended {
         self.rev = self.rev.wrapping_add(1);
-        let mut changed = Vec::new();
+        let mut out = Appended::default();
         for chat in chats {
-            if let Some(slot) = self.list.iter_mut().find(|c| c.id == chat.id) {
-                if *slot != chat {
-                    slot.clone_from(&chat);
-                    changed.push(chat);
+            match self.list.iter().position(|c| c.id == chat.id) {
+                Some(pos) if pos < self.confirmed => {
+                    if let Some(slot) = self.list.get_mut(pos)
+                        && *slot != chat
+                    {
+                        slot.clone_from(&chat);
+                        out.changed.push(chat);
+                    }
                 }
-            } else if self.list.len() < MAX_DIALOGS {
-                self.list.push(chat.clone());
-                changed.push(chat);
+                Some(pos) => {
+                    let old = self.list.remove(pos);
+                    out.reordered |= pos != self.confirmed;
+                    self.admit(chat.clone());
+                    if old != chat {
+                        out.changed.push(chat);
+                    }
+                }
+                None => {
+                    if self.list.len() >= MAX_DIALOGS {
+                        if self.confirmed >= self.list.len() {
+                            continue; // every row is confirmed: full
+                        }
+                        self.list.pop();
+                        out.reordered = true;
+                    }
+                    out.reordered |= self.confirmed < self.list.len();
+                    self.admit(chat.clone());
+                    out.changed.push(chat);
+                }
             }
         }
-        changed
+        if rest == Rest::Last && self.confirmed < self.list.len() {
+            self.list.truncate(self.confirmed);
+            out.reordered = true;
+        }
+        debug_assert!(self.confirmed <= self.list.len() && self.list.len() <= MAX_DIALOGS);
+        out
     }
 
-    /// Changes whenever the set of listed chats may have changed (not on
-    /// bumps or unread changes, which only reorder or update rows).
+    /// Inserts `chat` as the last confirmed row. The caller made room.
+    fn admit(&mut self, chat: ChatSummary) {
+        self.list.insert(self.confirmed, chat);
+        self.confirmed += 1;
+    }
+
+    /// Changes whenever the set or order of listed chats may have changed
+    /// (not on unread changes or bumps that leave a chat in place).
     pub fn rev(&self) -> u64 {
         self.rev
     }
@@ -173,6 +232,7 @@ impl Dialogs {
         {
             return Bump::Reflected;
         }
+        let provisional = pos >= self.confirmed;
         let mut summary = self.list.remove(pos);
         summary.last = Some(last.preview);
         summary.last_date = summary.last_date.max(last.date);
@@ -186,6 +246,13 @@ impl Dialogs {
             self.list.iter().take_while(|c| c.pinned).count()
         };
         self.list.insert(insert_at, summary.clone());
+        if provisional && insert_at <= self.confirmed {
+            // Moved to the top by a new message: its rank is known now.
+            self.confirmed += 1;
+        }
+        if insert_at != pos {
+            self.rev = self.rev.wrapping_add(1);
+        }
         Bump::Updated(summary)
     }
 
@@ -291,8 +358,8 @@ mod tests {
         let page: Vec<_> = (0..i64::try_from(MAX_DIALOGS).unwrap() + 50)
             .map(chat)
             .collect();
-        d.append(vec![chat(0), chat(0)]);
-        let added = d.append(page);
+        d.append(vec![chat(0), chat(0)], Rest::More);
+        let added = d.append(page, Rest::More).changed;
         assert_eq!(d.len(), MAX_DIALOGS);
         assert_eq!(added.len(), MAX_DIALOGS - 1);
         assert_eq!(added.first().map(|c| c.id), Some(id(1)));
@@ -310,7 +377,7 @@ mod tests {
         let mut d = Dialogs::default();
         // Loaded: pinned 1, then 2..=6 by recency (dates 60..20).
         d.reset(vec![pinned(1)]);
-        d.append((2..=6).map(|n| dated(n, 80 - n * 10)).collect());
+        d.append((2..=6).map(|n| dated(n, 80 - n * 10)).collect(), Rest::More);
         // Fresh first page: 6 got a new message, 2 was left (newer than the
         // page's oldest, but missing), 1 was unpinned and is not in the page.
         let page = vec![dated(6, 100), dated(3, 50)];
@@ -345,7 +412,9 @@ mod tests {
         d.reset(vec![chat(1), chat(2)]);
         let mut fresh = chat(1);
         fresh.unread = 3;
-        let changed = d.append(vec![fresh.clone(), chat(2), chat(3)]);
+        let changed = d
+            .append(vec![fresh.clone(), chat(2), chat(3)], Rest::More)
+            .changed;
         assert_eq!(changed, vec![fresh, chat(3)]);
         assert_eq!(ids(&d), vec![1, 2, 3]);
         assert_eq!(d.as_slice()[0].unread, 3);
@@ -359,5 +428,52 @@ mod tests {
         d.reset(vec![c]);
         d.bump(id(1), last(0), Unread::Increment);
         assert_eq!(d.as_slice()[0].unread, u32::MAX);
+    }
+
+    /// Round 9, finding 3: at capacity after a refresh, a chat the restarted
+    /// traversal finds below the first page is admitted in server order,
+    /// evicting the lowest-ranked provisional row.
+    #[test]
+    fn refreshed_traversal_admits_new_chats_at_capacity() {
+        let max = i64::try_from(MAX_DIALOGS).unwrap();
+        let mut d = Dialogs::default();
+        d.reset((0..max).map(|n| dated(n, -n)).collect());
+        // Fresh first page: the same 100 head rows; 900 provisional rows.
+        d.merge_first_page((0..100).map(|n| dated(n, -n)).collect(), Rest::More);
+        assert_eq!(d.len(), MAX_DIALOGS);
+        // The next page holds a new chat at server position 150.
+        let mut page: Vec<_> = (100..200).map(|n| dated(n, -n)).collect();
+        page.insert(50, dated(5000, -150));
+        page.pop();
+        let out = d.append(page, Rest::More);
+        assert!(out.reordered);
+        assert_eq!(out.changed, vec![dated(5000, -150)]);
+        assert_eq!(d.len(), MAX_DIALOGS);
+        assert_eq!(d.as_slice()[150].id, id(5000));
+        assert!(d.get(id(max - 1)).is_none(), "lowest provisional evicted");
+        assert_eq!(d.as_slice()[200].id, id(199), "provisional order kept");
+    }
+
+    #[test]
+    fn end_of_traversal_drops_unconfirmed_rows() {
+        let mut d = Dialogs::default();
+        d.reset((1..=5).map(chat).collect());
+        d.merge_first_page(vec![chat(1)], Rest::More);
+        let out = d.append(vec![chat(3)], Rest::Last);
+        assert!(out.reordered);
+        assert_eq!(ids(&d), vec![1, 3]);
+    }
+
+    /// Round 9, finding 4: a bump that moves a chat changes the revision.
+    #[test]
+    fn reordering_bump_changes_the_revision() {
+        let mut d = Dialogs::default();
+        d.reset(vec![chat(1), chat(2)]);
+        let rev = d.rev();
+        d.bump(id(1), last(10), Unread::Unchanged);
+        assert_eq!(d.rev(), rev, "already on top: same order");
+        d.bump(id(2), last(11), Unread::Unchanged);
+        assert_ne!(d.rev(), rev);
+        assert_eq!(ids(&d), vec![2, 1]);
     }
 }

@@ -1,15 +1,28 @@
-//! What to start: the fake backend (`--fake`) or the real one with
-//! credentials from the environment (plan section 12). Credentials are read at
-//! runtime only and never logged.
+//! What to start: the fake backend (`--fake`, optionally `--onboarding`) or
+//! the real one (plan sections 12 and 17.1). The real backend resolves its
+//! API credentials in core: the env pair (`ABYSS_API_ID`/`ABYSS_API_HASH`)
+//! is only read here and handed over as an [`EnvResolution`]; a missing pair
+//! is not a launch error any more, it is the onboarding. Credentials are
+//! never logged.
 
 use std::ffi::{OsStr, OsString};
 
-use abyss_core::Credentials;
-use abyss_core::api::ApiHash;
+use abyss_core::credentials::{EnvResolution, from_env};
 
-pub(crate) const API_ID_VAR: &str = "ABYSS_API_ID";
-pub(crate) const API_HASH_VAR: &str = "ABYSS_API_HASH";
 pub(crate) const FAKE_FLAG: &str = "--fake";
+/// With `--fake`: start from `NeedCredentials`, as on a first run.
+#[cfg(feature = "fake")]
+pub(crate) const ONBOARDING_FLAG: &str = "--onboarding";
+
+/// Where the fake starts.
+#[cfg(feature = "fake")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FakeStart {
+    /// Signed in to the demo account, with an env-like pair.
+    Demo,
+    /// No credentials: the onboarding from the welcome screen.
+    Onboarding,
+}
 
 #[derive(Debug)]
 pub(crate) enum Launch {
@@ -18,21 +31,16 @@ pub(crate) enum Launch {
     #[cfg(feature = "fake")]
     Fake {
         faults: abyss_core::FakeFaults,
+        start: FakeStart,
     },
-    Telegram(Credentials),
+    Telegram(EnvResolution),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LaunchError {
-    /// Names of the variables that are unset or empty.
-    MissingCredentials(Vec<&'static str>),
-    /// `ABYSS_API_ID` is set but is not a positive integer.
-    InvalidApiId,
-    /// `ABYSS_API_HASH` is set but is not 32 hexadecimal characters.
-    InvalidApiHash,
     /// `--fake` was passed to a build without the `fake` feature.
     #[cfg_attr(
-        feature = "fake",
+        all(feature = "fake", not(test)),
         expect(
             dead_code,
             reason = "only builds without the fake backend reject --fake"
@@ -42,49 +50,50 @@ pub(crate) enum LaunchError {
 }
 
 /// Decides what to start from the command line and an environment lookup.
+#[cfg_attr(
+    feature = "fake",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "only builds without the fake backend fail (`FakeNotBuilt`)"
+    )
+)]
 pub(crate) fn resolve(
     args: impl IntoIterator<Item = OsString>,
     var: impl Fn(&str) -> Option<OsString>,
 ) -> Result<Launch, LaunchError> {
     // Skip argv[0]; ignore anything else (macOS may add `-psn_…`).
-    if args.into_iter().skip(1).any(|a| a == OsStr::new(FAKE_FLAG)) {
+    let args: Vec<OsString> = args.into_iter().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|a| a == OsStr::new(flag));
+    if has(FAKE_FLAG) {
         #[cfg(feature = "fake")]
         return Ok(Launch::Fake {
             faults: var(abyss_core::FAKE_FAULTS_VAR)
                 .and_then(|v| v.into_string().ok())
                 .map(|v| abyss_core::FakeFaults::parse(&v))
                 .unwrap_or_default(),
+            start: if has(ONBOARDING_FLAG) {
+                FakeStart::Onboarding
+            } else {
+                FakeStart::Demo
+            },
         });
         #[cfg(not(feature = "fake"))]
         return Err(LaunchError::FakeNotBuilt);
     }
-    let id = var(API_ID_VAR).filter(|v| !v.is_empty());
-    let hash = var(API_HASH_VAR).filter(|v| !v.is_empty());
-    let (id, hash) = match (id, hash) {
-        (Some(id), Some(hash)) => (id, hash),
-        (id, hash) => {
-            let missing = [(API_ID_VAR, id.is_none()), (API_HASH_VAR, hash.is_none())]
-                .into_iter()
-                .filter_map(|(name, absent)| absent.then_some(name))
-                .collect();
-            return Err(LaunchError::MissingCredentials(missing));
-        }
-    };
-    let api_id = id
-        .to_str()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .filter(|id| *id > 0)
-        .ok_or(LaunchError::InvalidApiId)?;
-    let api_hash = hash
-        .to_str()
-        .and_then(|s| ApiHash::parse(s).ok())
-        .ok_or(LaunchError::InvalidApiHash)?;
-    Ok(Launch::Telegram(Credentials { api_id, api_hash }))
+    // A non-UTF-8 value counts as malformed: it is set, but unusable.
+    Ok(Launch::Telegram(from_env(|name| {
+        var(name).map(|v| v.into_string().unwrap_or_else(|_| "\u{fffd}".to_owned()))
+    })))
 }
 
 #[cfg(test)]
 mod tests {
+    use abyss_core::api::EnvVar;
+
     use super::*;
+
+    const API_ID_VAR: &str = "ABYSS_API_ID";
+    const API_HASH_VAR: &str = "ABYSS_API_HASH";
 
     fn args(list: &[&str]) -> Vec<OsString> {
         std::iter::once("abyss")
@@ -102,66 +111,97 @@ mod tests {
         }
     }
 
-    #[test]
-    fn missing_credentials_name_the_variables() {
-        assert_eq!(
-            resolve(args(&[]), env(&[])).unwrap_err(),
-            LaunchError::MissingCredentials(vec![API_ID_VAR, API_HASH_VAR])
-        );
-        assert_eq!(
-            resolve(args(&[]), env(&[(API_ID_VAR, "1"), (API_HASH_VAR, "")])).unwrap_err(),
-            LaunchError::MissingCredentials(vec![API_HASH_VAR])
-        );
+    fn telegram(launch: Result<Launch, LaunchError>) -> EnvResolution {
+        match launch.unwrap() {
+            Launch::Telegram(env) => env,
+            #[cfg(feature = "fake")]
+            Launch::Fake { .. } => panic!("expected the real backend"),
+        }
     }
 
     const HASH: &str = "0123456789ABCDEF0123456789abcdef";
 
     #[test]
-    fn invalid_api_id() {
-        for bad in ["abc", "-1", "0", "99999999999"] {
-            assert_eq!(
-                resolve(args(&[]), env(&[(API_ID_VAR, bad), (API_HASH_VAR, HASH)])).unwrap_err(),
-                LaunchError::InvalidApiId
-            );
-        }
+    fn no_env_pair_is_the_onboarding_not_an_error() {
+        assert_eq!(
+            telegram(resolve(args(&[]), env(&[]))),
+            EnvResolution::Absent
+        );
     }
 
     #[test]
-    fn invalid_api_hash() {
-        for bad in ["h", "0123456789abcdef0123456789abcdeg", &format!("{HASH}0")] {
+    fn a_partial_env_pair_names_the_missing_variable() {
+        assert_eq!(
+            telegram(resolve(
+                args(&[]),
+                env(&[(API_ID_VAR, "1"), (API_HASH_VAR, "")])
+            )),
+            EnvResolution::Partial {
+                missing: EnvVar::ApiHash
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_env_values() {
+        for bad in ["abc", "-1", "0", "99999999999"] {
             assert_eq!(
-                resolve(args(&[]), env(&[(API_ID_VAR, "1"), (API_HASH_VAR, bad)])).unwrap_err(),
-                LaunchError::InvalidApiHash
+                telegram(resolve(
+                    args(&[]),
+                    env(&[(API_ID_VAR, bad), (API_HASH_VAR, HASH)])
+                )),
+                EnvResolution::Malformed { var: EnvVar::ApiId }
             );
         }
+        assert_eq!(
+            telegram(resolve(
+                args(&[]),
+                env(&[(API_ID_VAR, "1"), (API_HASH_VAR, "xyz")])
+            )),
+            EnvResolution::Malformed {
+                var: EnvVar::ApiHash
+            }
+        );
     }
 
     #[test]
     fn credentials_from_env() {
-        let launch = resolve(
+        let env = telegram(resolve(
             args(&["-psn_0_1"]),
             env(&[(API_ID_VAR, " 42 "), (API_HASH_VAR, HASH)]),
-        );
-        match launch.unwrap() {
-            Launch::Telegram(c) => {
-                assert_eq!(c.api_id, 42);
-                assert_eq!(c.api_hash.expose(), HASH.to_lowercase());
-                assert!(!format!("{c:?}").contains("0123"), "the hash is redacted");
-            }
-            #[cfg(feature = "fake")]
-            Launch::Fake { .. } => panic!("expected credentials"),
-        }
+        ));
+        let EnvResolution::Pair(c) = env else {
+            panic!("expected a pair");
+        };
+        assert_eq!(c.api_id.get(), 42);
+        assert_eq!(c.api_hash.expose(), HASH.to_lowercase());
+        assert!(!format!("{c:?}").contains("0123"), "the hash is redacted");
     }
 
     #[test]
     fn fake_flag_skips_credentials() {
         let launch = resolve(args(&[FAKE_FLAG]), env(&[]));
         #[cfg(feature = "fake")]
-        assert!(
-            matches!(launch, Ok(Launch::Fake { faults }) if faults == abyss_core::FakeFaults::default())
-        );
+        assert!(matches!(
+            launch,
+            Ok(Launch::Fake { faults, start: FakeStart::Demo })
+                if faults == abyss_core::FakeFaults::default()
+        ));
         #[cfg(not(feature = "fake"))]
         assert_eq!(launch.unwrap_err(), LaunchError::FakeNotBuilt);
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn onboarding_flag_starts_the_fake_without_credentials() {
+        let launch = resolve(args(&[ONBOARDING_FLAG, FAKE_FLAG]), env(&[]));
+        assert!(matches!(
+            launch,
+            Ok(Launch::Fake {
+                start: FakeStart::Onboarding,
+                ..
+            })
+        ));
     }
 
     #[cfg(feature = "fake")]
@@ -171,7 +211,7 @@ mod tests {
             args(&[FAKE_FLAG]),
             env(&[(abyss_core::FAKE_FAULTS_VAR, "store-stall")]),
         );
-        let Ok(Launch::Fake { faults }) = launch else {
+        let Ok(Launch::Fake { faults, .. }) = launch else {
             panic!("expected the fake");
         };
         assert!(faults.store_stall);

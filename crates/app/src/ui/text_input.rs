@@ -118,6 +118,16 @@ pub(crate) struct TextInput {
     /// Set by edits and caret moves: the next paint scrolls the caret into view.
     autoscroll: bool,
     is_selecting: bool,
+    mask: Mask,
+}
+
+/// Whether a field shows its text. A hidden field draws one `*` per byte,
+/// which keeps layout offsets exact for the ASCII-only field that uses it
+/// (the `api_hash`), and refuses copy and cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mask {
+    Shown,
+    Hidden,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -137,11 +147,34 @@ impl TextInput {
             scroll_top: px(0.),
             autoscroll: false,
             is_selecting: false,
+            mask: Mask::Shown,
         }
     }
 
     pub(crate) fn text(&self) -> &str {
         self.buffer.text()
+    }
+
+    pub(crate) fn mask(&self) -> Mask {
+        self.mask
+    }
+
+    pub(crate) fn set_mask(&mut self, mask: Mask, cx: &mut Context<'_, Self>) {
+        self.mask = mask;
+        cx.notify();
+    }
+
+    /// Clears the field.
+    pub(crate) fn clear(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        drop(self.take_text(window, cx));
+    }
+
+    /// The masked text as drawn (`*` per byte when hidden).
+    pub(super) fn display_text(&self) -> String {
+        match self.mask {
+            Mask::Shown => self.buffer.text().to_owned(),
+            Mask::Hidden => "*".repeat(self.buffer.text().len()),
+        }
     }
 
     /// Takes the text, leaving the field empty.
@@ -305,14 +338,14 @@ impl TextInput {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<'_, Self>) {
         let text = self.buffer.selected_text();
-        if !text.is_empty() {
+        if !text.is_empty() && self.mask == Mask::Shown {
             cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<'_, Self>) {
         let text = self.buffer.selected_text();
-        if !text.is_empty() {
+        if !text.is_empty() && self.mask == Mask::Shown {
             cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
             let fit = self.buffer.replace(None, "");
             self.after_edit(fit, window, cx);

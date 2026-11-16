@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use super::Actor;
-use super::apply::{HistoryReply, MIN_ID};
+use super::apply::HistoryReply;
 use crate::api::{Event, HistoryDir};
 use crate::backend::{Backend, HistoryPage};
 use crate::model::{Message, MsgId};
@@ -28,25 +28,23 @@ pub(super) struct TailDiff {
 /// Compares a tail `page` with an attached `window`, both ascending by id. An
 /// empty window is reported as a gap: replace instead of merging.
 ///
-/// The page is authoritative from its oldest id (or the start of history)
-/// up to `top` ([`HistoryReply::authoritative_top`]): window messages in
-/// that range that the page lacks were deleted, including the newest ones and
-/// all of them when the server's history is empty. Window messages above
-/// `top` arrived after the request and are left alone.
+/// The page is authoritative over `range`
+/// ([`HistoryReply::authoritative_range`]): from the oldest id the server
+/// sent (or the start of history) up to the authoritative top. Window
+/// messages in that range that the page lacks were deleted, including the
+/// newest ones and all of them when the server's history is empty. Window
+/// messages outside it (older history, or live messages that arrived after
+/// the request) are left alone; with no range, nothing is deleted.
 pub(super) fn tail_diff(
     window: &VecDeque<Message>,
     page: &HistoryPage,
-    top: Option<MsgId>,
+    range: Option<(MsgId, MsgId)>,
 ) -> TailDiff {
     let mut diff = TailDiff::default();
     let (Some(oldest), Some(newest)) = (window.front().map(|m| m.id), window.back().map(|m| m.id))
     else {
         diff.gap = true;
         return diff;
-    };
-    let lo = match page.messages.first() {
-        Some(first) if page.has_more => first.id,
-        _ => MIN_ID,
     };
     for m in &page.messages {
         match window.binary_search_by_key(&m.id, |w| w.id) {
@@ -63,7 +61,7 @@ pub(super) fn tail_diff(
     }
     let mut ids: Vec<MsgId> = page.messages.iter().map(|m| m.id).collect();
     ids.sort_unstable();
-    if let Some(top) = top {
+    if let Some((lo, top)) = range {
         diff.deleted = window
             .iter()
             .map(|w| w.id)
@@ -82,17 +80,13 @@ impl<B: Backend> Actor<B> {
         if w.has_newer() {
             return; // detached: scrolling back down loads current pages
         }
-        let top = p.authoritative_top();
-        let diff = tail_diff(w.messages(), &p.page, top);
+        let range = p.authoritative_range();
+        let diff = tail_diff(w.messages(), &p.page, range);
         if diff.gap {
             return self.on_tail(p).await;
         }
         let (chat, view) = (p.chat, p.view);
-        if let Some(top) = top {
-            let lo = match p.page.messages.first() {
-                Some(first) if p.page.has_more => first.id,
-                _ => MIN_ID,
-            };
+        if let Some((lo, top)) = range {
             self.reconcile(chat, lo, top, &p.page.messages).await;
         }
         let removed = self.windows.delete(chat, &diff.deleted);
@@ -121,8 +115,11 @@ impl<B: Backend> Actor<B> {
 #[cfg(all(test, feature = "fake"))]
 mod tests {
     use super::*;
+    use crate::actor::apply::{Coverage, MIN_ID, TailMode};
+    use crate::backend::HistoryQuery;
     use crate::backend::fake::text_message;
     use crate::model::{ChatId, PeerKind};
+    use crate::store::ViewGen;
 
     const CHAT: ChatId = ChatId {
         kind: PeerKind::User,
@@ -148,7 +145,7 @@ mod tests {
                 messages: page,
                 has_more: true,
             },
-            Some(MsgId(6)),
+            Some((MsgId(3), MsgId(6))),
         );
         assert!(!diff.gap);
         assert_eq!(diff.deleted, vec![MsgId(4)], "1 and 2 are below the page");
@@ -163,7 +160,7 @@ mod tests {
             messages: msgs(&[1, 2, 3, 5]),
             has_more: false,
         };
-        assert!(tail_diff(&window, &page, Some(MsgId(5))).gap);
+        assert!(tail_diff(&window, &page, Some((MIN_ID, MsgId(5)))).gap);
     }
 
     #[test]
@@ -175,7 +172,7 @@ mod tests {
             messages: msgs(&[1, 2, 3, 4, 5, 6, 7, 8, 9]),
             has_more: false,
         };
-        let diff = tail_diff(&window, &page, Some(MsgId(10)));
+        let diff = tail_diff(&window, &page, Some((MIN_ID, MsgId(10))));
         assert!(!diff.gap);
         assert_eq!(
             diff.deleted,
@@ -191,8 +188,41 @@ mod tests {
             messages: Vec::new(),
             has_more: false,
         };
-        let diff = tail_diff(&window, &page, Some(MsgId(4)));
+        let diff = tail_diff(&window, &page, Some((MIN_ID, MsgId(4))));
         assert!(!diff.gap);
         assert_eq!(diff.deleted, vec![MsgId(3), MsgId(4)]);
+    }
+
+    /// Round 9, finding 1: a partial tail (51..=100 of 1..=100) emptied by
+    /// buffered deletions is still authoritative only from 51; it must not
+    /// establish the start of history and delete 1..=50.
+    #[test]
+    fn emptied_partial_tail_keeps_older_messages() {
+        let all: Vec<i32> = (1..=100).collect();
+        let window: VecDeque<Message> = msgs(&all).into();
+        let served = HistoryPage {
+            messages: msgs(&all[50..]),
+            has_more: true,
+        };
+        let mut reply = HistoryReply {
+            chat: CHAT,
+            view: ViewGen(1),
+            dir: crate::api::HistoryDir::Tail,
+            query: HistoryQuery::Tail,
+            floor: Some(MsgId(100)),
+            covered: Coverage::of(&served),
+            page: served,
+            mode: TailMode::Merge,
+        };
+        reply.page.messages.clear(); // every message was tombstoned
+        let range = reply.authoritative_range();
+        assert_eq!(range, Some((MsgId(51), MsgId(100))));
+        let diff = tail_diff(&window, &reply.page, range);
+        assert!(!diff.gap);
+        let expected: Vec<MsgId> = (51..=100).map(MsgId).collect();
+        assert_eq!(diff.deleted, expected);
+        // A partial page that covered nothing establishes nothing.
+        reply.covered = None;
+        assert_eq!(reply.authoritative_range(), None);
     }
 }

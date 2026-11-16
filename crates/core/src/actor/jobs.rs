@@ -145,6 +145,8 @@ pub(super) enum TaskKind {
     Read,
     CacheChats,
     Updates,
+    /// A login call (task 6b), for panic handling.
+    Auth(super::auth::AuthTag),
 }
 
 /// A spawned task reporting back to the actor.

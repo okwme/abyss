@@ -4,9 +4,10 @@ use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId};
 use crate::store::ViewGen;
 
 pub use crate::auth_types::{
-    ApiHash, ApiHashError, AuthState, CredentialError, LocalDeletion, LogoutStatus,
-    PASSWORD_CAPACITY, PasswordBuf, PasswordTooLong, RemoteLogout, SaveStatus, StorageError,
-    mask_phone,
+    ApiCredentials, ApiHash, ApiHashError, ApiId, ApiIdError, AuthState, CodeDelivery,
+    CredentialError, CredentialSource, EnvVar, LocalDeletion, LogoutStatus, NewLogin, NextDelivery,
+    PASSWORD_CAPACITY, PasswordBuf, PasswordTooLong, RemoteLogout, SaveStatus, SentCodeInfo,
+    StorageError, mask_phone,
 };
 
 /// Generation of the client instance. Bumps on every rebuild, login and logout;
@@ -59,6 +60,25 @@ pub enum Command {
     /// item and the cache (plan sections 5, 16). While signed out, it retries
     /// the local deletion only.
     Logout,
+    /// Onboarding (plan section 17.2): use this pair. Persisted only after
+    /// the first successful code request. Refused while an env override or
+    /// an unreadable Keychain is in control.
+    SubmitCredentials {
+        api_id: i32,
+        api_hash: ApiHash,
+    },
+    /// Deletes the stored pair (never an env override). Refused while signed
+    /// in: changing credentials means logging out first.
+    ForgetStoredCredentials,
+    /// Re-runs credential resolution: the Retry for an unreadable Keychain,
+    /// or "use the saved pair" after Back.
+    ReloadCredentials,
+    /// Retries saving the entered pair after a Keychain write failed.
+    RetryCredentialSave,
+    /// One login step back (plan section 17.3): code, password and the
+    /// official-app screens go to the phone screen; the phone screen goes to
+    /// the credential screens. Refused once signed in (only logout goes back).
+    Back,
 }
 
 impl std::fmt::Debug for Command {
@@ -89,6 +109,11 @@ impl std::fmt::Debug for Command {
                 .finish(),
             Self::ViewingTail(c) => f.debug_tuple("ViewingTail").field(c).finish(),
             Self::Logout => f.write_str("Logout"),
+            Self::SubmitCredentials { .. } => f.write_str("SubmitCredentials(<redacted>)"),
+            Self::ForgetStoredCredentials => f.write_str("ForgetStoredCredentials"),
+            Self::ReloadCredentials => f.write_str("ReloadCredentials"),
+            Self::RetryCredentialSave => f.write_str("RetryCredentialSave"),
+            Self::Back => f.write_str("Back"),
         }
     }
 }
@@ -129,7 +154,10 @@ pub enum SendState {
     Failed,
     /// The server asked to wait (`FLOOD_WAIT`): not sent. Core resends it with
     /// the same `random_id` once `seconds` (counted from this event) have
-    /// passed; it can be discarded meanwhile.
+    /// passed (at least one second); it can be discarded meanwhile. Automatic
+    /// resends are bounded: after repeated flood waits, or past a total retry
+    /// window, the send becomes `Failed` (with `UserError::FloodWait`) and
+    /// waits for Retry or Discard.
     FloodWait {
         seconds: u32,
     },
@@ -156,6 +184,16 @@ pub enum UserError {
     PhoneInvalid,
     /// Telegram banned the phone number (`PHONE_NUMBER_BANNED`).
     PhoneBanned,
+    /// Too many login attempts for this number (`PHONE_NUMBER_FLOOD`,
+    /// `PHONE_PASSWORD_FLOOD`); no countdown is given.
+    PhoneFlood,
+    /// The entered API credentials could not be saved to the Keychain. They
+    /// stay in memory and are retried on the next successful login step.
+    CredentialsNotSaved(StorageError),
+    /// The stored API credentials could not be deleted.
+    CredentialsNotForgotten(StorageError),
+    /// Not while signed in: log out first.
+    SignOutFirst,
     /// The login code is wrong or expired; ask for a new one.
     InvalidCode,
     /// The 2FA password is wrong.
@@ -187,13 +225,18 @@ pub enum HistoryDir {
 #[derive(Debug)]
 pub enum Event {
     Auth(AuthState),
+    /// Which credential source is in control (plan section 17.2a); `None`
+    /// while none is.
+    CredentialSource(Option<CredentialSource>),
     Connection(ConnState),
     /// The whole chat list, replacing the UI's copy. A reloaded first page
     /// (bootstrap, refresh) is merged into the loaded list in core, so later
     /// pages survive it.
     DialogsReset(Vec<ChatSummary>),
     /// Chats a later page added or changed: the UI updates listed chats in
-    /// place and appends new ones.
+    /// place and appends new ones. A page that reorders the list (after a
+    /// refresh, a newly found chat is placed in server order and may evict a
+    /// provisional one) is sent as `DialogsReset` instead.
     DialogsAppended(Vec<ChatSummary>),
     /// Whether more dialogs pages can be loaded (`LoadDialogs`), after every
     /// applied dialogs page. A refreshed first page restarts pagination, so

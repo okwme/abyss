@@ -5,11 +5,11 @@
 //! `mark_as_read` hardcodes `max_id: 0`, and `send_message` draws a fresh
 //! `random_id` per call. Responses go through the pure mappers in `map`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use grammers_client::InvocationError;
 use grammers_client::session::Session as _;
-use grammers_client::session::types::PeerInfo;
+use grammers_client::session::types::{PeerId, PeerInfo};
 use grammers_client::tl;
 
 use super::errors::{backend_error, kind};
@@ -18,7 +18,7 @@ use super::map::{self, Directory};
 use super::pins::Pins;
 use crate::backend::{BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery};
 use crate::model::{ChatId, MsgId};
-use crate::session::AbyssSession;
+use crate::session::{AbyssSession, Pinned};
 
 /// Telegram's page size limit for dialogs and history.
 pub(crate) const MAX_PAGE: u32 = 100;
@@ -120,8 +120,9 @@ pub(crate) struct Calls<I> {
     session: Arc<AbyssSession>,
     /// What stays pinned in `session`, so the retired snapshot carries every
     /// access hash core may still need (see [`Pins`]). Held across the
-    /// session update, so concurrent calls cannot interleave two updates.
-    pins: tokio::sync::Mutex<Pins>,
+    /// session update (never across an `.await`), so two updates cannot
+    /// interleave.
+    pins: Mutex<Pins>,
 }
 
 impl<I> std::fmt::Debug for Calls<I> {
@@ -130,18 +131,81 @@ impl<I> std::fmt::Debug for Calls<I> {
     }
 }
 
-impl<I: Invoke> Calls<I> {
-    pub(crate) fn new(invoker: I, session: Arc<AbyssSession>, pins: Pins) -> Self {
-        Self {
-            invoker,
-            session,
-            pins: tokio::sync::Mutex::new(pins),
+/// A call in progress on a chat: its peer stays pinned until the guard drops,
+/// also when the call's future is cancelled.
+struct InFlight<'a, I> {
+    calls: &'a Calls<I>,
+    id: Option<PeerId>,
+}
+
+impl<I> Drop for InFlight<'_, I> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            let mut pins = self.calls.pins();
+            pins.end(id);
+            self.calls.repin(&mut pins);
+        }
+    }
+}
+
+impl<I> Calls<I> {
+    fn pins(&self) -> MutexGuard<'_, Pins> {
+        // `Pins` holds no invariant a panic could break halfway.
+        self.pins.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Hands the session the selected set when it changed.
+    fn repin(&self, pins: &mut Pins) {
+        if let Some(set) = pins.changed() {
+            self.apply(pins, &set);
         }
     }
 
+    fn apply(&self, pins: &mut Pins, set: &[PeerId]) {
+        let Pinned { unknown, .. } = self.session.retain_pinned(set);
+        if unknown > 0 {
+            tracing::debug!(unknown, "listed peers without an access hash left unpinned");
+        }
+        pins.applied(set, unknown);
+    }
+
+    /// Core's required set (`Client::retain_peers`): pinned exactly, plus
+    /// the chats of calls in progress. Never waits on I/O.
+    pub(crate) fn retain(&self, required: &[ChatId]) {
+        let mut pins = self.pins();
+        let invalid = pins.require(required);
+        if invalid > 0 {
+            tracing::debug!(invalid, "required chats with out-of-range ids ignored");
+        }
+        self.repin(&mut pins);
+    }
+
     #[cfg(test)]
+    pub(crate) fn pin_state(&self) -> (Vec<PeerId>, usize) {
+        let pins = self.pins();
+        (pins.selected(), pins.unknown())
+    }
+}
+
+impl<I: Invoke> Calls<I> {
+    /// Calls over `session`, whose current pins (the inherited ones) stay as
+    /// they are until core's first [`Self::retain`].
+    pub(crate) fn new(invoker: I, session: Arc<AbyssSession>) -> Self {
+        let pins = Pins::new(session.pinned_ids());
+        Self {
+            invoker,
+            session,
+            pins: Mutex::new(pins),
+        }
+    }
+
     pub(crate) fn session(&self) -> &Arc<AbyssSession> {
         &self.session
+    }
+
+    /// The raw invoker, for the login calls (`grammers::auth`).
+    pub(crate) fn invoker(&self) -> &I {
+        &self.invoker
     }
 
     async fn info(&self, chat: ChatId) -> Option<PeerInfo> {
@@ -157,37 +221,32 @@ impl<I: Invoke> Calls<I> {
     }
 
     /// Caches every addressable peer of a response (grammers' `auto_cache_peers`
-    /// does the same for the responses it handles itself).
+    /// does the same for the responses it handles itself). Peers core listed
+    /// that the session could not pin are retried: the response may have
+    /// carried their hashes.
     async fn remember(&self, dir: &Directory) {
         for info in dir.infos() {
             let _ = self.session.cache_peer(info).await;
         }
+        let mut pins = self.pins();
+        if let Some(set) = pins.unresolved() {
+            self.apply(&mut pins, &set);
+        }
     }
 
-    /// Applies `change` to the tracked chats and, when the set changed,
-    /// re-pins exactly that set in the session (peers that fell out return
-    /// to the session's bounded unpinned cache).
-    async fn update_pins(&self, change: impl FnOnce(&mut Pins) -> bool) {
-        let mut pins = self.pins.lock().await;
-        if !change(&mut pins) {
-            return;
-        }
-        let chats = pins.all();
-        let mut infos: Vec<PeerInfo> = Vec::with_capacity(chats.len());
-        for chat in chats {
-            if let Some(info) = self.info(chat).await {
-                infos.push(info);
-            }
-        }
-        self.session.replace_pinned_peers(infos);
-    }
-
-    /// Pins a chat about to be addressed, before the request: a rebuild
-    /// during the call must still carry its access hash.
-    async fn resolve_used(&self, chat: ChatId) -> Result<tl::enums::InputPeer, BackendError> {
+    /// Resolves a chat about to be addressed and pins it before the request,
+    /// until the returned guard drops: a rebuild during the call must still
+    /// carry its access hash.
+    async fn resolve_used(
+        &self,
+        chat: ChatId,
+    ) -> Result<(tl::enums::InputPeer, InFlight<'_, I>), BackendError> {
         let peer = self.resolve(chat).await?;
-        self.update_pins(|p| p.use_chat(chat)).await;
-        Ok(peer)
+        let mut pins = self.pins();
+        let id = map::peer_id(chat).filter(|&id| pins.begin(id));
+        self.repin(&mut pins);
+        drop(pins);
+        Ok((peer, InFlight { calls: self, id }))
     }
 
     pub(crate) async fn dialogs(
@@ -222,10 +281,7 @@ impl<I: Invoke> Calls<I> {
         if mapped.excluded > 0 {
             tracing::debug!(excluded = mapped.excluded, "broadcast channels left out");
         }
-        // Every page adds to the pins, the first one too: core keeps older
-        // pages across a refresh, and their chats must survive a rebuild.
-        self.update_pins(|p| p.list(mapped.chats.iter().map(|c| c.id)))
-            .await;
+        // No pinning here: core lists the chats it keeps (`retain`).
         Ok(DialogsPage {
             chats: mapped.chats,
             next: mapped.next,
@@ -238,7 +294,7 @@ impl<I: Invoke> Calls<I> {
         query: HistoryQuery,
         limit: u32,
     ) -> Result<HistoryPage, BackendError> {
-        let peer = self.resolve_used(chat).await?;
+        let (peer, _in_flight) = self.resolve_used(chat).await?;
         let limit = page_limit(limit);
         let (offset_id, add_offset, min_id) = history_offsets(query, limit);
         let request = tl::functions::messages::GetHistory {
@@ -269,7 +325,7 @@ impl<I: Invoke> Calls<I> {
         text: String,
         random_id: i64,
     ) -> Result<MsgId, BackendError> {
-        let peer = self.resolve_used(chat).await?;
+        let (peer, _in_flight) = self.resolve_used(chat).await?;
         let request = send_request(peer, text, random_id);
         let resp = call(&self.invoker, RetryClass::Never, &request)
             .await
@@ -286,7 +342,7 @@ impl<I: Invoke> Calls<I> {
         chat: ChatId,
         max_id: MsgId,
     ) -> Result<(), BackendError> {
-        let peer = self.resolve_used(chat).await?;
+        let (peer, _in_flight) = self.resolve_used(chat).await?;
         let res = if let Some(channel) = map::input_channel(&peer) {
             let request = tl::functions::channels::ReadHistory {
                 channel,

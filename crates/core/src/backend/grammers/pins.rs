@@ -1,134 +1,157 @@
 //! Which peers an instance keeps pinned in its session (plan section 2,
 //! rebuild step 5: the retired snapshot carries only pinned peers).
 //!
-//! A rebuild must not lose the access hash of any chat core still shows or
-//! uses. Core keeps every loaded dialog page across a first-page refresh
-//! (`store::Dialogs::merge_first_page`), and it may address any open chat or
-//! pending send after a rebuild, so the pinned set is the union of:
-//! - the chats carried into this instance (`Seed::peers`), for its lifetime;
-//! - recently used chats (history, sends, read marks), the last
-//!   [`MAX_CARRIED_PEERS`]: open windows and pending sends;
-//! - chats seen in dialog pages, the last [`MAX_DIALOGS`] seen, which covers
-//!   every dialog core can hold.
+//! Core owns the set (`Client::retain_peers`): pending sends, open windows,
+//! then the retained dialogs in list order, at most `MAX_PINNED_PEERS`. The
+//! backend does not guess. The selected set is:
+//! 1. the base: core's last required set or, until core's first call on this
+//!    instance, the peers inherited from the retired instance, kept as they
+//!    are (an unordered snapshot carries no priority to reinterpret);
+//! 2. then the peers of in-flight calls that the base does not list (core
+//!    has not caught up with them yet).
 //!
-//! The union is bounded, and the session additionally caps it at
-//! `MAX_PINNED_PEERS`; peers past that cap are cached unpinned. The priority
-//! order above decides which ones those are.
+//! Deduplicated and cut at `MAX_PINNED_PEERS`, so it always fits the session
+//! cap; the base comes first because core already ranks sends and windows
+//! (the chats calls address) ahead of dialogs. The session is repinned
+//! whenever the selected set changes. A listed peer whose access hash the
+//! session lacks is not pinned, only counted (it cannot be addressed after a
+//! rebuild either way; core reloads it with the dialogs).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 
+use grammers_session::types::PeerId;
+
+use super::map;
 use crate::backend::MAX_CARRIED_PEERS;
 use crate::model::ChatId;
-use crate::store::MAX_DIALOGS;
+use crate::session::MAX_PINNED_PEERS;
 
-/// A bounded least-recently-used set of chats.
-#[derive(Debug)]
-pub(crate) struct Recency {
-    stamps: HashMap<ChatId, u64>,
-    order: BTreeMap<u64, ChatId>,
-    next: u64,
-    cap: usize,
-}
+/// Distinct chats tracked as in flight: core admits at most this many
+/// windows plus sends; beyond it a call is simply not tracked.
+pub(crate) const MAX_IN_FLIGHT: usize = MAX_CARRIED_PEERS;
 
-impl Recency {
-    pub(crate) fn new(cap: usize) -> Self {
-        Self {
-            stamps: HashMap::with_capacity(cap),
-            order: BTreeMap::new(),
-            next: 0,
-            cap,
-        }
-    }
-
-    /// Marks `chat` as the most recent. Returns whether the set of chats
-    /// changed (an insertion, possibly with an eviction).
-    pub(crate) fn touch(&mut self, chat: ChatId) -> bool {
-        let stamp = self.next;
-        self.next = self.next.saturating_add(1);
-        if let Some(old) = self.stamps.insert(chat, stamp) {
-            self.order.remove(&old);
-            self.order.insert(stamp, chat);
-            return false;
-        }
-        self.order.insert(stamp, chat);
-        while self.stamps.len() > self.cap {
-            let Some((_, oldest)) = self.order.pop_first() else {
-                break;
-            };
-            self.stamps.remove(&oldest);
-        }
-        true
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.stamps.len()
-    }
-
-    /// Most recent first.
-    pub(crate) fn newest_first(&self) -> impl Iterator<Item = ChatId> + '_ {
-        self.order.values().rev().copied()
-    }
-}
-
-/// The chats an instance keeps pinned.
+/// The pins of one instance.
 #[derive(Debug)]
 pub(crate) struct Pins {
-    carried: Vec<ChatId>,
-    active: Recency,
-    dialogs: Recency,
+    /// Core's last required set, or the inherited pins before it.
+    base: Vec<PeerId>,
+    /// Chats of calls in progress, with their call counts, oldest first.
+    in_flight: Vec<(PeerId, u32)>,
+    /// The set last handed to the session.
+    applied: HashSet<PeerId>,
+    /// Listed peers the session could not pin at the last application.
+    unknown: usize,
 }
 
 impl Pins {
-    /// `carried` are the build's carried chats; `inherited` the peers the
-    /// retired instance had pinned (its dialogs, open chats and sends), which
-    /// stay pinned until newer dialogs push them out.
-    pub(crate) fn new(carried: &[ChatId], inherited: impl IntoIterator<Item = ChatId>) -> Self {
-        let carried: Vec<ChatId> = carried.iter().copied().take(MAX_CARRIED_PEERS).collect();
-        let mut dialogs = Recency::new(MAX_DIALOGS);
-        for chat in inherited.into_iter().take(crate::session::MAX_PINNED_PEERS) {
-            if !carried.contains(&chat) {
-                dialogs.touch(chat);
+    /// `inherited` are the pins the session started with (the retired
+    /// instance's set); they are already pinned.
+    pub(crate) fn new(mut inherited: Vec<PeerId>) -> Self {
+        inherited.truncate(MAX_PINNED_PEERS);
+        let applied = inherited.iter().copied().collect();
+        Self {
+            base: inherited,
+            in_flight: Vec::with_capacity(MAX_IN_FLIGHT),
+            applied,
+            unknown: 0,
+        }
+    }
+
+    /// Core's required set replaces the base. Returns how many ids were out
+    /// of range (never pinnable, so not counted as unknown).
+    pub(crate) fn require(&mut self, chats: &[ChatId]) -> usize {
+        let mut seen = HashSet::with_capacity(chats.len().min(MAX_PINNED_PEERS));
+        let mut base = Vec::with_capacity(chats.len().min(MAX_PINNED_PEERS));
+        let mut invalid = 0_usize;
+        for &chat in chats {
+            if base.len() >= MAX_PINNED_PEERS {
+                break;
+            }
+            match map::peer_id(chat) {
+                Some(id) => {
+                    if seen.insert(id) {
+                        base.push(id);
+                    }
+                }
+                None => invalid = invalid.saturating_add(1),
             }
         }
-        Self {
-            carried,
-            active: Recency::new(MAX_CARRIED_PEERS),
-            dialogs,
+        self.base = base;
+        invalid
+    }
+
+    /// A call addressing `id` started. Returns whether it is tracked (and so
+    /// must be ended with [`Self::end`]).
+    pub(crate) fn begin(&mut self, id: PeerId) -> bool {
+        if let Some(entry) = self.in_flight.iter_mut().find(|(p, _)| *p == id) {
+            entry.1 = entry.1.saturating_add(1);
+            return true;
+        }
+        if self.in_flight.len() >= MAX_IN_FLIGHT {
+            return false;
+        }
+        self.in_flight.push((id, 1));
+        true
+    }
+
+    /// A tracked call addressing `id` ended.
+    pub(crate) fn end(&mut self, id: PeerId) {
+        let Some(at) = self.in_flight.iter().position(|(p, _)| *p == id) else {
+            return;
+        };
+        let last = self.in_flight.get_mut(at).is_some_and(|entry| {
+            entry.1 = entry.1.saturating_sub(1);
+            entry.1 == 0
+        });
+        if last {
+            self.in_flight.remove(at);
         }
     }
 
-    /// A chat was addressed (history, send, read mark).
-    pub(crate) fn use_chat(&mut self, chat: ChatId) -> bool {
-        self.active.touch(chat)
-    }
-
-    /// Chats listed by a dialogs page, in page order.
-    pub(crate) fn list(&mut self, chats: impl DoubleEndedIterator<Item = ChatId>) -> bool {
-        // Backwards, so the page's first chat ends up the most recent.
-        let mut changed = false;
-        for chat in chats.rev() {
-            changed |= self.dialogs.touch(chat);
-        }
-        changed
-    }
-
-    /// Every chat to pin, distinct, in priority order. Bounded by the sum of
-    /// the three caps.
-    pub(crate) fn all(&self) -> Vec<ChatId> {
-        let cap = self.carried.len() + self.active.len() + self.dialogs.len();
+    /// The selected set: the base, then in-flight extras, distinct, at most
+    /// `MAX_PINNED_PEERS`.
+    pub(crate) fn selected(&self) -> Vec<PeerId> {
+        let cap = self
+            .base
+            .len()
+            .saturating_add(self.in_flight.len())
+            .min(MAX_PINNED_PEERS);
         let mut seen = HashSet::with_capacity(cap);
         let mut out = Vec::with_capacity(cap);
-        let ordered = self
-            .carried
-            .iter()
-            .copied()
-            .chain(self.active.newest_first())
-            .chain(self.dialogs.newest_first());
-        for chat in ordered {
-            if seen.insert(chat) {
-                out.push(chat);
+        let extras = self.in_flight.iter().map(|(id, _)| *id);
+        for id in self.base.iter().copied().chain(extras) {
+            if out.len() >= MAX_PINNED_PEERS {
+                break;
+            }
+            if seen.insert(id) {
+                out.push(id);
             }
         }
         out
+    }
+
+    /// The selected set when it differs from the one last applied.
+    pub(crate) fn changed(&self) -> Option<Vec<PeerId>> {
+        let selected = self.selected();
+        let same = selected.len() == self.applied.len()
+            && selected.iter().all(|id| self.applied.contains(id));
+        (!same).then_some(selected)
+    }
+
+    /// The selected set when the last application left listed peers
+    /// unpinned (a later response may have taught the session their hashes).
+    pub(crate) fn unresolved(&self) -> Option<Vec<PeerId>> {
+        (self.unknown > 0).then(|| self.selected())
+    }
+
+    /// Records what was handed to the session and how many it could not pin.
+    pub(crate) fn applied(&mut self, set: &[PeerId], unknown: usize) {
+        self.applied = set.iter().copied().collect();
+        self.unknown = unknown;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unknown(&self) -> usize {
+        self.unknown
     }
 }

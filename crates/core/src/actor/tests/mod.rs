@@ -10,7 +10,9 @@
 mod auth;
 mod lifecycle;
 mod logout;
+mod onboarding;
 mod review4b;
+mod review4c;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,6 +69,10 @@ struct Setup {
     cache_dir: Option<PathBuf>,
     /// Hold the store after the startup reads: every later write stalls.
     hold_store: bool,
+    /// A stored API credential item (task 6b).
+    stored_creds: Option<crate::api::ApiCredentials>,
+    /// Reading the credential item fails (a locked Keychain).
+    creds_locked: bool,
 }
 
 async fn harness(script: FakeScript, cache: Option<CacheHandle>) -> Harness {
@@ -97,7 +103,18 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
             )
             .unwrap();
     }
+    if let Some(creds) = &setup.stored_creds {
+        store
+            .set(
+                SecretItem::ApiCredentials,
+                &crate::credentials::encode(creds),
+            )
+            .unwrap();
+    }
     let (wrapped, faults) = FaultyStore::new(store.clone());
+    if setup.creds_locked {
+        faults.fail_get_of(SecretItem::ApiCredentials);
+    }
     let persist = PersistHandle::spawn(wrapped).unwrap();
     let account = persist.load_session().await.unwrap().snapshot;
     let (cache, cache_parts) = match setup.cache_dir {
@@ -256,11 +273,15 @@ async fn refresh_merges_the_first_page_into_loaded_pages() {
     // Pagination restarts from the fresh cursor instead of staying terminal.
     h.until(|e| matches!(e, Event::DialogsPaging { has_more: true }))
         .await;
+    // The newcomer is placed in server order ahead of provisional rows, so
+    // that page resends the whole list.
     let mut appended = Vec::new();
     for _ in 0..2 {
         h.send(Command::LoadDialogs).await;
-        let (ev, _) = h.until(|e| matches!(e, Event::DialogsAppended(_))).await;
-        if let Event::DialogsAppended(v) = ev {
+        let (ev, _) = h
+            .until(|e| matches!(e, Event::DialogsAppended(_) | Event::DialogsReset(_)))
+            .await;
+        if let Event::DialogsAppended(v) | Event::DialogsReset(v) = ev {
             appended.extend(v);
         }
     }

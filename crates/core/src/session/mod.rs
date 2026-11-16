@@ -26,7 +26,7 @@ use grammers_session::{BoxFuture, Session};
 use tokio::sync::watch;
 
 pub use cell::SessionSnapshot;
-pub use peers::{MAX_PINNED_PEERS, MAX_UNPINNED_PEERS};
+pub use peers::{MAX_PINNED_PEERS, MAX_UNPINNED_PEERS, Pinned};
 pub use worker::{
     AccountGen, LoadStatus, LoadedSession, PERSIST_QUEUE, PersistError, PersistHandle,
 };
@@ -140,9 +140,15 @@ impl AbyssSession {
         self.peers().pin(infos)
     }
 
-    /// Replaces the pinned set, for example after `DialogsReset`.
-    pub fn replace_pinned_peers(&self, infos: impl IntoIterator<Item = PeerInfo>) -> usize {
-        self.peers().replace_pins(infos)
+    /// Makes the pinned set exactly the addressable peers among `ids` (in
+    /// priority order, at most [`MAX_PINNED_PEERS`]); see [`Pinned`].
+    pub fn retain_pinned(&self, ids: &[PeerId]) -> Pinned {
+        self.peers().set_pins(ids)
+    }
+
+    /// The pinned peer ids, in no particular order.
+    pub fn pinned_ids(&self) -> Vec<PeerId> {
+        self.peers().pinned_ids()
     }
 
     /// Becomes `true` on the first `UpdateState::All` for this instance: the

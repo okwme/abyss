@@ -25,7 +25,8 @@ use std::pin::Pin;
 
 pub use seed::{CarriedPeers, MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 
-use crate::api::{CredentialError, PasswordBuf};
+use crate::api::{CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
+pub use crate::credentials::CredentialSlot;
 use crate::model::{ChatId, ChatSummary, Message, MsgId};
 
 /// Opaque position in the dialogs list, produced by the backend.
@@ -145,6 +146,30 @@ pub enum AuthError {
     PhoneBanned,
     /// `API_ID_INVALID` / `API_ID_PUBLISHED_FLOOD` (plan section 17.2).
     Credentials(CredentialError),
+    /// `PHONE_NUMBER_FLOOD` / `PHONE_PASSWORD_FLOOD`: too many attempts for
+    /// this number, without a wait time.
+    PhoneFlood,
+    /// The server asked for a login step abyss does not implement (email
+    /// setup, `auth.sentCodeSuccess`, a paid login): finish it in an
+    /// official app (plan section 17.2a).
+    OfficialAppRequired,
+}
+
+/// Where a login code went (`auth.sentCode`, plan section 17.2a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SentCode {
+    pub delivery: CodeDelivery,
+    pub length: Option<u8>,
+    pub next: Option<NextDelivery>,
+    /// The server's resend timeout.
+    pub timeout: Option<std::time::Duration>,
+}
+
+/// A sent login code: the token to sign in with, and where the code went.
+#[derive(Debug)]
+pub struct CodeRequest<T> {
+    pub token: T,
+    pub sent: SentCode,
 }
 
 impl From<BackendError> for AuthError {
@@ -212,12 +237,20 @@ pub trait Client: Send + Sync + 'static {
     /// Whether this instance's session is authorized (grammers `is_authorized`).
     fn is_authorized(&self) -> impl Future<Output = Result<bool, BackendError>> + Send;
 
-    /// `auth.sendCode` for `phone` with the backend's API credentials. Handles
-    /// a login-time `303` itself.
+    /// `auth.sendCode` for `phone` with the instance's API credentials,
+    /// keeping the full `auth.SentCode`. Handles a login-time `303` itself.
+    /// Unsupported flows answer [`AuthError::OfficialAppRequired`].
     fn request_login_code(
         &self,
         phone: &str,
-    ) -> impl Future<Output = Result<Self::LoginToken, AuthError>> + Send;
+    ) -> impl Future<Output = Result<CodeRequest<Self::LoginToken>, AuthError>> + Send;
+
+    /// `auth.resendCode`: the server-directed resend (its next delivery
+    /// type). Returns a fresh token.
+    fn resend_login_code(
+        &self,
+        token: &Self::LoginToken,
+    ) -> impl Future<Output = Result<CodeRequest<Self::LoginToken>, AuthError>> + Send;
 
     fn sign_in(
         &self,
@@ -331,6 +364,11 @@ pub trait Backend: Send + Sync + 'static {
     /// `AbyssSession` from the latest one (`AbyssSession::from_snapshot`,
     /// which revokes any earlier instance's write token).
     fn use_account(&self, account: crate::session::SessionSnapshot);
+
+    /// The API credentials in use (plan section 17.2a). [`Backend::build`]
+    /// waits until the slot holds a pair and builds with it, so no client
+    /// exists without credentials.
+    fn credentials(&self) -> &CredentialSlot;
 
     /// Builds a fresh instance from `seed`. Spawns nothing: core spawns the
     /// runner and the update consumer.

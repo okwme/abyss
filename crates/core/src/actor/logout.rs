@@ -195,9 +195,11 @@ impl<B: Backend> Actor<B> {
         self.start_logout(plan).await;
     }
 
-    /// A call answered `AUTH_KEY_UNREGISTERED`/`SESSION_REVOKED`.
+    /// A call answered `AUTH_KEY_UNREGISTERED`/`SESSION_REVOKED`: the key is
+    /// dead, so the local session is torn down whether or not the account
+    /// was signed in (a login call can see it too).
     pub(super) async fn session_revoked(&mut self) {
-        if !self.auth.signed_in || matches!(self.life.phase, Phase::LoggingOut(_)) {
+        if matches!(self.life.phase, Phase::LoggingOut(_)) {
             return;
         }
         self.auth.phone_error = Some(UserError::SessionRevoked);

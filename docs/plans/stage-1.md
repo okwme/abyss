@@ -750,6 +750,111 @@ Open items:
 - An echo in `SentUnconfirmed` can be dropped by a `Reconciled` whose tail was requested before the send was accepted. 10b should keep `SentUnconfirmed` echoes until a later `Reconciled` or a `Sent`.
 - The fake does not push `updateMessageID` on its own; tests inject it. 12 should check the ordering against a live server.
 
+**Task 11c status (2026-11-16): review round 7 fixes to `GrammersBackend`, offline.** Each regression test below fails on the old code.
+1. **Pins follow core, not page recency (HIGH).** `GrammersClient` implements `Client::retain_peers`. The recency tracker is gone. `grammers/pins.rs` now selects core's required set (the base), then the chats of in-flight calls that the base does not list. The selection is deduplicated and cut at `MAX_PINNED_PEERS`. The session pins exactly that selection: `AbyssSession::retain_pinned(&[PeerId]) -> Pinned { pinned, unknown }` replaces `replace_pinned_peers`. Dialogs pages no longer pin anything. Test: `capacity_boundary_refresh_keeps_what_core_keeps_across_a_rebuild`. It loads chats 1–1000 in 50-chat pages, then refreshes with `[1001, 1…49]` while core keeps `[1001, 1…999]`. Chat 50 survives the rebuild with its hash, chat 1000 is not carried, and exactly 1,000 are carried.
+2. **No funnel on rebuild (HIGH).** Before core's first `retain_peers` on an instance, the base is the session's inherited pins, kept as an unordered set. They are never ranked or truncated, and an in-flight extra never displaces one. Core's first call replaces the base. The old dialog-slot funnel and `info_chat` are deleted. Tests: `consecutive_rebuilds_keep_more_than_1000_inherited_peers`, which keeps 1,264 inherited peers across three rebuilds, each with a repinning call before core reconciles; and the unit test `inherited_pins_are_kept_as_they_are_until_core_reconciles`.
+3. **Cap and priority.** The selection never exceeds 1,264. The session is repinned whenever the selection's membership changes, including when a priority change moves a chat across the cap. A pure reorder with the same membership does not repin. In-flight tracking is an RAII guard taken before the request and released on drop, so a cancelled call also releases it. It is bounded by `MAX_IN_FLIGHT` (264 distinct chats); further calls are simply not tracked. Pins live under a `std::sync::Mutex` that is never held across an `.await`, so `retain_peers` does no I/O. Tests: `the_pinned_set_never_exceeds_the_session_cap`, `a_priority_change_at_capacity_repins`, `in_flight_chats_stay_pinned_until_the_call_ends`, and the unit tests `every_part_is_bounded` and `a_reorder_that_changes_the_capped_membership_is_a_change`.
+   - **Unknown hashes.** A required peer that the session does not know, or knows without an access hash, is not pinned. It is counted (`Pinned::unknown`, logged as a count at debug). Out-of-range ids are counted separately. While the unknown count is non-zero, every response retries the selection, since the response may have carried the missing hash. Tests: `listed_peers_without_a_hash_are_counted_then_pinned_once_learned`, and the session test `unpinned_peers_return_to_fifo_on_replace`.
+4. **Peer budget.** `16 × limit + 16` is gone. Users plus chats are bounded on their own by `MAX_RESPONSE_PEERS = MAX_DIRECTORY` (4,096). The dialog and message limits are unchanged. Tests: `a_service_message_adding_many_users_is_accepted` (one `messageActionChatAddUser` with 200 users at limit 1) and `mentions_and_forwards_naming_many_peers_are_accepted` (five forwarded messages naming 155 peers at limit 5).
+- **Contract:** the suite calls `retain_peers(&[chat])` before the rebuild check, as core does when the window opens. Without that call, the live grammers run would no longer carry the chat.
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (249 core with 3 ignored, 97 app). The grammers module has 65 tests.
+
+Open items:
+- The unpinned FIFO (2,000) is now smaller than one response may carry (4,096 auxiliary peers). A huge response that arrives between a dialogs page and core's next `retain_peers` can evict that page's peers before they are pinned. They are then counted as unknown and re-learned on the next dialogs load. Consider raising `MAX_UNPINNED_PEERS`, or not caching auxiliary peers beyond the FIFO's size per response.
+- `Seed::peers` is now unused by grammers. It is a subset of the inherited pins.
+
+**Task 6b status (2026-11-16): done offline, against the fake and grammers unit tests; a real-credential login is task 12.**
+- **grammers login** (`backend/grammers/auth.rs`): a raw `auth.sendCode`/`auth.resendCode` adapter keeps the full `SentCode` (delivery type, length, next type, timeout bounded to 24 h). `auth.sentCodeSuccess`, `auth.sentCodePaymentRequired`, and email/Firebase/word/phrase code types map to `OfficialAppRequired`. Also implemented: `sign_in`, `check_password` with an `account.getPassword` refetch, `users.getUsers([self])`, `auth.logOut`, `is_authorized` (401 → not authorized), and a 303 migration on `sendCode`. The typed error table covers `PHONE_NUMBER_*`, `PHONE_CODE_*`, `API_ID_INVALID`, `API_ID_PUBLISHED_FLOOD`, `PHONE_PASSWORD_FLOOD`, `SESSION_PASSWORD_NEEDED` and `PASSWORD_HASH_INVALID`. Auth calls are never retried.
+- **Credentials** (`credentials.rs`, `actor/onboarding.rs`): resolution order is env pair, then Keychain item `dev.abyss.apicreds`, then embedded, then `NeedCredentials`. A partial or malformed env pair, or a Keychain read failure, is an error and never counts as absent. `CredentialSlot` is a versioned watch that client builds wait on, and a credential change retires the instance (`lifecycle::retire_for_credentials`). An entered pair is saved only after the first successful code request of the current attempt. An env pair is never saved. Keychain operations are a bounded queue (Load/Save/Delete, at most one of each kind).
+- **Attempts and Back**: each `SubmitPhone` bumps an `AttemptId`. Auth tasks are tagged with `{attempt, ClientGen}`, so a stale result is dropped. Back cancels the running auth task. A superseded `sign_in` that succeeded is caught by the probe.
+- **App** (`shell/auth.rs`, `shell/onboarding.rs`, `shell/view/onboarding.rs`, `ui/copy/onboarding.rs`):
+  - Screens: Welcome, Guide (numbered steps, troubleshooting, **Open my.telegram.org** via `cx.open_url` to a hardcoded constant), and Entry (`api_id`: digits, at most 10; `api_hash`: hex, exactly 32, masked with Show/Hide; copy and cut are refused while masked; paste is normalized by the filter; inline validation).
+  - Credential screens: saved-pair Use/Forget, the env-override explanation, and a Keychain Retry.
+  - Code screen: delivery, the resend countdown and button, the fixed warning, and the new-login notice.
+  - Outcome screens: Verifying, SignUpRequired, OfficialAppRequired, LoggingOut, and Done (tips, a 2FA recommendation when `has_password == Some(false)`, the unsaved title).
+  - **Log out** button at the top right of the signed-in shell. A `LogoutUnfinished` shutdown overlay.
+  - `cargo dev -- --onboarding` starts the fake from `NeedCredentials` with no env pair.
+- **Docs**: `docs/connecting.md` mirrors 17.3. A new `README.md` links to it under "Getting started". `ui::copy::onboarding::tests::every_key_phrase_is_in_the_copy_and_the_doc` checks 12 key phrases against both the copy and the doc.
+- **API changes** (additive except where noted):
+  - Commands: `SubmitCredentials { api_id, api_hash }`, `ForgetStoredCredentials`, `ReloadCredentials`, `RetryCredentialSave` and `Back`.
+  - States: `AuthState::{Verifying, OfficialAppRequired}`; `NeedCredentials { error, source }`; `Code { sent: Option<SentCodeInfo> }`; `SignedIn`/`SignedInUnsaved { new_login: Option<NewLogin> }`.
+  - Events: `Event::CredentialSource(Option<CredentialSource>)`.
+  - Errors: `UserError::{PhoneFlood, CredentialsNotSaved, CredentialsNotForgotten, SignOutFirst}` and new `CredentialError` variants.
+  - Types: `ApiId`, `ApiCredentials`, `EnvVar`, `CodeDelivery`, `NextDelivery`.
+  - Backend: `Client::request_login_code` now returns `CodeRequest<LoginToken>`. New `Client::resend_login_code` and `Backend::credentials() -> &CredentialSlot`.
+  - **Breaking**: `BackendChoice::Grammers(EnvResolution)` replaces `Grammers(Credentials)`, and `core::Credentials` is gone.
+  - Fake: `FakeScript::env`, `FAKE_INVALID_API_ID`/`FAKE_PUBLISHED_API_ID`, `Op::ResendCode`.
+
+Coordinator review findings, fixed (regression tests in `actor/tests/auth.rs`):
+1. **A probe failure was read as signed out.** The probe now returns `Probed::{NotAuthorized, Unknown}`. Unknown retries with 2–60 s backoff and honors flood waits, staying in `Verifying`. Tests: `inconclusive_probe_is_retried_not_read_as_signed_out`, `flood_wait_on_the_probe_is_honored`, `not_authorized_probe_is_not_a_revocation`.
+2. **Generation tagging and retirement supervision.** Auth tasks run in the instance `JoinSet` under `TaskKind::Auth(AuthTag)`, so retirement cancels and joins them. A result from a retired generation is dropped, and `reap_retired` restores the step. A startup check lost with its instance is redone. Test: `startup_check_lost_with_its_instance_is_redone`.
+3. **Revocation during login.** `session_revoked` no longer requires the signed-in state. `Unauthorized` from a login call tears the session down (`login_revoked`). Test: `revocation_during_login_tears_the_session_down`.
+4. **Auth calls bypassed admission.** Login calls take permits. A timeout parks the permit, and a stall rebuilds. Test: `login_calls_take_permits_and_park_them_on_timeout`.
+
+Deferred to a later task (not addressed here): retained-cache account binding, second-migration account teardown, incomplete-logout state, cancellation-aware startup.
+
+Verified:
+- fmt; clippy in both feature configs.
+- `cargo test --workspace --features fake`: 281 core (3 ignored), 109 app.
+- No gpui in `cargo tree -p abyss-core`.
+- `abyss --fake --onboarding` stays up (smoke run, killed after the timeout, no output).
+
+Deviations:
+- Copy lives in `ui/copy.rs` with a child module `ui/copy/onboarding.rs`, not `crates/app/src/onboarding/copy.rs`. One module already held every user-facing string; the child keeps the onboarding text and its doc-sync test together.
+- An auth task's completion reuses `Outcome::Read` for admission bookkeeping, so `apply.rs` stays untouched.
+- Back from Code or Password to Phone cancels the auth task without retiring the instance. Only a credential change retires it.
+- 17.3 says every screen except Welcome has Back. These screens have none: Verifying (an answer may be in flight), the env-override screen (fix the env and restart) and the Keychain screen (retry only). From Phone, Back is refused when the pair is from env or embedded.
+- `docs/connecting.md` has no screenshots yet.
+- After Done, `SignedInUnsaved` is shown on the Done screen (unsaved title), not as a toast.
+
+Manual checks remaining (task 12):
+- A real-credential login: code by app and SMS, the resend countdown, 2FA, `API_ID_INVALID`, and a flood.
+- Keychain prompts for `dev.abyss.apicreds`, and the locked-Keychain retry.
+- Logout against the real Keychain.
+- The `cx.open_url` hand-off.
+- IME behavior in the masked `api_hash` field.
+
+Open items:
+- The `api_hash` `TextInput` holds a plain `String` that is not zeroized. The platform `text_for_range` may expose the unmasked text to IME and accessibility. Use a `SecretBuf`-style input like `PasswordInput` when the design pass touches it.
+- Log out has no confirmation, even though it deletes local data.
+
+**Task 4c status (2026-11-16): round 9 re-check fixes to the core actor, done against the fake.** Regression tests are in `crates/core/src/actor/tests/review4c.rs` unless noted; findings 1–4 fail on the old code (checked by reverting each fix), finding 5 fills a test gap.
+1. **An emptied partial tail deleted older messages (HIGH).** `HistoryReply` now carries `covered: Option<Coverage>` (the oldest and newest id the server page held), captured before buffered tombstones filter the page. `authoritative_range()` is `[covered.oldest, max(covered.newest, floor)]` for a partial page, `[MIN, top]` only when the page is the whole history, and `None` (delete nothing) for a partial page that covered nothing. `tail_diff`, the merge's cache `Reconcile`, the Older/Newer cache reconciles and the bootstrap's `CacheCmd::ReconcileTail` all use it; `ReconcileTail` now takes `from: Option<MsgId>` (covered start, or `None` for the whole history) instead of deriving it from the first surviving message, and is skipped (window not marked cache-contiguous) when a partial page covered nothing. Tests: `emptied_refresh_tail_keeps_older_messages_in_window_and_cache`, `emptied_bootstrap_tail_keeps_older_cached_messages`, `merge::emptied_partial_tail_keeps_older_messages`.
+2. **Repeated FloodWait bypassed every retry bound.** The unknown-outcome attempt budget is unchanged. Flood waits are now bounded separately, per user action and across rebuilds (the pending-send table outlives instances): at most `MAX_FLOOD_WAITS` (5) automatic resends, no resend later than `AUTO_RETRY_WINDOW` (10 min) after the send or the last Retry, and every wait lasts at least `MIN_FLOOD_WAIT` (1 s). Past either bound the send emits `Error(FloodWait { seconds })` and goes `Failed` (Retry resets both bounds, same `random_id`; Discard frees it). Tests: `repeated_flood_waits_end_failed_across_rebuilds` (zero-second waits plus a rebuild during a wait), `flood_wait_past_the_retry_window_fails_at_once`.
+3. **A refresh hid newly found dialogs at capacity.** `Dialogs` tracks a confirmed prefix: a refreshed first page is confirmed, the kept rows from earlier pages are provisional. `append(chats, rest)` confirms provisional rows and admits new ones at the end of the confirmed rows (server order), evicting the lowest-ranked provisional row when full; a new chat is dropped only when every row is confirmed. A page ending the server's list drops provisional rows the traversal never reached. A bump that moves a provisional row to the top confirms it. A page that reorders, evicts or drops rows is emitted as `DialogsReset` (whole list) instead of `DialogsAppended`. Tests: `refresh_at_capacity_admits_a_new_chat_in_server_order` (1,200 server dialogs, 1,000 retained, newcomer at position 150 ends at index 150 of the list and of the retained peers), the 250-dialog regression updated to accept the reset, `dialogs::refreshed_traversal_admits_new_chats_at_capacity`, `dialogs::end_of_traversal_drops_unconfirmed_rows`.
+4. **`retain_peers` order went stale after a live bump.** `Dialogs::bump` bumps the revision when it moves a chat. Tests: `retained_peers_follow_a_live_bump`, `dialogs::reordering_bump_changes_the_revision`.
+5. **MessageId-vs-RPC correlation with a late successful answer.** Tests for both orders: `stream_message_id_then_successful_answer_applies_once` and `successful_answer_then_stream_message_id_applies_once` assert one `Sent`, no further send state, one server message, and that the send left the table (Retry gives `NotFound`).
+
+API changes (additive or doc-only in `api.rs`): `SendState::FloodWait` and `Event::DialogsAppended` docs. Internal: `Coverage`, `HistoryReply::{covered, authoritative_range}`, `CacheCmd::ReconcileTail { from }`, `store::Appended`, `Dialogs::append(chats, rest)`, test-only `Boot::awaiting_tail`.
+
+App obligations for **10b**: a `DialogsReset` may follow `LoadDialogs` (not only bootstrap and refresh); a `Failed` send after `FloodWait` comes with `Error(FloodWait)` and needs Retry/Discard.
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (252 core, 3 ignored; 97 app), the actor tests repeated 5 times without a failure.
+
+Open items:
+- Finding 5's two tests pass on the 4b code as well; they pin behaviour rather than fix a bug.
+- A full-bootstrap tail emptied by tombstones still replaces the window with an empty one (older history reloads from the cache on scroll); only the cache keeps 1–50.
+
+**Task 10b status (2026-11-16): round 6 app findings and the 4b/4c app obligations, done against the fake.** Every chat command now goes through an admission function (`chat/commands.rs`: `Admit`, `Refused`), and the UI change that follows a command is made only after core admitted it. Regression tests are in `crates/app/src/chat/` unless noted.
+1. **Queue rejection stranded sends (HIGH).** `submit` creates the echo and `submit_message` clears the composer only after `SendText` is admitted; a refused send uses up no `LocalId`. Retry shows "Sending…" and Discard removes the echo only once admitted; `OpenChat`, `LoadOlder`/`LoadNewer` pending flags, `MarkRead`'s high-water mark, `LoadDialogs`, `Window` and `ViewingTail` commit the same way, so a refused one is simply asked again. Frame- and render-driven refusals are quiet (a notice would redraw and re-ask at frame rate); user actions show Busy. Tests: `full_queue_creates_no_echo_and_changes_nothing`, `mark_read_and_live_tail_follow_what_is_on_screen`, `scrolling_near_the_top_loads_older_once`; `shell::tests::fake::full_queue_shows_busy` asserts the draft stays in the composer, no echo exists, a refused `OpenChat` opens nothing, and the next Enter sends.
+2. **Dialog pagination stalls.** `ChatList` pages from `DialogsPaging { has_more }` plus an explicit in-flight flag, cleared by `DialogsPaging` or any `Error`, never by list length. An empty list (a first page of broadcasts only) asks for the next page when `DialogsPaging` arrives, since no row renders to ask. A `DialogsReset` answering a "load more" (4c) leaves paging state alone; the `uniform_list` keeps its scroll offset. Tests: `list::pagination_follows_core_paging_not_list_length`, `dialogs_paging_follows_core`.
+3. **Mark-read before paint and above the viewport.** Each message row records its painted bounds (`chat/viewport.rs`, a canvas probe per row); a canvas in the chat pane defers the check to the end of the frame's effect cycle (`Window::defer` from paint), so it reads the frame on screen. Seen rows are those whose painted bounds intersect `ListState::viewport_bounds()`. `ListState` alone cannot answer this at the pinned commit: a bottom-pinned list has no scroll anchor, so `bounds_for_item` returns `None` for every row and `item_is_below_viewport` says `Some(false)` for all of them, including rows above the viewport. `ViewingTail(Some(chat))` is sent while the window is active, attached and the newest message row is on screen (or the loaded chat is empty), `ViewingTail(None)` otherwise, including on deactivation; only on change. The old scroll handler and `on_next_frame` scheduling are gone. Tests: `only_rows_inside_the_viewport_count_as_seen` (real `list` layout: with echoes filling the viewport, message 100 is not read and not the tail; scrolled to it, it is), and `shell::tests::fake::painted_rows_drive_mark_read_and_the_live_tail` (the real window: a tail marks 30 read and sends `ViewingTail(Some)`; after own sends push the newest message off screen, an incoming 31 is not marked read and the tail is not viewed).
+4. **Echo reconciliation.** Echoes reconcile only on `Reconciled { chat, view, newest }`; view resets (including a reopened chat's full `Tail`, which replaces the rows) no longer touch them. A `Sent { id }` echo at or below `newest` that the on-screen view lacks was deleted and goes. A `SentUnconfirmed` echo goes on the second `Reconciled` of its chat after it became unconfirmed: core runs one history load per chat and drops replies of superseded views, so the first may answer a tail requested before the acceptance, while the second was requested after it. Tests: `unconfirmed_echo_outlives_view_resets_and_one_reconcile`, `reconcile_drops_a_sent_echo_whose_message_was_deleted`, `reopening_a_chat_replaces_the_view_with_its_full_tail`, `sends::reconcile_drops_deleted_sends_and_late_unconfirmed_ones`.
+5. **Dialog order drift.** `bump` moves a chat only when `last_id` grew (by `last_date` when either id is unknown); an older or repeated bump updates in place. Test: `list::identical_previews_in_one_second_order_by_id`.
+6. **Spoiler links.** A link with text under a hidden spoiler shows no ` (target)` suffix and becomes one reveal range (no copy range), so link and reveal ranges never overlap; revealed, it is a normal link. Clicks go through `rich::Body::interactive` (`Click::{Copy, Reveal}`), used by the chat view and the tests. Tests: `rich::spoiler_hides_a_link_target_until_revealed`, `a_partly_hidden_link_is_one_reveal_range`, and real clicks on laid-out text: `clicking_a_hidden_spoiler_link_only_reveals`, `clicking_a_revealed_spoiler_link_copies`.
+7. **FloodWait sends.** The echo shows "Waiting N s (Telegram rate limit)" counting down to the resend ("Resending…" at 0), redrawn every second by one ticker while any echo waits; Discard is offered, Retry is not (core resends). A send that exhausts its flood-wait bounds (4c) arrives as `Failed` plus `Error(FloodWait)` (a notice while signed in) and gets Retry and Discard; Retry is `RetrySend` of the same send, so core keeps its `random_id`. Tests: `flood_waiting_send_can_be_discarded_but_not_retried`, `exhausted_flood_wait_fails_with_retry_and_discard`, `sends::flood_wait_counts_down`, `copy::send_label_tests::flood_wait_counts_down_to_the_resend`.
+
+No core changes. Auth commands still go through `Session::send` (notice on refusal, as before); their UI transitions belong to the auth code.
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (302 core with 3 ignored, 124 app), `abyss --fake` stays up. The new tests use the new admission API, so they do not compile against the old code; each encodes the old behaviour as a failing assertion (echo before admission, length-keyed paging, every row "not below", reset-keyed reconcile, preview/date ordering, overlapping copy and reveal ranges).
+
+Manual checks remaining: mark-read and `ViewingTail` timing with real scrolling and window switching; that the per-row paint probes cost nothing visible with 2,000-message windows; the countdown against a real `FLOOD_WAIT`; that a `DialogsReset` after "load more" keeps the sidebar's scroll position on a real account.
+
+Open items:
+- A `SentUnconfirmed` echo can stay next to its server copy until the second reconcile (the next light refresh, activation or reopen). Rare (no `updateMessageID`), and never a lost message. Exact removal needs core to say which sends a reconciled tail covers.
+- An empty sidebar list asks for the next page from `DialogsPaging`; a non-empty one asks from rendering, so a filtered page that adds nothing visible is followed only when the sidebar next renders (every event batch renders).
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.
@@ -867,6 +972,13 @@ Open items:
     - A failed logout is forgotten and shown as "Signed out". Keep an incomplete-logout state with Retry, report it at shutdown, and use the copy "Logout incomplete".
     - Startup waits ignore cancellation, so a stalled Keychain blocks the shutdown acknowledgement. Make them cancellation-aware.
     - Tests: seed recognizable old auth keys and assert they are absent after logout. Add shutdown with a full *command* queue.
+
+- **Round 9 (re-check of task 4b, 2026-11-16).** All fixed in task 4c (section 13):
+  - **High:** a partial tail emptied by buffered deletions deleted older valid messages from the window and the cache (`MIN_ID` lower bound). Reconciliation now uses the server page's coverage captured before tombstone filtering; an empty partial page never establishes the start of history.
+  - Repeated `FloodWait` bypassed all retry bounds (zero-second waits looped). Bounded by a flood-wait count and a total automatic-retry window that survive rebuilds, with a 1 s minimum wait; exhaustion is `Failed` (Retry/Discard).
+  - A refresh at capacity hid newly discovered dialogs. Retained rows are provisional, the refreshed traversal confirms rows in server order and evicts the lowest-ranked provisional rows.
+  - **Low:** `retain_peers` order went stale after a live bump; a reordering bump now bumps the dialogs revision.
+  - Test gap: MessageId-vs-RPC correlation is now tested in both arrival orders with a late successful RPC.
 
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 

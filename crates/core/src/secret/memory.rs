@@ -82,6 +82,9 @@ struct Faults {
     failing: AtomicU8,
     /// Deletions of these items fail (one bit per item).
     failing_deletes: AtomicU8,
+    /// Reads and writes of these items fail (one bit per item).
+    failing_gets: AtomicU8,
+    failing_sets: AtomicU8,
     calls: AtomicU64,
     held: Mutex<bool>,
     released: Condvar,
@@ -121,6 +124,32 @@ impl FaultControl {
         self.0
             .failing_deletes
             .fetch_or(item_bit(item), Ordering::SeqCst);
+    }
+
+    /// Makes reading `item` fail (a locked Keychain) until [`Self::heal_item`].
+    pub fn fail_get_of(&self, item: SecretItem) {
+        self.0
+            .failing_gets
+            .fetch_or(item_bit(item), Ordering::SeqCst);
+    }
+
+    /// Makes writing `item` fail until [`Self::heal_item`].
+    pub fn fail_set_of(&self, item: SecretItem) {
+        self.0
+            .failing_sets
+            .fetch_or(item_bit(item), Ordering::SeqCst);
+    }
+
+    /// Ends every per-item failure of `item`.
+    pub fn heal_item(&self, item: SecretItem) {
+        let keep = !item_bit(item);
+        self.0.failing_gets.fetch_and(keep, Ordering::SeqCst);
+        self.0.failing_sets.fetch_and(keep, Ordering::SeqCst);
+        self.0.failing_deletes.fetch_and(keep, Ordering::SeqCst);
+    }
+
+    fn item_fails(mask: &AtomicU8, item: SecretItem) -> bool {
+        mask.load(Ordering::SeqCst) & item_bit(item) != 0
     }
 
     fn delete_fails(&self, item: SecretItem) -> bool {
@@ -192,11 +221,17 @@ impl<S: SecretStore> FaultyStore<S> {
 impl<S: SecretStore> SecretStore for FaultyStore<S> {
     fn get(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
         self.control.before(StoreOp::Get)?;
+        if FaultControl::item_fails(&self.control.0.failing_gets, item) {
+            return Err(StoreError::Injected);
+        }
         self.inner.get(item)
     }
 
     fn set(&self, item: SecretItem, secret: &[u8]) -> Result<(), StoreError> {
         self.control.before(StoreOp::Set)?;
+        if FaultControl::item_fails(&self.control.0.failing_sets, item) {
+            return Err(StoreError::Injected);
+        }
         self.inner.set(item, secret)
     }
 
@@ -213,5 +248,6 @@ const fn item_bit(item: SecretItem) -> u8 {
     match item {
         SecretItem::Session => 1,
         SecretItem::CacheKey => 2,
+        SecretItem::ApiCredentials => 4,
     }
 }

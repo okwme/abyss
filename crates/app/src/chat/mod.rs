@@ -255,7 +255,10 @@ impl ChatShell {
                     self.after_echo_change();
                 }
             }
-            Event::Auth(_) | Event::Connection(_) | Event::Error(_) => {}
+            Event::Auth(_)
+            | Event::CredentialSource(_)
+            | Event::Connection(_)
+            | Event::Error(_) => {}
         }
     }
 

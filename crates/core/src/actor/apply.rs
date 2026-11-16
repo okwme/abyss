@@ -57,16 +57,51 @@ pub(super) struct HistoryReply {
     pub(super) query: HistoryQuery,
     /// See [`Job::History`](super::jobs::Job::History).
     pub(super) floor: Option<MsgId>,
+    /// What the server page covered, captured before tombstones filter it.
+    pub(super) covered: Option<Coverage>,
     pub(super) page: HistoryPage,
     pub(super) mode: TailMode,
 }
 
+/// The ids a server page covered: its oldest and newest message as the
+/// server sent them. Captured before buffered deletions filter the page, so a
+/// page emptied by tombstones still bounds what it is authoritative for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Coverage {
+    pub(super) oldest: MsgId,
+    pub(super) newest: MsgId,
+}
+
+impl Coverage {
+    pub(super) fn of(page: &HistoryPage) -> Option<Self> {
+        let ids = page.messages.iter().map(|m| m.id);
+        Some(Self {
+            oldest: ids.clone().min()?,
+            newest: ids.max()?,
+        })
+    }
+}
+
 impl HistoryReply {
-    /// Up to which id a tail is authoritative: its own newest id, and the
-    /// newest the window held when it was requested. Window messages above
-    /// it arrived later and are kept; at or below it, the server decides.
+    /// Up to which id a tail is authoritative: the newest id the server sent,
+    /// and the newest the window held when it was requested. Window messages
+    /// above it arrived later and are kept; at or below it, the server decides.
     pub(super) fn authoritative_top(&self) -> Option<MsgId> {
-        self.page.messages.last().map(|m| m.id).max(self.floor)
+        self.covered.map(|c| c.newest).max(self.floor)
+    }
+
+    /// The inclusive id range a tail is authoritative for: from the oldest id
+    /// the server sent (or the start of history, when the page is the whole
+    /// history) up to [`Self::authoritative_top`]. A partial page that covered
+    /// nothing establishes nothing: `None`, so nothing is deleted.
+    pub(super) fn authoritative_range(&self) -> Option<(MsgId, MsgId)> {
+        let top = self.authoritative_top()?;
+        let lo = if self.page.has_more {
+            self.covered?.oldest
+        } else {
+            MIN_ID
+        };
+        Some((lo, top))
     }
 }
 
@@ -161,6 +196,7 @@ impl<B: Backend> Actor<B> {
                     dir: req.dir,
                     query: req.query,
                     floor: req.floor,
+                    covered: Coverage::of(&page),
                     page,
                     mode,
                 };
@@ -194,28 +230,33 @@ impl<B: Backend> Actor<B> {
         self.dialogs_busy = false;
         match res {
             Ok(DialogsPage { chats, next }) => {
+                let rest = if next.is_some() {
+                    Rest::More
+                } else {
+                    Rest::Last
+                };
                 let event = match step {
                     DialogsStep::First => {
                         if let Some(boot) = self.boot.as_mut() {
                             boot.note_dialogs(&chats);
                         }
-                        let rest = if next.is_some() {
-                            Rest::More
-                        } else {
-                            Rest::Last
-                        };
                         // Chats kept from later pages stay provisionally, but
                         // pagination restarts from the fresh cursor: a chat
                         // that appeared below the first page meanwhile is only
-                        // found by walking forward again (later pages update
-                        // the kept rows in place).
+                        // found by walking forward again (later pages confirm
+                        // the kept rows, and admit new ones in server order).
                         self.dialogs.merge_first_page(chats, rest);
                         self.dialogs_next = next;
                         Event::DialogsReset(self.dialogs.as_slice().to_vec())
                     }
                     DialogsStep::Next => {
                         self.dialogs_next = next;
-                        Event::DialogsAppended(self.dialogs.append(chats))
+                        let page = self.dialogs.append(chats, rest);
+                        if page.reordered {
+                            Event::DialogsReset(self.dialogs.as_slice().to_vec())
+                        } else {
+                            Event::DialogsAppended(page.changed)
+                        }
                     }
                 };
                 // `PutChats` replaces the cached list, so it always gets the whole list.
@@ -385,12 +426,15 @@ impl<B: Backend> Actor<B> {
                     HistoryQuery::Before(id) => MsgId(id.0.saturating_sub(1)),
                     _ => MAX_ID,
                 };
-                let lo = if p.page.has_more {
-                    p.page.messages.first().map_or(hi, |m| m.id)
-                } else {
-                    MIN_ID
+                // A partial page is authoritative from the oldest id the
+                // server sent, even when tombstones emptied it.
+                let lo = match (p.page.has_more, p.covered) {
+                    (false, _) => Some(MIN_ID),
+                    (true, covered) => covered.map(|c| c.oldest),
                 };
-                self.reconcile(p.chat, lo, hi, &p.page.messages).await;
+                if let Some(lo) = lo {
+                    self.reconcile(p.chat, lo, hi, &p.page.messages).await;
+                }
                 if let Ok(change) = self.windows.prepend(p.chat, p.view, p.page) {
                     self.emit_history(p.chat, p.view, p.dir, change).await;
                 }
@@ -400,12 +444,13 @@ impl<B: Backend> Actor<B> {
                     HistoryQuery::After(id) => MsgId(id.0.saturating_add(1)),
                     _ => MIN_ID,
                 };
-                let hi = if p.page.has_more {
-                    p.page.messages.last().map_or(lo, |m| m.id)
-                } else {
-                    MAX_ID
+                let hi = match (p.page.has_more, p.covered) {
+                    (false, _) => Some(MAX_ID),
+                    (true, covered) => covered.map(|c| c.newest),
                 };
-                self.reconcile(p.chat, lo, hi, &p.page.messages).await;
+                if let Some(hi) = hi {
+                    self.reconcile(p.chat, lo, hi, &p.page.messages).await;
+                }
                 if let Ok(change) = self.windows.append_newer(p.chat, p.view, p.page) {
                     self.emit_history(p.chat, p.view, p.dir, change).await;
                 }
@@ -441,6 +486,7 @@ impl<B: Backend> Actor<B> {
     /// the request) are kept on top.
     pub(super) async fn on_tail(&mut self, p: HistoryReply) {
         let top = p.authoritative_top();
+        let range = p.authoritative_range();
         let HistoryReply { chat, mut page, .. } = p;
         let Some(w) = self.windows.get(chat) else {
             return;
@@ -451,18 +497,29 @@ impl<B: Backend> Actor<B> {
             .filter(|m| top.is_none_or(|t| m.id > t))
             .cloned();
         page.messages.extend(late);
-        if self.cache.is_some() {
+        // The cache is reconciled from the page's covered start (not from the
+        // first message tombstones left), or from the start of history when
+        // the page is all of it. A partial page that covered nothing proves
+        // nothing: the cache is left alone and is not contiguous.
+        let from = match (page.has_more, range) {
+            (false, _) => Some(None),
+            (true, Some((lo, _))) => Some(Some(lo)),
+            (true, None) => None,
+        };
+        if self.cache.is_some()
+            && let Some(from) = from
+        {
             self.cache_write(CacheCmd::ReconcileTail {
                 chat,
                 messages: page.messages.clone(),
-                has_more: page.has_more,
+                from,
             })
             .await;
         }
         let Some(view) = self.windows.invalidate(chat) else {
             return;
         };
-        if self.cache.is_some() {
+        if self.cache.is_some() && from.is_some() {
             self.windows.set_cache_contiguous(chat);
         }
         if let Ok(change) = self.windows.prepend(chat, view, page) {

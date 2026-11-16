@@ -253,6 +253,31 @@ fn flood_waiting_send_can_be_discarded_but_not_retried() {
     assert!(!shell.countdown_tick(), "nothing waits: the ticker stops");
 }
 
+/// 4c: past its flood-wait bounds a send ends `Failed` (with
+/// `Error(FloodWait)`); Retry asks core to resend the same send.
+#[test]
+fn exhausted_flood_wait_fails_with_retry_and_discard() {
+    let mut core = Core::default();
+    let mut shell = open(&mut core);
+    let id = send(&mut shell, &mut core, "x");
+    core.take();
+    set(&mut shell, id, SendState::FloodWait { seconds: 30 });
+    set(&mut shell, id, SendState::Failed);
+    shell.apply(Event::Error(abyss_core::api::UserError::FloodWait {
+        seconds: 30,
+    }));
+    assert_eq!(state_of(&shell, 50), Some(SendState::Failed));
+    assert!(!shell.countdown_tick(), "no countdown on a failed send");
+    shell.retry(id, &mut core.admit()).unwrap();
+    assert!(
+        matches!(core.take().as_slice(), [Command::RetrySend(r)] if *r == id),
+        "the same send (core keeps its random_id)"
+    );
+    set(&mut shell, id, SendState::Failed);
+    shell.discard(id, &mut core.admit()).unwrap();
+    assert!(matches!(core.take().as_slice(), [Command::DiscardSend(r)] if *r == id));
+}
+
 /// Finding 4: echoes are reconciled on `Reconciled`, not on view resets,
 /// and an unconfirmed one outlives a reconcile that may predate its send.
 #[test]
