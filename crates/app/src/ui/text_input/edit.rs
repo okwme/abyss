@@ -21,9 +21,6 @@ pub(crate) enum CharFilter {
     Phone,
     /// ASCII digits.
     Digits,
-    /// ASCII hexadecimal digits: a pasted `api_hash` loses its spaces,
-    /// quotes and line breaks.
-    Hex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,12 +55,7 @@ impl Limits {
         lines: Lines::Single,
         max_utf16: 10,
     };
-    /// `api_hash`: 32 hex digits.
-    pub(crate) const API_HASH: Limits = Limits {
-        filter: CharFilter::Hex,
-        lines: Lines::Single,
-        max_utf16: 32,
-    };
+
     pub(crate) const COMPOSER: Limits = Limits {
         filter: CharFilter::Any,
         lines: Lines::Multi,
@@ -108,7 +100,8 @@ pub(crate) fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
-#[derive(Debug)]
+/// The content (a phone number, a code, a message draft) never reaches
+/// `Debug` output (task 6c).
 pub(crate) struct EditBuffer {
     content: String,
     selected: Range<usize>,
@@ -118,6 +111,15 @@ pub(crate) struct EditBuffer {
     /// Bumps on every content change, so layouts from an older revision are
     /// never used to map offsets.
     revision: u64,
+}
+
+impl std::fmt::Debug for EditBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditBuffer")
+            .field("len", &self.content.len())
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EditBuffer {
@@ -338,7 +340,6 @@ fn clean(text: &str, limits: Limits) -> String {
         let keep = match limits.filter {
             CharFilter::Phone => (ch.is_ascii_digit() || ch == '+').then_some(ch),
             CharFilter::Digits => ch.is_ascii_digit().then_some(ch),
-            CharFilter::Hex => ch.is_ascii_hexdigit().then_some(ch),
             CharFilter::Any => match ch {
                 '\r' => {
                     chars.next_if_eq(&'\n');
@@ -380,6 +381,23 @@ mod tests {
         let mut b = EditBuffer::new(Limits::COMPOSER);
         b.replace(None, text);
         b
+    }
+
+    /// Task 6c: no field's content (phone, code, draft) reaches `Debug`.
+    #[test]
+    fn debug_never_prints_the_content() {
+        for (limits, text) in [
+            (Limits::PHONE, "+15550100"),
+            (Limits::CODE, "24680"),
+            (Limits::API_ID, "97531"),
+            (Limits::COMPOSER, "secret plans"),
+        ] {
+            let mut b = EditBuffer::new(limits);
+            b.replace(None, text);
+            assert_eq!(b.text(), text);
+            let shown = format!("{b:?}");
+            assert!(!shown.contains(text), "{shown}");
+        }
     }
 
     #[test]

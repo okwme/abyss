@@ -310,8 +310,8 @@ mod fake {
         // Masked: the field shows bullets, never the hash.
         let shown = read(&root, cx, |s| s.api_hash.clone());
         assert_eq!(
-            shown.read_with(cx, |i, _| i.mask()),
-            crate::ui::text_input::Mask::Hidden
+            shown.read_with(cx, |i, _| i.reveal()),
+            crate::ui::password::Reveal::Hidden
         );
         cx.simulate_keystrokes("enter");
         let Some(Command::SubmitCredentials { api_id, api_hash }) = last_command(&harness) else {
@@ -322,7 +322,10 @@ mod fake {
         assert_eq!(read(&root, cx, |s| s.entry_error.clone()), None);
         let api_id_left = read(&root, cx, |s| s.api_id.clone());
         assert_eq!(api_id_left.read_with(cx, |i, _| i.text().to_owned()), "");
-        assert_eq!(shown.read_with(cx, |i, _| i.text().to_owned()), "");
+        assert!(
+            shown.read_with(cx, |i, _| i.secret().is_empty()),
+            "wiped once admitted"
+        );
     }
 
     /// Back on login screens goes to core; never away from an env pair.
@@ -353,7 +356,8 @@ mod fake {
     }
 
     /// A login in this run shows Done (with the 2FA recommendation), then
-    /// the chats; Logout sends `Command::Logout`.
+    /// the chats; Logout asks first and sends `Command::Logout` only once
+    /// confirmed (task 6c).
     #[gpui::test]
     fn done_then_chats_then_logout(cx: &mut TestAppContext) {
         use crate::shell::auth::Saved;
@@ -374,10 +378,106 @@ mod fake {
         );
         act(&root, cx, super::super::Session::open_chats);
         assert_eq!(auth(&root, cx), AuthView::SignedIn);
+        let before = sent_count(&harness);
         act(&root, cx, super::super::Session::logout);
+        assert_eq!(sent_count(&harness), before, "Logout asks first");
+        assert!(read(&root, cx, super::super::Session::confirming_logout));
+        act(&root, cx, super::super::Session::cancel_logout);
+        assert!(!read(&root, cx, super::super::Session::confirming_logout));
+        assert_eq!(sent_count(&harness), before, "cancel sends nothing");
+        act(&root, cx, super::super::Session::logout);
+        // A refused logout keeps the prompt up for another try.
+        harness.sent.borrow_mut().full = true;
+        act(&root, cx, super::super::Session::confirm_logout);
+        assert!(read(&root, cx, super::super::Session::confirming_logout));
+        harness.sent.borrow_mut().full = false;
+        act(&root, cx, super::super::Session::confirm_logout);
         assert!(matches!(last_command(&harness), Some(Command::Logout)));
+        assert!(!read(&root, cx, super::super::Session::confirming_logout));
         core_says(&harness, cx, AuthState::LoggingOut);
         assert_eq!(auth(&root, cx), AuthView::LoggingOut);
+    }
+
+    /// Task 6c: a failed local deletion shows "Logout incomplete" (never
+    /// "Signed out"); Retry sends `Logout` again once admitted.
+    #[gpui::test]
+    fn logout_incomplete_offers_a_retry(cx: &mut TestAppContext) {
+        use abyss_core::api::{LocalDeletion, RemoteLogout, StorageError};
+        let (root, cx, harness) = open(cx);
+        let failed = AuthState::LoggedOut {
+            remote: RemoteLogout::Revoked,
+            local: LocalDeletion::Failed(StorageError::Internal),
+        };
+        core_says(&harness, cx, failed);
+        let incomplete = AuthView::LogoutIncomplete {
+            remote: RemoteLogout::Revoked,
+        };
+        assert_eq!(auth(&root, cx), incomplete);
+        harness.sent.borrow_mut().full = true;
+        act(&root, cx, super::super::Session::retry_logout);
+        assert_eq!(auth(&root, cx), incomplete, "refused: still incomplete");
+        harness.sent.borrow_mut().full = false;
+        act(&root, cx, super::super::Session::retry_logout);
+        assert!(matches!(last_command(&harness), Some(Command::Logout)));
+        assert_eq!(auth(&root, cx), AuthView::LoggingOut);
+        let done = AuthState::LoggedOut {
+            remote: RemoteLogout::Revoked,
+            local: LocalDeletion::Deleted,
+        };
+        core_says(&harness, cx, done);
+        assert_eq!(auth(&root, cx), AuthView::Connecting);
+    }
+
+    /// Task 6c: a refused auth command changes nothing; the input stays for
+    /// another submit.
+    #[gpui::test]
+    fn refused_auth_commands_keep_the_input(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        let code = AuthState::Code {
+            phone_hint: "+1 •••• •••00".into(),
+            sent: None,
+            error: Some(UserError::Rejected),
+        };
+        core_says(&harness, cx, code);
+        harness.sent.borrow_mut().full = true;
+        cx.simulate_input("12345");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sent_count(&harness), 0);
+        let kept = read(&root, cx, |s| s.code.clone());
+        assert_eq!(kept.read_with(cx, |i, _| i.text().to_owned()), "12345");
+        assert!(
+            matches!(auth(&root, cx), AuthView::Code { error: Some(_), .. }),
+            "the error stays until core takes the code"
+        );
+        assert_eq!(
+            read(&root, cx, |s| s.notice.clone()),
+            Some(crate::ui::copy::user_error(UserError::Busy))
+        );
+        harness.sent.borrow_mut().full = false;
+        cx.simulate_keystrokes("enter");
+        assert!(matches!(last_command(&harness), Some(Command::SubmitCode(c)) if c == "12345"));
+        assert_eq!(kept.read_with(cx, |i, _| i.text().to_owned()), "");
+
+        core_says(
+            &harness,
+            cx,
+            AuthState::Password {
+                hint: None,
+                error: None,
+            },
+        );
+        harness.sent.borrow_mut().full = true;
+        cx.simulate_input("pw");
+        cx.simulate_keystrokes("enter");
+        let field = read(&root, cx, |s| s.password.clone());
+        assert_eq!(&*field.read_with(cx, |i, _| i.secret()), b"pw", "kept");
+        harness.sent.borrow_mut().full = false;
+        cx.simulate_keystrokes("enter");
+        assert!(matches!(
+            last_command(&harness),
+            Some(Command::SubmitPassword(p)) if p.as_bytes() == b"pw"
+        ));
+        assert!(field.read_with(cx, |i, _| i.secret().is_empty()), "wiped");
     }
 
     #[gpui::test]
