@@ -729,8 +729,32 @@ Telegram requires an `api_id`/`api_hash` per client application. Decision: **bri
   - Validation: `api_id > 0`. `ApiHash` is exactly 32 hex chars, normalized to lowercase, with whitespace trimmed on paste.
   - Persist **only after the first successful `request_login_code`**, which proves the pair is valid. Until then the pair lives in memory only.
 - `API_ID_INVALID` and `API_ID_PUBLISHED_FLOOD` from `request_login_code` map to `CredentialError`. The state goes back to `NeedCredentials` with that error, without touching the session. The client is retired through the normal rebuild boundary.
-- `Command::ResetCredentials` is allowed only while logged out. It deletes `dev.abyss.apicreds`. While signed in, changing credentials means logging out first; the UI says so.
+- `Command::ForgetStoredCredentials` (renamed from `ResetCredentials`) is allowed only while logged out and only deletes the stored pair. It never touches an env override. While signed in, changing credentials means logging out first; the UI says so.
 - `ApiHash` has a redacting `Debug` and is never logged. This is the same rule as phone numbers.
+
+### 17.2a Credential provenance and auth-attempt rules (review round 4)
+
+**Provenance.** Resolution is atomic per source. Core reports `CredentialSource::{Env, Stored, Embedded, Entered}` alongside `AuthState` and the UI shows which source is in control.
+- **Env pair:**
+  - A partial env pair (only one variable set) is an explicit error naming the missing variable. It never falls through to the Keychain.
+  - An invalid env pair yields `NeedCredentials { error, source: Env }`, and the screen explains how to unset the variables. Entering a new pair is disabled while the env override is active.
+- **Keychain:**
+  - A Keychain read *failure* (locked, denied) is distinct from *absent*. It shows "Keychain unavailable" with Retry, and never shows the onboarding as if no pair were stored.
+  - Credential write and delete failures surface as `UserError` with Retry. A failed write after a successful `sendCode` does not block login; the pair is retried on the next successful auth step and stays in memory until then.
+
+**Auth attempts.** Every `SubmitCredentials`, `RequestCode`, `SubmitCode` and `SubmitPassword` runs under an `AuthAttempt` id.
+- **Back and Forget** are actor transitions, not UI-only navigation. Each one:
+  1. bumps the attempt id;
+  2. retires the client built for the superseded credentials through the normal retirement boundary;
+  3. clears the login and password tokens.
+- **Stale completions** carry an old attempt id and are dropped, including credential persistence. A late `sendCode` success can never persist a superseded pair.
+- **Ambiguous completion:** if a superseded `sign_in` or `check_password` may have completed, core runs the section 4 `is_authorized` probe before it accepts new credentials. If the probe says authorized, the user is signed in with the pair in use, and that pair is persisted.
+
+**Sent-code handling.** The pinned grammers `request_login_code` discards the sent-code type, timeout and next type (`auth.rs:290`). Use a raw `auth.sendCode` adapter that keeps the full `auth.SentCode`.
+- **Supported:** delivery in the app, SMS, call and flash call shown as text, plus server-directed resend with the server timeout.
+- **Unsupported:** the email-setup flow (`sentCodeTypeSetUpEmailRequired`) and `auth.sentCodeSuccess`. Both show "Finish this step in an official Telegram app, then try again" and never fake the flow.
+
+**`API_ID_PUBLISHED_FLOOD`** means the id is unusable (for example, it was published). It is not a timed wait. The message says to create or use a different application, with no countdown.
 
 ### 17.3 Screens
 
@@ -743,20 +767,21 @@ Every screen has Back except Welcome. Copy lives in one module (`crates/app/src/
 
    One button: **Connect to Telegram**.
 2. **Get API credentials.** Numbered steps, with **Open my.telegram.org** opening the system browser.
-   - The URL is the hardcoded constant `https://my.telegram.org/apps`, opened via `cx.open_url`. This is the only URL the app ever opens.
+   - The URL is the hardcoded constant `https://my.telegram.org/apps`, opened via `cx.open_url`. This is the only URL onboarding opens directly. Message links keep the separate confirm-before-open policy in section 8.
    - The steps:
+     0. Prerequisite: you need an existing Telegram account signed in on an official app (phone or desktop), and you must keep that session available. Login codes for my.telegram.org and for abyss arrive there.
      1. Log in with your phone number. The login code arrives *in your Telegram app*, not by SMS.
      2. Open "API development tools".
      3. Fill App title `abyss`, a Short name of 5–32 letters/digits, and Platform "Desktop"; leave URL empty.
      4. Copy `api_id` and `api_hash`.
    - Troubleshooting:
      - If the form says "ERROR", retry later, with VPN and ad blockers off and a letters-only short name.
-     - There is one app per account.
+     - There is one app per phone number. If you already registered one, copy its existing `api_id`/`api_hash`; don't try to create a second.
      - Never share the `api_hash`.
      - New `api_id`s can draw extra anti-spam scrutiny.
 3. **Enter credentials.** The `api_id` field accepts digits only, at most 10. The `api_hash` field accepts hex only, exactly 32 characters; it has a paste-normalizing filter and is masked with a reveal toggle. Inline validation runs, then **Continue** sends `SubmitCredentials`. A `CredentialError` comes back here with a specific message.
 4. **Phone** (section 4). International format with a leading `+`. Explain that the code is sent to your other Telegram sessions first.
-5. **Code.** Show where the code went (the sent-code type from `auth.sentCode`). Add a fixed warning: "Telegram and abyss will never ask for this code anywhere else." Expect a "new login" notice on your other devices.
+5. **Code.** Show where the code went, from the full `auth.SentCode` (section 17.2a), including the resend countdown and the next delivery type. Add a fixed warning: "Telegram and abyss will never ask for this code anywhere else." Expect a "new login" notice on your other devices.
 6. **Password** (2FA, section 4), with the hint.
 7. **Done.** Tips:
    - The session shows as "abyss" under Settings › Devices in official apps, where it can be revoked remotely.
@@ -775,7 +800,11 @@ Back from screens 4–6 to the credential screens is allowed only before the ses
   - Credentials are not persisted before a successful code request and are persisted after.
   - An env override is never persisted.
   - `API_ID_INVALID` returns to `NeedCredentials` with an error, and the session stays untouched.
-  - `ResetCredentials` is refused while signed in.
+  - `ForgetStoredCredentials` is refused while signed in and never affects an env override.
+  - A partial env pair is an error. A Keychain read failure is not treated as absent.
+  - A stale `sendCode` success after Back persists nothing. A superseded `sign_in` that succeeded is detected by the probe.
+  - The raw `sendCode` adapter keeps the delivery type and timeout. Email setup and `sentCodeSuccess` route to the official-app message.
+  - `API_ID_PUBLISHED_FLOOD` shows no countdown.
   - `ApiHash` `Debug` redacts.
 - **Fake backend:** scripted `API_ID_INVALID` and `API_ID_PUBLISHED_FLOOD` on the first code request.
 - **App:**
