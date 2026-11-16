@@ -175,7 +175,12 @@ pub enum HistoryDir {
 pub enum Event {
     Auth(AuthState),
     Connection(ConnState),
+    /// The whole chat list, replacing the UI's copy. A reloaded first page
+    /// (bootstrap, refresh) is merged into the loaded list in core, so later
+    /// pages survive it.
     DialogsReset(Vec<ChatSummary>),
+    /// Chats a later page added or changed: the UI updates listed chats in
+    /// place and appends new ones.
     DialogsAppended(Vec<ChatSummary>),
     /// A chat's summary changed (new message, unread count).
     ChatBumped(ChatSummary),

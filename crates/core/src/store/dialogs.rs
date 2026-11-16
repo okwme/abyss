@@ -1,5 +1,7 @@
 //! Bounded, ordered chat list.
 
+use std::collections::HashSet;
+
 use crate::model::{ChatId, ChatSummary, Preview};
 
 /// Maximum number of dialogs held.
@@ -19,6 +21,14 @@ pub enum Bump {
     Updated(ChatSummary),
     /// The chat is not in the loaded list. Callers decide whether to fetch it.
     Unknown,
+}
+
+/// Whether more dialogs pages follow the one being applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rest {
+    /// This page ends the server's list.
+    Last,
+    More,
 }
 
 /// Whether a new message counts toward the chat's unread badge.
@@ -51,11 +61,58 @@ impl Dialogs {
         self.extend(chats);
     }
 
-    /// Appends a page in server order. Returns the chats actually added.
+    /// Applies a freshly loaded *first* page (bootstrap or refresh) without
+    /// dropping the pages loaded after it. The page becomes the head of the list
+    /// in server order. Previously loaded chats it does not contain are kept
+    /// after it (unpinned, newest first) when they are not newer than the page's
+    /// oldest unpinned chat; a chat that is newer but missing was left, deleted
+    /// or archived, so it goes. A page that ends the list replaces it entirely.
+    /// Returns how many previously loaded chats were kept.
+    pub fn merge_first_page(&mut self, page: Vec<ChatSummary>, rest: Rest) -> usize {
+        let old = std::mem::take(&mut self.list);
+        self.extend(page);
+        if rest == Rest::Last {
+            return 0;
+        }
+        let head: HashSet<ChatId> = self.list.iter().map(|c| c.id).collect();
+        let boundary = self
+            .list
+            .iter()
+            .filter(|c| !c.pinned)
+            .map(|c| c.last_date)
+            .min();
+        let mut tail: Vec<ChatSummary> = old
+            .into_iter()
+            .filter(|c| !head.contains(&c.id))
+            .filter(|c| boundary.is_none_or(|b| c.last_date <= b))
+            .map(|mut c| {
+                // Not in the pinned head of a fresh first page: no longer pinned.
+                c.pinned = false;
+                c
+            })
+            .collect();
+        tail.sort_by_key(|c| std::cmp::Reverse(c.last_date));
+        let before = self.list.len();
+        self.extend(tail);
+        self.list.len() - before
+    }
+
+    /// Applies a later page in server order: chats already listed are updated
+    /// in place, new ones are appended. Returns the chats added or changed.
     pub fn append(&mut self, chats: Vec<ChatSummary>) -> Vec<ChatSummary> {
-        let start = self.list.len();
-        self.extend(chats);
-        self.list.get(start..).unwrap_or_default().to_vec()
+        let mut changed = Vec::new();
+        for chat in chats {
+            if let Some(slot) = self.list.iter_mut().find(|c| c.id == chat.id) {
+                if *slot != chat {
+                    slot.clone_from(&chat);
+                    changed.push(chat);
+                }
+            } else if self.list.len() < MAX_DIALOGS {
+                self.list.push(chat.clone());
+                changed.push(chat);
+            }
+        }
+        changed
     }
 
     fn extend(&mut self, chats: Vec<ChatSummary>) {
@@ -172,6 +229,59 @@ mod tests {
         assert_eq!(d.len(), MAX_DIALOGS);
         assert_eq!(added.len(), MAX_DIALOGS - 1);
         assert_eq!(added.first().map(|c| c.id), Some(id(1)));
+    }
+
+    fn dated(n: i64, last_date: i64) -> ChatSummary {
+        ChatSummary {
+            last_date,
+            ..chat(n)
+        }
+    }
+
+    #[test]
+    fn first_page_merges_over_loaded_pages() {
+        let mut d = Dialogs::default();
+        // Loaded: pinned 1, then 2..=6 by recency (dates 60..20).
+        d.reset(vec![pinned(1)]);
+        d.append((2..=6).map(|n| dated(n, 80 - n * 10)).collect());
+        // Fresh first page: 6 got a new message, 2 was left (newer than the
+        // page's oldest, but missing), 1 was unpinned and is not in the page.
+        let page = vec![dated(6, 100), dated(3, 50)];
+        let kept = d.merge_first_page(page, Rest::More);
+        assert_eq!(ids(&d), vec![6, 3, 4, 5, 1]);
+        assert_eq!(kept, 3);
+        assert!(d.as_slice().iter().all(|c| !c.pinned));
+    }
+
+    #[test]
+    fn last_first_page_replaces_the_list() {
+        let mut d = Dialogs::default();
+        d.reset((1..=5).map(chat).collect());
+        assert_eq!(d.merge_first_page(vec![chat(9)], Rest::Last), 0);
+        assert_eq!(ids(&d), vec![9]);
+    }
+
+    #[test]
+    fn merged_list_stays_bounded() {
+        let mut d = Dialogs::default();
+        let max = i64::try_from(MAX_DIALOGS).unwrap();
+        d.reset((0..max).map(|n| dated(n, -n)).collect());
+        let page: Vec<_> = (max..max + 100).map(|n| dated(n, n)).collect();
+        d.merge_first_page(page, Rest::More);
+        assert_eq!(d.len(), MAX_DIALOGS);
+        assert_eq!(d.as_slice()[100].id, id(0));
+    }
+
+    #[test]
+    fn later_pages_update_in_place() {
+        let mut d = Dialogs::default();
+        d.reset(vec![chat(1), chat(2)]);
+        let mut fresh = chat(1);
+        fresh.unread = 3;
+        let changed = d.append(vec![fresh.clone(), chat(2), chat(3)]);
+        assert_eq!(changed, vec![fresh, chat(3)]);
+        assert_eq!(ids(&d), vec![1, 2, 3]);
+        assert_eq!(d.as_slice()[0].unread, 3);
     }
 
     #[test]

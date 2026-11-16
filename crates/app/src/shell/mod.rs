@@ -3,6 +3,7 @@
 
 mod auth;
 mod bridge;
+mod chat_view;
 mod chats;
 mod session;
 mod shutdown;

@@ -4,26 +4,19 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use abyss_core::api::{Command, ConnState, Event, PasswordBuf, SendState, UserError};
-use abyss_core::model::{ChatId, LocalId};
+use abyss_core::api::{Command, ConnState, Event, PasswordBuf, UserError};
 use abyss_core::{BackendChoice, CoreConfig, SendError, StartError};
 use gpui::{AppContext, Context, Entity, Focusable, SharedString, Subscription, Task, Window};
 
 use super::Root;
 use super::auth::AuthView;
 use super::bridge::{CoreLink, SharedCore, spawn_pump};
-use super::chats::ChatList;
 use super::shutdown::{self, Closing, Next};
+use crate::chat::ChatShell;
 use crate::launch::Launch;
 use crate::ui::copy;
 use crate::ui::password::{PasswordEvent, PasswordInput};
 use crate::ui::text_input::{Limits, TextInput, TextInputEvent, text_input};
-
-/// Demo account size for `--fake`.
-#[cfg(feature = "fake")]
-const DEMO_CHATS: u32 = 60;
-#[cfg(feature = "fake")]
-const DEMO_MESSAGES: u32 = 40;
 
 /// How long a notice (toast) stays up.
 const NOTICE_FOR: Duration = Duration::from_secs(5);
@@ -50,8 +43,9 @@ pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
     match launch {
         #[cfg(feature = "fake")]
         Launch::Fake => {
-            use abyss_core::backend::fake::{FakeBackend, FakeScript};
-            let (backend, handle) = FakeBackend::new(FakeScript::demo(DEMO_CHATS, DEMO_MESSAGES));
+            use abyss_core::backend::fake::FakeBackend;
+            let script = crate::chat::demo::script(crate::chat::format::now());
+            let (backend, handle) = FakeBackend::new(script);
             let core = abyss_core::start(CoreConfig::default(), BackendChoice::Fake(backend))?;
             Ok(Started {
                 core: Box::new(core),
@@ -73,25 +67,24 @@ pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
 }
 
 pub(crate) struct Session {
-    core: SharedCore,
+    pub(super) core: SharedCore,
     pub(super) driver: LoginDriver,
     pub(super) auth: AuthView,
     pub(super) phone: Entity<TextInput>,
     pub(super) code: Entity<TextInput>,
     pub(super) password: Entity<PasswordInput>,
     pub(super) composer: Entity<TextInput>,
-    pub(super) chats: ChatList,
-    pub(super) selected: Option<ChatId>,
+    /// Chat list, open chat and pending sends (`crate::chat`, `shell::chats`).
+    pub(super) shell: ChatShell,
     pub(super) conn: Option<ConnState>,
-    pub(super) last_send: Option<SendState>,
     pub(super) notice: Option<SharedString>,
     notice_gen: u64,
     pub(super) closing: Closing,
-    next_local: u64,
     _pump: Task<()>,
     #[cfg(feature = "fake")]
     _fake: Option<abyss_core::backend::fake::FakeHandle>,
     _subscriptions: [Subscription; 4],
+    _chat_wiring: [Subscription; 2],
 }
 
 impl Session {
@@ -129,6 +122,8 @@ impl Session {
             LoginDriver::Demo => AuthView::Phone { error: None },
         };
         let pump = spawn_pump(Rc::clone(&shared), window, cx);
+        let shell = ChatShell::default();
+        let chat_wiring = super::chats::wire(shell.rows(), window, cx);
         let session = Self {
             core: shared,
             driver: started.driver,
@@ -137,18 +132,16 @@ impl Session {
             code,
             password,
             composer,
-            chats: ChatList::default(),
-            selected: None,
+            shell,
             conn: None,
-            last_send: None,
             notice: None,
             notice_gen: 0,
             closing: Closing::Open,
-            next_local: 1,
             _pump: pump,
             #[cfg(feature = "fake")]
             _fake: started.fake,
             _subscriptions: subscriptions,
+            _chat_wiring: chat_wiring,
         };
         session.focus_for_auth(window, cx);
         session
@@ -156,7 +149,7 @@ impl Session {
 
     /// Queues a command. A full queue shows "busy"; the rejected command is
     /// dropped (a password in it is zeroized on drop).
-    fn send(&mut self, cmd: Command, window: &mut Window, cx: &mut Context<'_, Root>) {
+    pub(super) fn send(&mut self, cmd: Command, window: &mut Window, cx: &mut Context<'_, Root>) {
         let result = match self.core.try_borrow() {
             Ok(core) => core.send(cmd),
             Err(_) => Err(SendError::Full(cmd)),
@@ -237,7 +230,7 @@ impl Session {
             AuthView::Phone { .. } => self.phone.focus_handle(cx),
             AuthView::Code { .. } => self.code.focus_handle(cx),
             AuthView::Password { .. } => self.password.focus_handle(cx),
-            AuthView::SignedIn if self.selected.is_some() => self.composer.focus_handle(cx),
+            AuthView::SignedIn if self.shell.selected().is_some() => self.composer.focus_handle(cx),
             AuthView::Connecting | AuthView::FloodWait { .. } | AuthView::SignedIn => return,
         };
         window.focus(&handle, cx);
@@ -300,38 +293,6 @@ impl Session {
         cx.notify();
     }
 
-    pub(super) fn submit_message(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
-        let Some(chat) = self.selected.filter(|_| self.auth == AuthView::SignedIn) else {
-            return;
-        };
-        if self.composer.read(cx).text().trim().is_empty() {
-            return;
-        }
-        let text = self.composer.update(cx, |c, cx| c.take_text(window, cx));
-        let local_id = LocalId(self.next_local);
-        self.next_local = self.next_local.wrapping_add(1);
-        self.send(
-            Command::SendText {
-                chat,
-                text,
-                local_id,
-            },
-            window,
-            cx,
-        );
-    }
-
-    pub(super) fn select_chat(
-        &mut self,
-        chat: ChatId,
-        window: &mut Window,
-        cx: &mut Context<'_, Root>,
-    ) {
-        self.selected = Some(chat);
-        self.focus_for_auth(window, cx);
-        cx.notify();
-    }
-
     pub(super) fn apply_event(
         &mut self,
         event: Event,
@@ -345,21 +306,15 @@ impl Session {
                 }
             }
             Event::Connection(state) => self.conn = Some(state),
-            Event::DialogsReset(chats) => self.chats.reset(chats),
-            Event::DialogsAppended(chats) => self.chats.append(chats),
-            Event::ChatBumped(chat) => self.chats.bump(chat),
-            Event::SendState { state, .. } => self.last_send = Some(state),
             Event::Error(error) => self.on_error(error, window, cx),
-            // Message views land in task 10.
-            Event::History { .. }
-            | Event::ChatInvalidated(_)
-            | Event::Edited(_)
-            | Event::Deleted { .. } => {}
+            // Chat list, message view and sends: `shell::chats`.
+            chat => self.apply_chat_event(chat, window, cx),
         }
     }
 
     fn on_error(&mut self, error: UserError, window: &mut Window, cx: &mut Context<'_, Root>) {
         tracing::info!(?error, "core reported an error");
+        self.shell.load_failed();
         match self.auth.with_error(error, Instant::now()) {
             Some(next) => self.set_auth(next, window, cx),
             None => self.show_notice(copy::user_error(error), window, cx),

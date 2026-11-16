@@ -1,0 +1,241 @@
+//! The `--fake` demo account: enough chats and messages to exercise the chat
+//! list and message view by hand (task 9 and 10 acceptance): 1,000 dialogs of
+//! every kind, and one 2,000-message chat with emoji, RTL, 4,096-character
+//! text, every entity kind, every media kind, service and unsupported
+//! messages, edits, outgoing messages, senders and over-budget formatting.
+
+use abyss_core::backend::fake::FakeScript;
+use abyss_core::model::{
+    Body, ChatId, ChatKind, ChatSummary, MediaKind, Message, MsgId, PeerKind, Preview, Sender,
+    ThreadKey,
+};
+use abyss_core::rich_text::{EntityKind, MAX_ENTITIES, RawEntity, RichText};
+use abyss_core::sanitize::display_name;
+
+const CHATS: i64 = 1000;
+const SHOWCASE_MESSAGES: i32 = 2000;
+const MESSAGES: i32 = 30;
+
+fn chat_id(n: i64) -> ChatId {
+    let kind = match n % 5 {
+        2 | 3 => PeerKind::Channel,
+        4 => PeerKind::Chat,
+        _ => PeerKind::User,
+    };
+    ChatId { kind, id: n }
+}
+
+fn kind_of(n: i64) -> ChatKind {
+    match n % 5 {
+        2 if n % 10 == 2 => ChatKind::Supergroup {
+            forum: true,
+            gigagroup: false,
+        },
+        2 => ChatKind::Supergroup {
+            forum: false,
+            gigagroup: n % 20 == 7,
+        },
+        3 => ChatKind::Supergroup {
+            forum: false,
+            gigagroup: n % 15 == 3,
+        },
+        4 => ChatKind::Group,
+        _ if n % 7 == 0 => ChatKind::Bot,
+        _ => ChatKind::Private,
+    }
+}
+
+fn summary(n: i64, now: i64) -> ChatSummary {
+    let kind = kind_of(n);
+    let title = match n {
+        1 => "Formatting showcase".to_owned(),
+        2 => "Forum: abyss contributors".to_owned(),
+        _ => format!("Chat {n}"),
+    };
+    let last = match n % 4 {
+        0 => Preview::Media(MediaKind::Photo),
+        1 => Preview::Text(format!(
+            "Last message in chat {n}, long enough to be cut off in the row"
+        )),
+        2 => Preview::Text("مرحبا بالعالم".into()),
+        _ => Preview::Service,
+    };
+    ChatSummary {
+        id: chat_id(n),
+        title: display_name(&title),
+        kind,
+        pinned: n <= 3,
+        unread: u32::try_from(n % 9).unwrap_or(0) * u32::try_from(n % 3).unwrap_or(0),
+        unread_mentions: 0,
+        last: Some(last),
+        last_date: now - n * 3_600,
+        can_send: !matches!(
+            kind,
+            ChatKind::Supergroup {
+                gigagroup: true,
+                ..
+            }
+        ),
+    }
+}
+
+fn message(chat: ChatId, id: i32, date: i64, body: Body) -> Message {
+    Message {
+        id: MsgId(id),
+        thread: ThreadKey { chat, topic: None },
+        sender: None,
+        date,
+        edit_date: None,
+        outgoing: false,
+        reply_to: None,
+        body,
+    }
+}
+
+fn entity(offset: i32, length: i32, kind: EntityKind) -> RawEntity {
+    RawEntity {
+        offset,
+        length,
+        kind,
+    }
+}
+
+/// Every entity kind, overlapping, around multi-byte text.
+fn formatted() -> RichText {
+    let text =
+        "bold italic under strike `code` pre spoiler @mention https://abyss.example click 😀 done";
+    RichText::from_entities(
+        text,
+        &[
+            entity(0, 11, EntityKind::Bold),
+            entity(5, 12, EntityKind::Italic),
+            entity(12, 5, EntityKind::Underline),
+            entity(18, 6, EntityKind::Strike),
+            entity(25, 6, EntityKind::Code),
+            entity(32, 3, EntityKind::Pre),
+            entity(36, 7, EntityKind::Spoiler),
+            entity(44, 8, EntityKind::Mention),
+            entity(53, 21, EntityKind::Url),
+            entity(
+                75,
+                5,
+                EntityKind::TextUrl("https://example.org/real-target".into()),
+            ),
+        ],
+    )
+}
+
+fn showcase_body(i: i32) -> Body {
+    let text = |t: &str| Body::Text(RichText::plain(t));
+    match i % 12 {
+        0 => Body::Text(formatted()),
+        1 => text("Emoji: 👩‍💻🚀🇺🇦 and ZWJ 👨‍👩‍👧‍👦"),
+        2 => text("עברית ועוד: مرحبا بالعالم mixed with English"),
+        3 if i % 120 == 3 => text(&"long text ".repeat(410)),
+        4 => Body::Media {
+            kind: media(i),
+            caption: RichText::plain("A caption under the media"),
+        },
+        5 => Body::Service("Ada joined the group".into()),
+        6 => Body::Unsupported,
+        7 => {
+            let entities: Vec<RawEntity> = (0..=i32::try_from(MAX_ENTITIES).unwrap_or(256))
+                .map(|k| entity(k % 40, 1, EntityKind::Bold))
+                .collect();
+            Body::Text(RichText::from_entities(
+                &"over budget ".repeat(4),
+                &entities,
+            ))
+        }
+        _ => Body::Text(RichText::plain(&format!("Message {i}"))),
+    }
+}
+
+fn media(i: i32) -> MediaKind {
+    match (i / 12) % 11 {
+        0 => MediaKind::Photo,
+        1 => MediaKind::Video,
+        2 => MediaKind::Voice,
+        3 => MediaKind::Audio,
+        4 => MediaKind::Document {
+            name: display_name("report-2026.pdf"),
+            size: 1_572_864,
+        },
+        5 => MediaKind::Sticker,
+        6 => MediaKind::Gif,
+        7 => MediaKind::Poll,
+        8 => MediaKind::Location,
+        9 => MediaKind::Contact,
+        _ => MediaKind::Other,
+    }
+}
+
+fn showcase(chat: ChatId, now: i64) -> Vec<Message> {
+    (1..=SHOWCASE_MESSAGES)
+        .map(|i| {
+            let date = now - i64::from(SHOWCASE_MESSAGES - i) * 600;
+            let mut m = message(chat, i, date, showcase_body(i));
+            m.outgoing = i % 5 == 0;
+            m.edit_date = (i % 9 == 0).then_some(date + 60);
+            m
+        })
+        .collect()
+}
+
+fn ordinary(chat: ChatId, n: i64, now: i64) -> Vec<Message> {
+    let senders = ["Ada", "Grace", "Linus"];
+    (1..=MESSAGES)
+        .map(|i| {
+            let date = now - n * 3_600 - i64::from(MESSAGES - i) * 120;
+            let body = Body::Text(RichText::plain(&format!("Message {i} in chat {n}")));
+            let mut m = message(chat, i, date, body);
+            m.outgoing = i % 4 == 0;
+            if chat.kind != PeerKind::User && !m.outgoing {
+                let k = usize::try_from(i).unwrap_or(0) % senders.len();
+                m.sender = senders.get(k).map(|name| Sender {
+                    id: chat_id(i64::from(i) + 10_000),
+                    name: display_name(name),
+                });
+            }
+            m
+        })
+        .collect()
+}
+
+/// The demo account at time `now` (Unix seconds).
+pub(crate) fn script(now: i64) -> FakeScript {
+    let mut script = FakeScript::default();
+    for n in 1..=CHATS {
+        let summary = summary(n, now);
+        let id = summary.id;
+        script.dialogs.push(summary);
+        let history = if n == 1 {
+            showcase(id, now)
+        } else {
+            ordinary(id, n, now)
+        };
+        script.history.insert(id, history);
+    }
+    script
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn demo_data_is_valid_domain_data() {
+        let script = script(1_794_837_900);
+        assert_eq!(script.dialogs.len(), 1000);
+        assert!(script.dialogs.iter().all(ChatSummary::is_valid));
+        let showcase = &script.history[&chat_id(1)];
+        assert_eq!(showcase.len(), 2000);
+        assert!(showcase.iter().all(Message::is_valid));
+        assert!(showcase.windows(2).all(|w| w[0].id < w[1].id));
+        let long = showcase.iter().filter_map(|m| match &m.body {
+            Body::Text(rt) => Some(rt.text().len()),
+            _ => None,
+        });
+        assert!(long.max().unwrap() >= 4096);
+    }
+}

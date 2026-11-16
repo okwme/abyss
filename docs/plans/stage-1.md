@@ -645,6 +645,32 @@ Remaining for task 12 (live):
 
 Auth TODOs for task 6 (listed in `grammers/mod.rs`): `is_authorized`, `request_login_code` (needs `api_hash`), `sign_in`, `check_password` (re-fetch via `account.getPassword` on `SRP_ID_INVALID`), `users.getUsers` self after sign-in, `sign_out`. All auth calls use `RetryClass::Never` with typed error mapping; `Unauthorized` from any call must trigger a local logout; no bootstrap while signed out.
 
+**Task 9 status (2026-11-16): done, with one deferral.** The chat list is `crates/app/src/chat/list.rs` (model) and `crates/app/src/shell/chat_view.rs` (a `uniform_list` sidebar: avatar initials, kind tag, time, sanitized 100-char preview, unread badge with `@` for mentions). `DialogsReset` replaces the list, `DialogsAppended` upserts, `ChatBumped` moves a chat to the top of its section (pinned or not) only when its last message or date changed, so read-state bumps do not reorder. Scrolling within 20 rows of the end asks for the next page once per list length, never past `MAX_DIALOGS`. Selecting a chat sends `OpenChat` and focuses the composer.
+
+Dialogs-refresh truncation is fixed in core (`store::Dialogs::merge_first_page`, `actor/apply.rs::on_dialogs`), not the app, so core stays the single source of truth. A refreshed first page becomes the head of the list. Previously loaded chats missing from it are kept when they are not newer than the page's oldest unpinned chat: those sort below the page, so the server would return them on later pages anyway. Kept chats are unpinned (a pinned chat absent from the page was unpinned) and stay sorted newest first; the list stays bounded by `MAX_DIALOGS`. A first page that is also the last (`next == None`) replaces the list, since it is the whole truth. The pagination cursor is kept when older pages survived the merge, so scrolling continues from where it was instead of refetching. `DialogsAppended` upserts in core too, so a later page that overlaps the merged head updates in place instead of duplicating. This supersedes the task 4 note that a refresh resets the list to one page. Tests: 4 store tests plus `refresh_merges_the_first_page_into_loaded_pages` in the actor.
+
+Deviations:
+- Forum topic expansion is deferred. Topics are a Stage 2 non-goal (section 0), and neither the model nor the backend carries topic data. Forum chats are tagged "forum" and the chat header says topics arrive later; messages show as one stream.
+- A merged list can keep a chat the user left between refreshes until it is bumped out or the app restarts (the server does not report removals in a page).
+
+Manual checks remaining: scroll smoothness with 1,000 dialogs (`--fake` seeds 1,000), pinned ordering against a real account, pagination against grammers (task 11).
+
+**Task 10 status (2026-11-16): done against the fake.** `crates/app/src/chat/`:
+- `messages.rs`: `MessageWindow` mirrors core's window per `ViewGen` (a stale view is ignored, a newer one resets, nothing but a tail seeds an empty window) and returns `RowOp`s (coalesced splices, remeasures) that keep a GPUI `ListState` (bottom-aligned, `FollowMode::Tail`) in step, so a prepend is one `splice(0..0, n)` and the scroll anchor holds. Scrolling within 10 rows of the top sends `LoadOlder`; within 10 of the bottom while detached sends `LoadNewer`; each once until any `History` or `Error` answers (core drops requests while a load runs, so a stuck flag would stall scrolling). Bounded by `MAX_MESSAGES_PER_CHAT`; a "Jump to latest" button reopens the tail when detached.
+- `rich.rs`: `RichText` spans become `TextRun`s for `StyledText::with_runs`, each run as long as its own piece, so the partition is exact by construction; a malformed one falls back to plain text rather than panicking. Bold, italic, underline, strike, code/pre (monospace with background), mention (colored), spoiler (hidden until clicked, per message, bounded set). Links render as text; a hidden `TextUrl` target is appended as ` (target)`, sanitized and cut at 256 bytes. Clicking a link copies the exact target to the clipboard and shows "Link copied"; nothing opens a browser. Tests: per-feature cases, a 2,000-case generated partition fuzz (surrogate-splitting and out-of-range offsets), and the headless `with_runs` render through `InteractiveText` in `TestAppContext`.
+- Rows show sender names in groups, day separators, time, an "edited" marker, service messages, reply quotes, and inert media chips (kind, file name, size); nothing is downloaded.
+- `sends.rs`: composer submit sends `SendText` with a UI-allocated `LocalId` and shows an echo row (at most 256) showing Sending, Sent, Sent unconfirmed, Not sent (Failed) or Not sure it was sent (Unknown). Failed and Unknown get Retry (`RetrySend`) and Discard (`DiscardSend`). A Sent echo leaves when its server id appears in the window; SentUnconfirmed and older Sent echoes leave when a new tail arrives. A full command queue shows Busy and keeps the composer text.
+- Mark read: after each frame, the newest message row inside the viewport is found; `MarkRead` is sent when it is above the last sent mark and the window is active.
+- Window activation sends `Command::Window(Active/Inactive)`; GPUI's `on_system_wake` calls `CoreHandle::notify_wake()` (new defaulted `CoreLink::notify_wake`).
+- `demo.rs` (`--fake`): 1,000 dialogs of every kind and a 2,000-message "Formatting showcase" chat (entities, emoji, RTL, 4,100-char text, every media kind, service, unsupported, edits).
+
+Deviations:
+- Echoes are UI-side and listed after the window's messages, not merged by date; the fake does not echo own sends, so with `--fake` a Sent echo stays until the chat reloads.
+- Links copy only; there is no "open in browser" prompt in Stage 1.
+- Topic threads are not shown (see task 9).
+
+Manual checks remaining: prepend anchoring and live-tail follow under real scrolling, mark-read timing, system wake after sleep, IME in the composer, and the rich-text rendering against the showcase chat.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.
@@ -723,6 +749,10 @@ Auth TODOs for task 6 (listed in `grammers/mod.rs`): `is_authorized`, `request_l
   - A send that gets `Migrated` or `FloodWait` becomes `Failed` and is stranded after the rebuild. Fix: classify both separately and keep the send replayable with the same `random_id`.
   - The send-replay test only covers an unaccepted attempt. Fix: add an "accepted, response lost" fault plus fake server dedup by `random_id`, and check the 3-attempt cap across several rebuilds.
   - Shutdown during a retirement skips revoke. This one went to task 6.
+
+- **Round 5 (code review of task 11, 2026-11-16).** Six findings go to task 11b (backend-local): dialog-refresh pins losing access hashes before a rebuild, response cardinality bounds, `exclude_pinned` on later pages, folder entries ending pagination early, unredacted `Debug` on mapping types, and the contract suite accepting an empty `After`. Two go to task 4b because they cross into the actor:
+  - Typed stream-error causes: auth loss and migration must survive the stream boundary so core can run a local logout or the migration policy.
+  - `updateMessageID` correlation with the pending-send table.
 
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 
