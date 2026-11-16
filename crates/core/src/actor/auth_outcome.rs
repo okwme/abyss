@@ -31,7 +31,7 @@ impl<B: Backend> Actor<B> {
             }
         };
         match step {
-            AuthStep::SignIn { token, res } => self.on_sign_in(guard, token, res).await,
+            AuthStep::SignIn(res) => self.on_sign_in(guard, res).await,
             AuthStep::Password(res) => self.on_password(guard, res).await,
             other => {
                 drop(guard);
@@ -53,7 +53,7 @@ impl<B: Backend> Actor<B> {
             AuthStep::Unresolved(Ambiguous::Password) => {
                 self.token_unavailable(UserError::Network).await;
             }
-            AuthStep::SignIn { .. } | AuthStep::Password(_) => {}
+            AuthStep::SignIn(_) | AuthStep::Password(_) => {}
         }
     }
 
@@ -76,7 +76,7 @@ impl<B: Backend> Actor<B> {
     async fn on_code_sent(&mut self, kind: AuthKind, res: Result<Token<B>, AuthFail>) {
         let fail = match res {
             Ok(token) => {
-                self.auth.login_token = Some(token);
+                self.auth.login_token = Some(std::sync::Arc::new(token));
                 return self.code_state(None).await;
             }
             Err(fail) => fail,
@@ -109,17 +109,16 @@ impl<B: Backend> Actor<B> {
     async fn on_sign_in(
         &mut self,
         guard: AuthInFlight,
-        token: Token<B>,
         res: Result<SignInNext<<B::Client as Client>::PasswordToken>, AuthFail>,
     ) {
         match res {
             Ok(SignInNext::Password(challenge)) => {
                 drop(guard);
+                self.auth.login_token = None;
                 self.password_state(challenge, None).await;
             }
             Ok(SignInNext::InvalidCode) => {
                 drop(guard);
-                self.auth.login_token = Some(token);
                 self.code_state(Some(UserError::InvalidCode)).await;
             }
             Ok(SignInNext::SignUpRequired) => {
@@ -128,7 +127,6 @@ impl<B: Backend> Actor<B> {
                 self.set_auth(AuthState::SignUpRequired).await;
             }
             Err(fail) => {
-                self.auth.login_token = Some(token);
                 if fail.is_ambiguous() {
                     // Keep the pending flag until the probe has answered.
                     return self.probe(Ambiguous::Code, guard);

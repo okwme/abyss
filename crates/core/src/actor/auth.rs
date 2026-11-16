@@ -123,10 +123,7 @@ pub(super) enum SignInNext<P> {
 pub(super) enum AuthStep<C: Client> {
     Startup(AuthResult<Account>),
     CodeSent(AuthResult<C::LoginToken>),
-    SignIn {
-        token: C::LoginToken,
-        res: AuthResult<SignInNext<C::PasswordToken>>,
-    },
+    SignIn(AuthResult<SignInNext<C::PasswordToken>>),
     /// A wrong password (with a fresh token), or a failure.
     Password(AuthResult<PasswordChallenge<C::PasswordToken>>),
     Challenge(AuthResult<PasswordChallenge<C::PasswordToken>>),
@@ -162,7 +159,7 @@ pub(super) struct AuthMachine<C: Client> {
     task: Option<AuthTask<C>>,
     phone: Option<Zeroizing<String>>,
     pub(super) phone_hint: String,
-    pub(super) login_token: Option<C::LoginToken>,
+    pub(super) login_token: Option<Arc<C::LoginToken>>,
     pub(super) password_token: Option<C::PasswordToken>,
     pub(super) hint: Option<String>,
     flood: Option<(Instant, AuthState)>,
@@ -185,12 +182,6 @@ impl<C: Client> AuthMachine<C> {
             hint: None,
             flood: None,
         }
-    }
-
-    /// Whether a login call is pending (the guard is held).
-    #[cfg(test)]
-    pub(super) fn pending(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
     }
 
     pub(super) fn flood_deadline(&self) -> Option<Instant> {
@@ -460,12 +451,15 @@ impl<B: Backend> Actor<B> {
         let Some(ctx) = self.login_ctx() else {
             return self.login_unavailable().await;
         };
-        let Some(token) = self.auth.login_token.take() else {
-            return self.code_state(Some(UserError::InvalidCode)).await;
-        };
+        // A pending call answers `Busy` before the token is looked at.
         let Some(guard) = self.begin_auth().await else {
-            self.auth.login_token = Some(token);
             return;
+        };
+        // Shared, not taken: the token stays valid on the server until a
+        // sign-in succeeds, so a lost answer or a panic does not lose it.
+        let Some(token) = self.auth.login_token.clone() else {
+            drop(guard);
+            return self.code_state(Some(UserError::InvalidCode)).await;
         };
         self.spawn_auth(AuthKind::SignIn, guard, async move {
             let res = call(&ctx.cancel, ctx.deadline, ctx.client.sign_in(&token, &code)).await;
@@ -476,7 +470,7 @@ impl<B: Backend> Actor<B> {
                 Ok(SignIn::SignUpRequired) => Ok(SignInNext::SignUpRequired),
                 Err(e) => Err(e),
             };
-            AuthStep::SignIn { token, res }
+            AuthStep::SignIn(res)
         });
     }
 
@@ -488,12 +482,13 @@ impl<B: Backend> Actor<B> {
         let Some(ctx) = self.login_ctx() else {
             return self.login_unavailable().await;
         };
-        let Some(token) = self.auth.password_token.take() else {
-            return self.token_unavailable(UserError::Network).await;
-        };
         let Some(guard) = self.begin_auth().await else {
-            self.auth.password_token = Some(token);
             return;
+        };
+        // Taken: a password token is single-use (`check_password` consumes it).
+        let Some(token) = self.auth.password_token.take() else {
+            drop(guard);
+            return self.token_unavailable(UserError::Network).await;
         };
         self.spawn_auth(AuthKind::Password, guard, async move {
             let res = call(

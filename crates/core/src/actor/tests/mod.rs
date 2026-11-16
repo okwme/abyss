@@ -233,7 +233,7 @@ fn dialogs_len(ev: &Event) -> usize {
 
 #[tokio::test(start_paused = true)]
 async fn refresh_merges_the_first_page_into_loaded_pages() {
-    let mut h = harness(FakeScript::demo(250, 0), None);
+    let mut h = harness(FakeScript::demo(250, 0), None).await;
     h.online().await;
     for expected in [100, 50] {
         h.send(Command::LoadDialogs).await;
