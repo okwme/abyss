@@ -658,3 +658,25 @@ pub(super) struct LifeAtShutdown {
     pub(super) retired: bool,
     pub(super) logout: Option<LogoutStatus>,
 }
+
+impl<B: Backend> Actor<B> {
+    /// Task 6b: retires a signed-out instance built for API credentials no
+    /// longer in use (Back, Forget, new or rejected credentials). Like a
+    /// rebuild, without backoff or a `Rebuilding` event: the next build waits
+    /// for the credential slot to hold a pair.
+    pub(super) fn retire_for_credentials(&mut self) {
+        if self.life.phase != Phase::SignedOut {
+            return;
+        }
+        let Some(live) = self.live.take() else {
+            return;
+        };
+        self.begin_retire();
+        self.life.phase = Phase::Retiring(After::Rebuild);
+        self.life.pending_delay = Duration::ZERO;
+        let shutdown = self.cancel.clone();
+        self.life.step = Some(tokio::spawn(async move {
+            Step::Retired(retire(live, REBUILD_CAPS, &shutdown).await)
+        }));
+    }
+}

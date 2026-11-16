@@ -21,6 +21,9 @@ pub(crate) enum CharFilter {
     Phone,
     /// ASCII digits.
     Digits,
+    /// ASCII hexadecimal digits: a pasted `api_hash` loses its spaces,
+    /// quotes and line breaks.
+    Hex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +51,18 @@ impl Limits {
         filter: CharFilter::Digits,
         lines: Lines::Single,
         max_utf16: 8,
+    };
+    /// `api_id`: at most 10 digits (a positive 32-bit number).
+    pub(crate) const API_ID: Limits = Limits {
+        filter: CharFilter::Digits,
+        lines: Lines::Single,
+        max_utf16: 10,
+    };
+    /// `api_hash`: 32 hex digits.
+    pub(crate) const API_HASH: Limits = Limits {
+        filter: CharFilter::Hex,
+        lines: Lines::Single,
+        max_utf16: 32,
     };
     pub(crate) const COMPOSER: Limits = Limits {
         filter: CharFilter::Any,
@@ -323,6 +338,7 @@ fn clean(text: &str, limits: Limits) -> String {
         let keep = match limits.filter {
             CharFilter::Phone => (ch.is_ascii_digit() || ch == '+').then_some(ch),
             CharFilter::Digits => ch.is_ascii_digit().then_some(ch),
+            CharFilter::Hex => ch.is_ascii_hexdigit().then_some(ch),
             CharFilter::Any => match ch {
                 '\r' => {
                     chars.next_if_eq(&'\n');

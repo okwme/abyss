@@ -171,7 +171,7 @@ fn display_runs(input: &TextInput, style: &TextStyle) -> (SharedString, Vec<Text
     let (text, color) = if content.is_empty() {
         (input.placeholder.clone(), style.color.opacity(0.4))
     } else {
-        (SharedString::from(content.to_owned()), style.color)
+        (SharedString::from(input.display_text()), style.color)
     };
     let run = TextRun {
         len: text.len(),

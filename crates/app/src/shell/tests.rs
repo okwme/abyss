@@ -14,7 +14,7 @@ use gpui::{Entity, TestAppContext, VisualTestContext};
 use super::bridge::{CoreLink, DRAIN_MAX, EventSource, ShutdownAck, drain};
 use super::shutdown::Closing;
 use super::{Failure, Root, State};
-use crate::launch::{API_HASH_VAR, API_ID_VAR, LaunchError};
+use crate::launch::LaunchError;
 
 /// Commands the UI sent, and whether the queue reports full.
 #[derive(Default)]
@@ -95,14 +95,14 @@ fn closing(root: &Entity<Root>, cx: &mut VisualTestContext) -> Option<Closing> {
 }
 
 #[gpui::test]
-fn missing_credentials_show_the_error_screen_and_close_freely(cx: &mut TestAppContext) {
-    let missing = LaunchError::MissingCredentials(vec![API_ID_VAR, API_HASH_VAR]);
-    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(missing), window, cx));
+fn launch_errors_show_the_error_screen_and_close_freely(cx: &mut TestAppContext) {
+    let error = LaunchError::FakeNotBuilt;
+    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(error), window, cx));
     cx.run_until_parked();
     root.read_with(cx, |root, _| {
         assert!(matches!(
             root.state,
-            State::Failed(Failure::Launch(LaunchError::MissingCredentials(_)))
+            State::Failed(Failure::Launch(LaunchError::FakeNotBuilt))
         ));
     });
     assert_eq!(closing(&root, cx), None);
@@ -183,8 +183,33 @@ mod fake {
                 Command::SubmitPassword(PasswordBuf::from_slice(p.as_bytes()).unwrap())
             }
             Command::RetryPasswordParams => Command::RetryPasswordParams,
-            _ => Command::Logout,
+            Command::SubmitCredentials { api_id, api_hash } => Command::SubmitCredentials {
+                api_id: *api_id,
+                api_hash: api_hash.clone(),
+            },
+            Command::Back => Command::Back,
+            Command::ResendCode => Command::ResendCode,
+            Command::ReloadCredentials => Command::ReloadCredentials,
+            Command::ForgetStoredCredentials => Command::ForgetStoredCredentials,
+            Command::Logout => Command::Logout,
+            // A stand-in for commands these tests don't inspect.
+            _ => Command::LoadDialogs,
         })
+    }
+
+    fn sent_count(harness: &Harness) -> usize {
+        harness.sent.borrow().commands.len()
+    }
+
+    fn act(
+        root: &Entity<Root>,
+        cx: &mut VisualTestContext,
+        f: impl FnOnce(&mut super::super::Session, &mut gpui::Window, &mut gpui::Context<'_, Root>),
+    ) {
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| f(s, window, cx), cx);
+        });
+        cx.run_until_parked();
     }
 
     /// The router follows core's states; each form sends its command.
@@ -201,6 +226,7 @@ mod fake {
             cx,
             AuthState::Code {
                 phone_hint: phone_hint.clone(),
+                sent: None,
                 error: None,
             },
         );
@@ -208,6 +234,7 @@ mod fake {
             auth(root, cx),
             AuthView::Code {
                 phone_hint: phone_hint.into(),
+                sent: None,
                 error: None
             }
         );
@@ -234,9 +261,152 @@ mod fake {
             cx,
             AuthState::SignedIn {
                 display_name: "Demo User".into(),
+                new_login: None,
             },
         );
         assert_eq!(auth(root, cx), AuthView::SignedIn);
+    }
+
+    /// Welcome → guide → entry (UI-only), Back locally, inline validation,
+    /// then `SubmitCredentials` with the fields cleared.
+    #[gpui::test]
+    fn onboarding_entry_submits_credentials(cx: &mut TestAppContext) {
+        use crate::shell::auth::{Onboarding, Stored};
+        let (root, cx, harness) = open(cx);
+        let need = AuthState::NeedCredentials {
+            error: None,
+            source: None,
+        };
+        core_says(&harness, cx, need);
+        assert_eq!(auth(&root, cx), AuthView::Onboarding(Onboarding::Welcome));
+        act(&root, cx, super::super::Session::connect);
+        assert_eq!(auth(&root, cx), AuthView::Onboarding(Onboarding::Guide));
+        act(&root, cx, super::super::Session::have_credentials);
+        let entry = AuthView::Onboarding(Onboarding::Entry {
+            error: None,
+            stored: Stored::No,
+        });
+        assert_eq!(auth(&root, cx), entry);
+        act(&root, cx, super::super::Session::back);
+        assert_eq!(auth(&root, cx), AuthView::Onboarding(Onboarding::Guide));
+        assert_eq!(sent_count(&harness), 0, "UI-only Back sends nothing");
+        act(&root, cx, super::super::Session::have_credentials);
+
+        // api_id is focused; Enter with no hash is refused inline.
+        cx.simulate_input("12345");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sent_count(&harness), 0);
+        assert_eq!(
+            read(&root, cx, |s| s.entry_error.clone()),
+            Some(crate::ui::copy::onboarding::HASH_INVALID.into())
+        );
+        act(&root, cx, |s, w, cx| {
+            use gpui::Focusable;
+            let handle = s.api_hash.focus_handle(cx);
+            w.focus(&handle, cx);
+        });
+        let hash = "0123456789abcdef0123456789ABCDEF";
+        cx.simulate_input(hash);
+        // Masked: the field shows bullets, never the hash.
+        let shown = read(&root, cx, |s| s.api_hash.clone());
+        assert_eq!(
+            shown.read_with(cx, |i, _| i.mask()),
+            crate::ui::text_input::Mask::Hidden
+        );
+        cx.simulate_keystrokes("enter");
+        let Some(Command::SubmitCredentials { api_id, api_hash }) = last_command(&harness) else {
+            panic!("expected SubmitCredentials");
+        };
+        assert_eq!(api_id, 12345);
+        assert_eq!(api_hash.expose(), hash.to_lowercase());
+        assert_eq!(read(&root, cx, |s| s.entry_error.clone()), None);
+        let api_id_left = read(&root, cx, |s| s.api_id.clone());
+        assert_eq!(api_id_left.read_with(cx, |i, _| i.text().to_owned()), "");
+        assert_eq!(shown.read_with(cx, |i, _| i.text().to_owned()), "");
+    }
+
+    /// Back on login screens goes to core; never away from an env pair.
+    #[gpui::test]
+    fn back_rules(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        core_says(&harness, cx, AuthState::Phone { error: None });
+        act(&root, cx, super::super::Session::back);
+        assert!(matches!(last_command(&harness), Some(Command::Back)));
+        let sent = sent_count(&harness);
+        let env = Event::CredentialSource(Some(abyss_core::api::CredentialSource::Env));
+        harness.events.unbounded_send(env).unwrap();
+        cx.run_until_parked();
+        act(&root, cx, super::super::Session::back);
+        assert_eq!(sent_count(&harness), sent, "no Back from an env pair");
+        let code = AuthState::Code {
+            phone_hint: "+1 •••• •••00".into(),
+            sent: None,
+            error: None,
+        };
+        core_says(&harness, cx, code);
+        act(&root, cx, super::super::Session::back);
+        assert!(matches!(last_command(&harness), Some(Command::Back)));
+        core_says(&harness, cx, AuthState::Verifying { error: None });
+        let sent = sent_count(&harness);
+        act(&root, cx, super::super::Session::back);
+        assert_eq!(sent_count(&harness), sent, "no Back while verifying");
+    }
+
+    /// A login in this run shows Done (with the 2FA recommendation), then
+    /// the chats; Logout sends `Command::Logout`.
+    #[gpui::test]
+    fn done_then_chats_then_logout(cx: &mut TestAppContext) {
+        use crate::shell::auth::Saved;
+        let (root, cx, harness) = open(cx);
+        let signed_in = AuthState::SignedIn {
+            display_name: String::new(),
+            new_login: Some(abyss_core::api::NewLogin {
+                has_password: Some(false),
+            }),
+        };
+        core_says(&harness, cx, signed_in);
+        assert_eq!(
+            auth(&root, cx),
+            AuthView::Done {
+                has_password: Some(false),
+                saved: Saved::Yes
+            }
+        );
+        act(&root, cx, super::super::Session::open_chats);
+        assert_eq!(auth(&root, cx), AuthView::SignedIn);
+        act(&root, cx, super::super::Session::logout);
+        assert!(matches!(last_command(&harness), Some(Command::Logout)));
+        core_says(&harness, cx, AuthState::LoggingOut);
+        assert_eq!(auth(&root, cx), AuthView::LoggingOut);
+    }
+
+    #[gpui::test]
+    fn resend_is_sent_from_the_code_screen(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        act(&root, cx, super::super::Session::resend_code);
+        assert_eq!(sent_count(&harness), 0, "no resend outside the code screen");
+        let code = AuthState::Code {
+            phone_hint: "+1 •••• •••00".into(),
+            sent: None,
+            error: None,
+        };
+        core_says(&harness, cx, code);
+        act(&root, cx, super::super::Session::resend_code);
+        assert!(matches!(last_command(&harness), Some(Command::ResendCode)));
+    }
+
+    #[gpui::test]
+    fn unfinished_logout_at_shutdown_says_so(cx: &mut TestAppContext) {
+        let (root, cx, mut harness) = open(cx);
+        assert!(!cx.simulate_close());
+        let report = ShutdownReport {
+            save: abyss_core::api::SaveStatus::Confirmed,
+            logout: Some(abyss_core::api::LogoutStatus::Incomplete),
+        };
+        harness.ack.take().unwrap().send(report).unwrap();
+        cx.run_until_parked();
+        assert_eq!(closing(&root, cx), Some(Closing::LogoutUnfinished));
+        assert!(cx.simulate_close());
     }
 
     #[gpui::test]
@@ -293,6 +463,7 @@ mod fake {
             cx,
             AuthState::SignedInUnsaved {
                 display_name: String::new(),
+                new_login: None,
             },
         );
         assert_eq!(auth(&root, cx), AuthView::SignedIn);
@@ -301,12 +472,7 @@ mod fake {
             Some(crate::ui::copy::SIGNED_IN_UNSAVED.into())
         );
         core_says(&harness, cx, AuthState::SignUpRequired);
-        assert_eq!(
-            auth(&root, cx),
-            AuthView::Phone {
-                error: Some(UserError::SignUpRequired)
-            }
-        );
+        assert_eq!(auth(&root, cx), AuthView::SignUpRequired);
     }
 
     #[gpui::test]

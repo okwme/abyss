@@ -123,13 +123,186 @@ impl Drop for ApiHash {
     }
 }
 
-/// Telegram rejected the API credentials (plan section 17.2).
+/// Why API credentials are missing or unusable (plan sections 17.2, 17.2a).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialError {
     /// `API_ID_INVALID`: the id/hash pair is unknown.
     ApiIdInvalid,
-    /// `API_ID_PUBLISHED_FLOOD`: the pair was published and is blocked.
+    /// `API_ID_PUBLISHED_FLOOD`: the id is unusable (for example, it was
+    /// published). Not a timed wait: use a different application.
     ApiIdPublishedFlood,
+    /// Only one of the two environment variables is set. Never falls through
+    /// to the Keychain.
+    EnvPartial { missing: EnvVar },
+    /// An environment variable is set but malformed.
+    EnvMalformed { var: EnvVar },
+    /// The Keychain could not be read (locked, denied). Not the same as "no
+    /// pair stored": retry, never re-onboard.
+    KeychainUnavailable,
+    /// The stored pair is unreadable. Entering a new pair replaces it.
+    StoredUnreadable,
+    /// A submitted `api_id` is not a positive 32-bit number.
+    InvalidApiId,
+}
+
+impl CredentialError {
+    /// Whether the user may enter a new pair while this error is shown.
+    pub fn allows_entry(self) -> bool {
+        !matches!(
+            self,
+            Self::EnvPartial { .. } | Self::EnvMalformed { .. } | Self::KeychainUnavailable
+        )
+    }
+}
+
+/// The two credential environment variables (plan section 17.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvVar {
+    ApiId,
+    ApiHash,
+}
+
+impl EnvVar {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ApiId => "ABYSS_API_ID",
+            Self::ApiHash => "ABYSS_API_HASH",
+        }
+    }
+}
+
+/// Where the API credentials in use came from (plan section 17.2a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// `ABYSS_API_ID` + `ABYSS_API_HASH`: a dev override, never persisted.
+    Env,
+    /// The Keychain item `dev.abyss.apicreds`.
+    Stored,
+    /// Compiled in at build time.
+    Embedded,
+    /// Typed into the onboarding screen this run.
+    Entered,
+}
+
+/// A validated `api_id`: a positive 32-bit number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApiId(i32);
+
+/// Why a string is not an `api_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiIdError {
+    Empty,
+    /// A character other than `0-9`.
+    NotDigits,
+    /// More than [`ApiId::MAX_DIGITS`] digits.
+    TooLong,
+    /// Zero, or above `i32::MAX`.
+    OutOfRange,
+}
+
+impl ApiId {
+    /// The most digits an `api_id` has (`i32::MAX` has 10).
+    pub const MAX_DIGITS: usize = 10;
+
+    pub fn new(id: i32) -> Result<Self, ApiIdError> {
+        if id > 0 {
+            Ok(Self(id))
+        } else {
+            Err(ApiIdError::OutOfRange)
+        }
+    }
+
+    /// Trims surrounding whitespace, then expects 1 to 10 ASCII digits.
+    pub fn parse(input: &str) -> Result<Self, ApiIdError> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(ApiIdError::Empty);
+        }
+        if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ApiIdError::NotDigits);
+        }
+        if trimmed.len() > Self::MAX_DIGITS {
+            return Err(ApiIdError::TooLong);
+        }
+        let id = trimmed.parse::<i32>().map_err(|_| ApiIdError::OutOfRange)?;
+        Self::new(id)
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// A Telegram application's `api_id` and `api_hash`. `Debug` redacts both.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiCredentials {
+    pub api_id: ApiId,
+    pub api_hash: ApiHash,
+}
+
+impl ApiCredentials {
+    /// A pair for the fake backend and tests: `api_id` (made positive) and a
+    /// fixed hash.
+    #[cfg(any(test, feature = "fake"))]
+    pub fn fake(api_id: i32) -> Self {
+        Self {
+            api_id: ApiId(api_id.max(1)),
+            api_hash: ApiHash("0123456789abcdef0123456789abcdef".to_owned()),
+        }
+    }
+}
+
+impl std::fmt::Debug for ApiCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiCredentials(<redacted>)")
+    }
+}
+
+/// How Telegram delivered a login code (`auth.SentCodeType`, the supported
+/// subset; plan section 17.2a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeDelivery {
+    /// A message in the user's other Telegram sessions.
+    App,
+    Sms,
+    /// A voice call that reads the code.
+    Call,
+    /// A flash call: the code is the calling number.
+    FlashCall,
+    /// A missed call: the code is the last digits of the calling number.
+    MissedCall,
+    /// An SMS through fragment.com (anonymous numbers).
+    FragmentSms,
+}
+
+/// How the next code would be delivered after a resend (`auth.CodeType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextDelivery {
+    Sms,
+    Call,
+    FlashCall,
+    MissedCall,
+    FragmentSms,
+}
+
+/// Where the login code went, for the code screen (plan section 17.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SentCodeInfo {
+    pub delivery: CodeDelivery,
+    /// Digits in the code, when the server said.
+    pub length: Option<u8>,
+    /// What a resend would use, if the server offers one.
+    pub next: Option<NextDelivery>,
+    /// The server asks not to resend before this time.
+    pub resend_at: Option<SystemTime>,
+}
+
+/// What the Done screen shows after a login in this run (plan section 17.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewLogin {
+    /// `Some(false)`: the account has no 2FA password; recommend one.
+    /// `None`: unknown (a login confirmed by the probe).
+    pub has_password: Option<bool>,
 }
 
 /// A device-local storage failure, without OS detail (that may be logged
@@ -254,12 +427,15 @@ pub enum LogoutStatus {
     Incomplete,
 }
 
-/// Login state (plan sections 4 and 17.2).
+/// Login state (plan sections 4, 17.2 and 17.2a).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthState {
-    /// No usable API credentials. `error` says why the last pair failed.
+    /// No usable API credentials. `error` says why; `source` says which
+    /// source is in control (an env override disables entering a pair;
+    /// `Stored` after Back means a pair is still saved).
     NeedCredentials {
         error: Option<CredentialError>,
+        source: Option<CredentialSource>,
     },
     Connecting,
     Phone {
@@ -268,6 +444,8 @@ pub enum AuthState {
     Code {
         /// Masked, e.g. `+44 •••• ••12`; see [`mask_phone`].
         phone_hint: String,
+        /// Where the code went.
+        sent: Option<SentCodeInfo>,
         error: Option<UserError>,
     },
     Password {
@@ -284,16 +462,28 @@ pub enum AuthState {
         until: SystemTime,
         resume: Box<AuthState>,
     },
+    /// A sign-in may have gone through but its answer was lost. Core asks
+    /// the server (and retries by itself) before it accepts another attempt.
+    /// `error` is why the last check failed.
+    Verifying {
+        error: Option<UserError>,
+    },
     /// The number has no account; create it in an official app.
     SignUpRequired,
+    /// Telegram asked for a step abyss does not implement (email setup,
+    /// `auth.sentCodeSuccess`, …): finish it in an official app, then retry.
+    OfficialAppRequired,
     /// `display_name` is empty until the server has answered once.
+    /// `new_login` is set for a login completed in this run.
     SignedIn {
         display_name: String,
+        new_login: Option<NewLogin>,
     },
     /// Signed in, but the session could not be saved: the user signs in again
     /// next launch.
     SignedInUnsaved {
         display_name: String,
+        new_login: Option<NewLogin>,
     },
     LoggingOut,
     LoggedOut {
@@ -356,6 +546,53 @@ mod tests {
         assert_eq!(ApiHash::parse(&bad), Err(ApiHashError::NotHex));
         let inner = format!("{} {}", "a".repeat(15), "a".repeat(16));
         assert_eq!(ApiHash::parse(&inner), Err(ApiHashError::NotHex));
+    }
+
+    #[test]
+    fn api_id_validation() {
+        assert_eq!(ApiId::parse(" 42 ").unwrap().get(), 42);
+        assert_eq!(ApiId::parse("2147483647").unwrap().get(), i32::MAX);
+        assert_eq!(ApiId::parse("2147483648"), Err(ApiIdError::OutOfRange));
+        assert_eq!(ApiId::parse("0"), Err(ApiIdError::OutOfRange));
+        assert_eq!(ApiId::parse("00000000001"), Err(ApiIdError::TooLong));
+        assert_eq!(ApiId::parse("-1"), Err(ApiIdError::NotDigits));
+        assert_eq!(ApiId::parse("1 2"), Err(ApiIdError::NotDigits));
+        assert_eq!(ApiId::parse("١٢"), Err(ApiIdError::NotDigits));
+        assert_eq!(ApiId::parse("  "), Err(ApiIdError::Empty));
+        assert_eq!(ApiId::new(-5), Err(ApiIdError::OutOfRange));
+    }
+
+    #[test]
+    fn api_hash_boundaries_and_case() {
+        let upper = "ABCDEF0123456789".repeat(2);
+        assert_eq!(
+            ApiHash::parse(&upper).unwrap().expose(),
+            upper.to_lowercase()
+        );
+        assert!(ApiHash::parse(&format!("\t{}\n", "0".repeat(32))).is_ok());
+        assert_eq!(ApiHash::parse(&"é".repeat(16)), Err(ApiHashError::NotHex));
+    }
+
+    #[test]
+    fn credentials_debug_redacts_both_halves() {
+        let creds = ApiCredentials {
+            api_id: ApiId::new(123_456).unwrap(),
+            api_hash: ApiHash::parse(&"ab".repeat(16)).unwrap(),
+        };
+        let shown = format!("{creds:?}");
+        assert!(!shown.contains("123456") && !shown.contains("abab"));
+    }
+
+    #[test]
+    fn env_and_keychain_errors_block_entry() {
+        let partial = CredentialError::EnvPartial {
+            missing: EnvVar::ApiHash,
+        };
+        assert!(!partial.allows_entry());
+        assert!(!CredentialError::KeychainUnavailable.allows_entry());
+        assert!(CredentialError::ApiIdInvalid.allows_entry());
+        assert!(CredentialError::StoredUnreadable.allows_entry());
+        assert_eq!(EnvVar::ApiHash.name(), "ABYSS_API_HASH");
     }
 
     #[test]

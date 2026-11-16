@@ -4,7 +4,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use abyss_core::api::{AuthState, Command, ConnState, Event, PasswordBuf, UserError};
+use abyss_core::api::{
+    AuthState, Command, ConnState, CredentialSource, Event, PasswordBuf, UserError,
+};
 use abyss_core::{BackendChoice, CoreConfig, SendError, StartError};
 use gpui::{AppContext, Context, Entity, Focusable, SharedString, Subscription, Task, Window};
 
@@ -16,7 +18,7 @@ use crate::chat::ChatShell;
 use crate::launch::Launch;
 use crate::ui::copy;
 use crate::ui::password::{PasswordEvent, PasswordInput};
-use crate::ui::text_input::{Limits, TextInput, TextInputEvent, text_input};
+use crate::ui::text_input::{Limits, Mask, TextInput, TextInputEvent, text_input};
 
 /// How long a notice (toast) stays up.
 const NOTICE_FOR: Duration = Duration::from_secs(5);
@@ -46,9 +48,13 @@ impl Started {
 pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
     match launch {
         #[cfg(feature = "fake")]
-        Launch::Fake { faults } => {
+        Launch::Fake { faults, start } => {
             use abyss_core::backend::fake::{FakeBackend, FakeScript};
             let mut script = crate::chat::demo::script(crate::chat::format::now());
+            if start == crate::launch::FakeStart::Onboarding {
+                // No credentials: core starts from `NeedCredentials`.
+                script.env = abyss_core::credentials::EnvResolution::Absent;
+            }
             // The demo account's login: code `FAKE_CODE`, 2FA password with a hint.
             script.login = FakeScript::demo(0, 0).login;
             let (backend, handle) = FakeBackend::new(script);
@@ -62,9 +68,8 @@ pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
                 ..Started::new(core)
             })
         }
-        Launch::Telegram(credentials) => {
-            let core =
-                abyss_core::start(CoreConfig::default(), BackendChoice::Grammers(credentials))?;
+        Launch::Telegram(env) => {
+            let core = abyss_core::start(CoreConfig::default(), BackendChoice::Grammers(env))?;
             Ok(Started::new(core))
         }
     }
@@ -79,6 +84,13 @@ pub(crate) struct Session {
     pub(super) phone: Entity<TextInput>,
     pub(super) code: Entity<TextInput>,
     pub(super) password: Entity<PasswordInput>,
+    /// Credential entry (plan section 17.3).
+    pub(super) api_id: Entity<TextInput>,
+    pub(super) api_hash: Entity<TextInput>,
+    /// Inline validation of the credential entry.
+    pub(super) entry_error: Option<SharedString>,
+    /// Which credential source is in control (core's `CredentialSource`).
+    pub(super) source: Option<CredentialSource>,
     pub(super) composer: Entity<TextInput>,
     /// Chat list, open chat and pending sends (`crate::chat`, `shell::chats`).
     pub(super) shell: ChatShell,
@@ -89,7 +101,7 @@ pub(crate) struct Session {
     _pump: Task<()>,
     #[cfg(feature = "fake")]
     fake: Option<abyss_core::backend::fake::FakeHandle>,
-    _subscriptions: [Subscription; 4],
+    _subscriptions: [Subscription; 6],
     _chat_wiring: [Subscription; 2],
 }
 
@@ -100,7 +112,17 @@ impl Session {
         let code = text_input(Limits::CODE, copy::CODE_PLACEHOLDER, cx);
         let composer = text_input(Limits::COMPOSER, copy::COMPOSER_PLACEHOLDER, cx);
         let password = cx.new(|cx| PasswordInput::new(window, cx));
+        let api_id = text_input(Limits::API_ID, copy::onboarding::API_ID_PLACEHOLDER, cx);
+        let api_hash = text_input(Limits::API_HASH, copy::onboarding::API_HASH_PLACEHOLDER, cx);
+        api_hash.update(cx, |input, cx| input.set_mask(Mask::Hidden, cx));
+        let [id_sub, hash_sub] = [&api_id, &api_hash].map(|input| {
+            cx.subscribe_in(input, window, |root, _, _: &TextInputEvent, window, cx| {
+                root.with_session(|s, cx| s.submit_credentials(window, cx), cx);
+            })
+        });
         let subscriptions = [
+            id_sub,
+            hash_sub,
             cx.subscribe_in(&phone, window, |root, _, _: &TextInputEvent, window, cx| {
                 root.with_session(|s, cx| s.submit_phone(window, cx), cx);
             }),
@@ -132,6 +154,10 @@ impl Session {
             phone,
             code,
             password,
+            api_id,
+            api_hash,
+            entry_error: None,
+            source: None,
             composer,
             shell,
             conn: None,
@@ -204,35 +230,42 @@ impl Session {
         if leaving_password {
             self.password.update(cx, PasswordInput::clear);
         }
+        let ticking = next.ticking_until().is_some() && self.auth.ticking_until().is_none();
         self.auth = next;
-        if let AuthView::FloodWait { .. } = self.auth {
-            spawn_flood_ticker(window, cx);
+        if ticking {
+            spawn_ticker(window, cx);
         }
         self.focus_for_auth(window, cx);
         cx.notify();
     }
 
-    /// Called every second during a flood wait. Returns whether to keep ticking.
-    pub(super) fn flood_tick(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) -> bool {
-        let AuthView::FloodWait { until, resume } = &self.auth else {
+    /// Called every second while a countdown runs (a flood wait, a code
+    /// resend). Returns whether to keep ticking.
+    pub(super) fn tick(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) -> bool {
+        let Some(until) = self.auth.ticking_until() else {
             return false;
         };
-        if Instant::now() < *until {
+        if Instant::now() < until {
             cx.notify();
             return true;
         }
-        let resume = (**resume).clone();
-        self.set_auth(resume, window, cx);
+        if let AuthView::FloodWait { resume, .. } = &self.auth {
+            let resume = (**resume).clone();
+            self.set_auth(resume, window, cx);
+        }
+        cx.notify();
         false
     }
 
     fn focus_for_auth(&self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        use super::auth::Onboarding;
         let handle = match self.auth {
+            AuthView::Onboarding(Onboarding::Entry { .. }) => self.api_id.focus_handle(cx),
             AuthView::Phone { .. } => self.phone.focus_handle(cx),
             AuthView::Code { .. } => self.code.focus_handle(cx),
             AuthView::Password { .. } => self.password.focus_handle(cx),
             AuthView::SignedIn if self.shell.selected().is_some() => self.composer.focus_handle(cx),
-            AuthView::Connecting | AuthView::FloodWait { .. } | AuthView::SignedIn => return,
+            _ => return,
         };
         window.focus(&handle, cx);
     }
@@ -294,6 +327,7 @@ impl Session {
     ) {
         match event {
             Event::Auth(state) => self.on_auth(state, window, cx),
+            Event::CredentialSource(source) => self.source = source,
             Event::Connection(state) => self.conn = Some(state),
             Event::Error(error) => self.on_error(error, window, cx),
             // Chat list, message view and sends: `shell::chats`.
@@ -302,13 +336,9 @@ impl Session {
     }
 
     fn on_auth(&mut self, state: AuthState, window: &mut Window, cx: &mut Context<'_, Root>) {
-        let hint = match &self.auth {
-            AuthView::Password { hint, .. } => hint.clone(),
-            _ => None,
-        };
         #[cfg(feature = "fake")]
         let fake_code = self.fake.is_some() && matches!(state, AuthState::Code { error: None, .. });
-        let projection = project(state, hint, Instant::now());
+        let projection = project(state, &self.auth, Instant::now());
         self.needs_params = projection.needs_params;
         self.set_auth(projection.view, window, cx);
         if let Some(notice) = projection.notice {
@@ -353,6 +383,10 @@ impl Session {
                     root.with_session(|s, _| s.closing = Closing::Unconfirmed, cx);
                     cx.notify();
                 }
+                Next::ShowLogoutUnfinished => {
+                    root.with_session(|s, _| s.closing = Closing::LogoutUnfinished, cx);
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -368,13 +402,13 @@ impl Session {
     }
 }
 
-/// Re-renders the countdown every second until the flood wait ends.
-fn spawn_flood_ticker(window: &mut Window, cx: &mut Context<'_, Root>) {
+/// Re-renders a countdown every second until it ends.
+fn spawn_ticker(window: &mut Window, cx: &mut Context<'_, Root>) {
     cx.spawn_in(window, async move |this, cx| {
         loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let more = this.update_in(cx, |root, window, cx| {
-                root.with_session(|s, cx| s.flood_tick(window, cx), cx)
+                root.with_session(|s, cx| s.tick(window, cx), cx)
             });
             if more.ok().flatten() != Some(true) {
                 return;

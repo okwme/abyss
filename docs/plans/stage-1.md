@@ -764,6 +764,61 @@ Open items:
 - The unpinned FIFO (2,000) is now smaller than one response may carry (4,096 auxiliary peers). A huge response that arrives between a dialogs page and core's next `retain_peers` can evict that page's peers before they are pinned. They are then counted as unknown and re-learned on the next dialogs load. Consider raising `MAX_UNPINNED_PEERS`, or not caching auxiliary peers beyond the FIFO's size per response.
 - `Seed::peers` is now unused by grammers. It is a subset of the inherited pins.
 
+**Task 6b status (2026-11-16): done offline, against the fake and grammers unit tests; a real-credential login is task 12.**
+- **grammers login** (`backend/grammers/auth.rs`): a raw `auth.sendCode`/`auth.resendCode` adapter keeps the full `SentCode` (delivery type, length, next type, timeout bounded to 24 h). `auth.sentCodeSuccess`, `auth.sentCodePaymentRequired`, and email/Firebase/word/phrase code types map to `OfficialAppRequired`. Also implemented: `sign_in`, `check_password` with an `account.getPassword` refetch, `users.getUsers([self])`, `auth.logOut`, `is_authorized` (401 → not authorized), and a 303 migration on `sendCode`. The typed error table covers `PHONE_NUMBER_*`, `PHONE_CODE_*`, `API_ID_INVALID`, `API_ID_PUBLISHED_FLOOD`, `PHONE_PASSWORD_FLOOD`, `SESSION_PASSWORD_NEEDED` and `PASSWORD_HASH_INVALID`. Auth calls are never retried.
+- **Credentials** (`credentials.rs`, `actor/onboarding.rs`): resolution order is env pair, then Keychain item `dev.abyss.apicreds`, then embedded, then `NeedCredentials`. A partial or malformed env pair, or a Keychain read failure, is an error and never counts as absent. `CredentialSlot` is a versioned watch that client builds wait on, and a credential change retires the instance (`lifecycle::retire_for_credentials`). An entered pair is saved only after the first successful code request of the current attempt. An env pair is never saved. Keychain operations are a bounded queue (Load/Save/Delete, at most one of each kind).
+- **Attempts and Back**: each `SubmitPhone` bumps an `AttemptId`. Auth tasks are tagged with `{attempt, ClientGen}`, so a stale result is dropped. Back cancels the running auth task. A superseded `sign_in` that succeeded is caught by the probe.
+- **App** (`shell/auth.rs`, `shell/onboarding.rs`, `shell/view/onboarding.rs`, `ui/copy/onboarding.rs`):
+  - Screens: Welcome, Guide (numbered steps, troubleshooting, **Open my.telegram.org** via `cx.open_url` to a hardcoded constant), and Entry (`api_id`: digits, at most 10; `api_hash`: hex, exactly 32, masked with Show/Hide; copy and cut are refused while masked; paste is normalized by the filter; inline validation).
+  - Credential screens: saved-pair Use/Forget, the env-override explanation, and a Keychain Retry.
+  - Code screen: delivery, the resend countdown and button, the fixed warning, and the new-login notice.
+  - Outcome screens: Verifying, SignUpRequired, OfficialAppRequired, LoggingOut, and Done (tips, a 2FA recommendation when `has_password == Some(false)`, the unsaved title).
+  - **Log out** button at the top right of the signed-in shell. A `LogoutUnfinished` shutdown overlay.
+  - `cargo dev -- --onboarding` starts the fake from `NeedCredentials` with no env pair.
+- **Docs**: `docs/connecting.md` mirrors 17.3. A new `README.md` links to it under "Getting started". `ui::copy::onboarding::tests::every_key_phrase_is_in_the_copy_and_the_doc` checks 12 key phrases against both the copy and the doc.
+- **API changes** (additive except where noted):
+  - Commands: `SubmitCredentials { api_id, api_hash }`, `ForgetStoredCredentials`, `ReloadCredentials`, `RetryCredentialSave` and `Back`.
+  - States: `AuthState::{Verifying, OfficialAppRequired}`; `NeedCredentials { error, source }`; `Code { sent: Option<SentCodeInfo> }`; `SignedIn`/`SignedInUnsaved { new_login: Option<NewLogin> }`.
+  - Events: `Event::CredentialSource(Option<CredentialSource>)`.
+  - Errors: `UserError::{PhoneFlood, CredentialsNotSaved, CredentialsNotForgotten, SignOutFirst}` and new `CredentialError` variants.
+  - Types: `ApiId`, `ApiCredentials`, `EnvVar`, `CodeDelivery`, `NextDelivery`.
+  - Backend: `Client::request_login_code` now returns `CodeRequest<LoginToken>`. New `Client::resend_login_code` and `Backend::credentials() -> &CredentialSlot`.
+  - **Breaking**: `BackendChoice::Grammers(EnvResolution)` replaces `Grammers(Credentials)`, and `core::Credentials` is gone.
+  - Fake: `FakeScript::env`, `FAKE_INVALID_API_ID`/`FAKE_PUBLISHED_API_ID`, `Op::ResendCode`.
+
+Coordinator review findings, fixed (regression tests in `actor/tests/auth.rs`):
+1. **A probe failure was read as signed out.** The probe now returns `Probed::{NotAuthorized, Unknown}`. Unknown retries with 2–60 s backoff and honors flood waits, staying in `Verifying`. Tests: `inconclusive_probe_is_retried_not_read_as_signed_out`, `flood_wait_on_the_probe_is_honored`, `not_authorized_probe_is_not_a_revocation`.
+2. **Generation tagging and retirement supervision.** Auth tasks run in the instance `JoinSet` under `TaskKind::Auth(AuthTag)`, so retirement cancels and joins them. A result from a retired generation is dropped, and `reap_retired` restores the step. A startup check lost with its instance is redone. Test: `startup_check_lost_with_its_instance_is_redone`.
+3. **Revocation during login.** `session_revoked` no longer requires the signed-in state. `Unauthorized` from a login call tears the session down (`login_revoked`). Test: `revocation_during_login_tears_the_session_down`.
+4. **Auth calls bypassed admission.** Login calls take permits. A timeout parks the permit, and a stall rebuilds. Test: `login_calls_take_permits_and_park_them_on_timeout`.
+
+Deferred to a later task (not addressed here): retained-cache account binding, second-migration account teardown, incomplete-logout state, cancellation-aware startup.
+
+Verified:
+- fmt; clippy in both feature configs.
+- `cargo test --workspace --features fake`: 281 core (3 ignored), 109 app.
+- No gpui in `cargo tree -p abyss-core`.
+- `abyss --fake --onboarding` stays up (smoke run, killed after the timeout, no output).
+
+Deviations:
+- Copy lives in `ui/copy.rs` with a child module `ui/copy/onboarding.rs`, not `crates/app/src/onboarding/copy.rs`. One module already held every user-facing string; the child keeps the onboarding text and its doc-sync test together.
+- An auth task's completion reuses `Outcome::Read` for admission bookkeeping, so `apply.rs` stays untouched.
+- Back from Code or Password to Phone cancels the auth task without retiring the instance. Only a credential change retires it.
+- 17.3 says every screen except Welcome has Back. These screens have none: Verifying (an answer may be in flight), the env-override screen (fix the env and restart) and the Keychain screen (retry only). From Phone, Back is refused when the pair is from env or embedded.
+- `docs/connecting.md` has no screenshots yet.
+- After Done, `SignedInUnsaved` is shown on the Done screen (unsaved title), not as a toast.
+
+Manual checks remaining (task 12):
+- A real-credential login: code by app and SMS, the resend countdown, 2FA, `API_ID_INVALID`, and a flood.
+- Keychain prompts for `dev.abyss.apicreds`, and the locked-Keychain retry.
+- Logout against the real Keychain.
+- The `cx.open_url` hand-off.
+- IME behavior in the masked `api_hash` field.
+
+Open items:
+- The `api_hash` `TextInput` holds a plain `String` that is not zeroized. The platform `text_for_range` may expose the unmasked text to IME and accessibility. Use a `SecretBuf`-style input like `PasswordInput` when the design pass touches it.
+- Log out has no confirmation, even though it deletes local data.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.

@@ -4,10 +4,14 @@
 use grammers_session::Session as _;
 use grammers_session::types::{PeerAuth, PeerInfo};
 
+use std::time::Duration;
+
 use super::{
-    Account, AuthError, BackendError, CheckPassword, FakeClient, FakeHandle, FakeLogin, Fault, Op,
-    PasswordBuf, PasswordChallenge, SignIn, injected_panic,
+    Account, AuthError, BackendError, CheckPassword, CodeDelivery, CodeRequest,
+    FAKE_INVALID_API_ID, FAKE_PUBLISHED_API_ID, FakeClient, FakeHandle, FakeLogin, Fault,
+    NextDelivery, Op, PasswordBuf, PasswordChallenge, SentCode, SignIn, injected_panic,
 };
+use crate::api::CredentialError;
 
 /// The fake account's user id and access hash.
 pub const FAKE_SELF_ID: i64 = 777_000;
@@ -123,6 +127,25 @@ impl ServerAuth {
     }
 }
 
+/// Where the fake "sends" a code. Numbers starting `+999` script the
+/// unsupported email-setup flow; `+998`, `+997` and `+996` an SMS, a call
+/// and a flash call, so `--fake --onboarding` can show each screen.
+fn delivery_for(digits: &str, scripted: Option<SentCode>) -> Option<SentCode> {
+    let with = |delivery| SentCode {
+        delivery,
+        length: Some(5),
+        next: Some(NextDelivery::Call),
+        timeout: Some(Duration::from_secs(90)),
+    };
+    match digits.get(..3) {
+        Some("999") => None,
+        Some("998") => Some(with(CodeDelivery::Sms)),
+        Some("997") => Some(with(CodeDelivery::Call)),
+        Some("996") => Some(with(CodeDelivery::FlashCall)),
+        _ => scripted,
+    }
+}
+
 /// Whether a call returns its answer or the answer is lost.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Answer {
@@ -195,13 +218,62 @@ impl FakeClient {
         Self::answer(answer, Ok(authorized)).await
     }
 
-    pub(super) async fn auth_request_code(&self, phone: &str) -> Result<FakeLoginToken, AuthError> {
+    pub(super) async fn auth_request_code(
+        &self,
+        phone: &str,
+    ) -> Result<CodeRequest<FakeLoginToken>, AuthError> {
         let answer = self.auth_enter(Op::RequestCode).await?;
-        if phone.chars().filter(char::is_ascii_digit).count() < MIN_PHONE_DIGITS {
+        match self.creds.api_id.get() {
+            FAKE_INVALID_API_ID => {
+                return Err(AuthError::Credentials(CredentialError::ApiIdInvalid));
+            }
+            FAKE_PUBLISHED_API_ID => {
+                return Err(AuthError::Credentials(CredentialError::ApiIdPublishedFlood));
+            }
+            _ => {}
+        }
+        let digits: String = phone.chars().filter(char::is_ascii_digit).collect();
+        if digits.len() < MIN_PHONE_DIGITS {
             return Err(AuthError::PhoneInvalid);
         }
+        let scripted = self.shared.with(|s| s.auth.login.sent);
+        let sent = delivery_for(&digits, scripted).ok_or(AuthError::OfficialAppRequired)?;
         let id = self.shared.with(|s| s.auth.send_code());
-        Self::answer(answer, Ok(FakeLoginToken(id))).await
+        let request = CodeRequest {
+            token: FakeLoginToken(id),
+            sent,
+        };
+        Self::answer(answer, Ok(request)).await
+    }
+
+    /// `auth.resendCode`: the next delivery type, a fresh code request.
+    pub(super) async fn auth_resend_code(
+        &self,
+        token: &FakeLoginToken,
+    ) -> Result<CodeRequest<FakeLoginToken>, AuthError> {
+        let answer = self.auth_enter(Op::ResendCode).await?;
+        let resent = self.shared.with(|s| {
+            (s.auth.code_token == Some(token.0)).then(|| (s.auth.send_code(), s.auth.login.sent))
+        });
+        // A stale or expired code request: Telegram's PHONE_CODE_EXPIRED.
+        let (id, sent) = resent.ok_or(AuthError::Backend(BackendError::Rejected))?;
+        let delivery = match sent.and_then(|s| s.next) {
+            Some(NextDelivery::Call) => CodeDelivery::Call,
+            Some(NextDelivery::FlashCall) => CodeDelivery::FlashCall,
+            Some(NextDelivery::MissedCall) => CodeDelivery::MissedCall,
+            Some(NextDelivery::FragmentSms) => CodeDelivery::FragmentSms,
+            Some(NextDelivery::Sms) | None => CodeDelivery::Sms,
+        };
+        let request = CodeRequest {
+            token: FakeLoginToken(id),
+            sent: SentCode {
+                delivery,
+                length: Some(5),
+                next: None,
+                timeout: None,
+            },
+        };
+        Self::answer(answer, Ok(request)).await
     }
 
     pub(super) async fn auth_sign_in(

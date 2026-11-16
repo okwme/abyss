@@ -9,6 +9,7 @@ publish.workspace = true
 grammers-client.workspace = true
 grammers-session.workspace = true
 grammers-mtsender.workspace = true
+grammers-crypto.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 # Sanitized events only (plan section 11); already in the graph via grammers.

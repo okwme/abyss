@@ -75,22 +75,11 @@ impl FakeFaults {
     }
 }
 
-/// Telegram API credentials, read from the environment at runtime only.
-pub struct Credentials {
-    pub api_id: i32,
-    pub api_hash: crate::api::ApiHash,
-}
-
-impl std::fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Credentials(<redacted>)")
-    }
-}
-
 #[derive(Debug)]
 pub enum BackendChoice {
-    /// The real backend (task 11).
-    Grammers(Credentials),
+    /// The real backend (task 11). The env pair, if any, is resolved first;
+    /// then the Keychain, the embedded pair, or onboarding (plan 17.1).
+    Grammers(crate::credentials::EnvResolution),
     #[cfg(feature = "fake")]
     Fake(crate::backend::fake::FakeBackend),
 }
@@ -245,11 +234,10 @@ impl CoreHandle {
 /// Starts core on its own thread.
 pub fn start(config: CoreConfig, backend: BackendChoice) -> Result<CoreHandle, StartError> {
     match backend {
-        BackendChoice::Grammers(Credentials { api_id, api_hash }) => {
-            // TODO(task 6b): the sent-code adapter (plan 17.2a) takes the hash.
-            drop(api_hash);
+        BackendChoice::Grammers(env) => {
             let store = crate::secret::KeychainStore::new();
-            let make = move |persist| GrammersBackend::new(api_id, persist);
+            let slot = crate::credentials::CredentialSlot::new(env);
+            let make = move |persist| GrammersBackend::new(slot, persist);
             start_with(config, make, store, || {})
         }
         #[cfg(feature = "fake")]
@@ -506,14 +494,40 @@ mod tests {
         assert_eq!(FakeFaults::parse(""), FakeFaults::default());
     }
 
-    #[test]
-    fn credentials_debug_redacts_the_hash() {
-        let creds = Credentials {
-            api_id: 1,
-            api_hash: crate::api::ApiHash::parse(&"a".repeat(32)).unwrap(),
+    /// `--fake --onboarding`: no env pair and nothing stored, so core asks
+    /// for credentials and builds nothing until a pair is entered.
+    #[tokio::test]
+    async fn onboarding_starts_from_need_credentials() {
+        let script = FakeScript {
+            env: crate::credentials::EnvResolution::Absent,
+            ..FakeScript::default()
         };
-        let shown = format!("{creds:?}");
-        assert!(shown.contains("redacted") && !shown.contains("aaaa"));
+        let (fake, h) = FakeBackend::new(script);
+        let mut core = start(CoreConfig::default(), BackendChoice::Fake(fake)).unwrap();
+        let ev = until(&mut core, |e| {
+            matches!(e, Event::Auth(AuthState::NeedCredentials { .. }))
+        })
+        .await;
+        assert!(matches!(
+            ev,
+            Some(Event::Auth(AuthState::NeedCredentials {
+                error: None,
+                source: None
+            }))
+        ));
+        assert_eq!(h.builds(), 0);
+        core.send(Command::SubmitCredentials {
+            api_id: 12345,
+            api_hash: crate::api::ApiHash::parse(&"a".repeat(32)).unwrap(),
+        })
+        .unwrap();
+        until(&mut core, |e| {
+            matches!(e, Event::Auth(AuthState::Phone { .. }))
+        })
+        .await;
+        assert_eq!(h.builds(), 1);
+        let report = core.begin_shutdown().unwrap().await.unwrap();
+        assert_eq!(report.save, SaveStatus::Confirmed);
     }
 }
 

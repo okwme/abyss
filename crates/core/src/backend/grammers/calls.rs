@@ -199,9 +199,13 @@ impl<I: Invoke> Calls<I> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn session(&self) -> &Arc<AbyssSession> {
         &self.session
+    }
+
+    /// The raw invoker, for the login calls (`grammers::auth`).
+    pub(crate) fn invoker(&self) -> &I {
+        &self.invoker
     }
 
     async fn info(&self, chat: ChatId) -> Option<PeerInfo> {
