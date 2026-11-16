@@ -21,6 +21,10 @@ pub(crate) const SERVICE_FALLBACK: &str = "Service message";
 pub(crate) const READ_ONLY: &str = "Only admins can post in this group.";
 pub(crate) const JUMP_TO_LATEST: &str = "Jump to latest";
 pub(crate) const RETRY: &str = "Retry";
+/// Shown once automatic retries of history loads gave up.
+pub(crate) const RETRY_HISTORY: &str = "Couldn't load messages · Retry";
+/// Shown once automatic retries of chat list pages gave up.
+pub(crate) const RETRY_CHATS: &str = "Couldn't load more chats · Retry";
 pub(crate) const DISCARD: &str = "Discard";
 pub(crate) const LINK_COPIED: &str = "Link copied. abyss never opens links.";
 pub(crate) const FORUM_TOPICS: &str = "Topics arrive in a later version.";

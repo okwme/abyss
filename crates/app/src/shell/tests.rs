@@ -850,12 +850,13 @@ mod fake {
         cx.run_until_parked();
         let sent = commands_since(&harness, from);
         assert_eq!(count(&sent, "MarkRead"), 0, "inactive: {sent:?}");
-        assert_eq!(count(&sent, "ViewingTail(None)"), 1, "{sent:?}");
         assert_eq!(count(&sent, "Window"), 0, "refused, not yet retried");
+        // Refused commands wait out their backoff (task 10d, finding 2).
         cx.executor().advance_clock(crate::chat::retry::FIRST_DELAY);
         cx.run_until_parked();
         let sent = commands_since(&harness, from);
         assert_eq!(count(&sent, "Window(Inactive)"), 1, "{sent:?}");
+        assert_eq!(count(&sent, "ViewingTail(None)"), 1, "{sent:?}");
         assert_eq!(count(&sent, "MarkRead"), 0);
         cx.executor()
             .advance_clock(crate::chat::retry::MAX_DELAY * 4);

@@ -142,6 +142,18 @@ impl ChatList {
         self.paging.wanted = false;
     }
 
+    /// A fresh trigger (the user's Retry, reconnection, activation): a
+    /// waiting or exhausted request may be asked again at once.
+    pub(crate) fn retry_now(&mut self) {
+        self.paging.retry.reset();
+    }
+
+    /// Whether failed requests for a page the sidebar wants stopped
+    /// retrying (until [`Self::retry_now`]).
+    pub(crate) fn gave_up(&self) -> bool {
+        self.could_ask() && self.paging.retry.gave_up()
+    }
+
     /// Core did not take a `LoadDialogs`: ask again after a backoff.
     pub(crate) fn refused(&mut self, now: Instant) {
         self.paging.retry.failed(now);

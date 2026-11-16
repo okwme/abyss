@@ -448,11 +448,17 @@ impl<B: Backend> Actor<B> {
                 if let Some(lo) = lo {
                     self.reconcile(p.chat, lo, hi, &p.page.messages).await;
                 }
-                if let Ok(change) = self.windows.prepend(p.chat, p.view, p.page) {
+                // A page core fetched on its own never drops a message.
+                let applied = if self.covers.is_fetch(p.chat, p.req) {
+                    self.windows.prepend_fitting(p.chat, p.view, p.page)
+                } else {
+                    self.windows.prepend(p.chat, p.view, p.page)
+                };
+                if let Ok(change) = applied {
                     self.emit_history(p.chat, p.view, p.dir, change).await;
                 }
                 if let HistoryQuery::Before(edge) = p.query {
-                    self.older_covers(p.chat, p.view, edge, lo).await;
+                    self.older_covers(p.chat, p.view, (p.req, edge), lo).await;
                 }
             }
             HistoryDir::Newer => {
@@ -540,6 +546,9 @@ impl<B: Backend> Actor<B> {
         let Some(view) = self.windows.invalidate(chat) else {
             return;
         };
+        // Loads deferred for the replaced view are over with it: the UI
+        // forgets them on the new view's `Tail` and asks again if needed.
+        self.deferred.retain(|(c, _)| *c != chat);
         if self.cache.is_some() && from.is_some() {
             self.windows.set_cache_contiguous(chat);
         }

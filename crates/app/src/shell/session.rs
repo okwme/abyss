@@ -363,7 +363,11 @@ impl Session {
         match event {
             Event::Auth(state) => self.on_auth(state, window, cx),
             Event::CredentialSource(source) => self.source = source,
-            Event::Connection(state) => self.conn = Some(state),
+            Event::Connection(state) => {
+                self.conn = Some(state);
+                // Reconnection restarts retries that gave up (`shell::chats`).
+                self.apply_chat_event(Event::Connection(state), window, cx);
+            }
             Event::Error(error) => self.on_error(error, window, cx),
             // Chat list, message view and sends: `shell::chats`.
             chat => self.apply_chat_event(chat, window, cx),

@@ -249,7 +249,9 @@ impl<B: Backend> Actor<B> {
                 () = sleep_until(send_due) => self.resume_flooded_sends().await,
                 _ = flush.tick() => self.flush_reads().await,
             }
+            // User loads first; background coverage only when idle.
             self.run_deferred_loads().await;
+            self.run_cover_fetch().await;
             self.pump();
             self.sync_peers();
         }
@@ -602,11 +604,15 @@ impl<B: Backend> Actor<B> {
 
     /// Scrolls the open window. Serves from the disk cache when it is known to be
     /// contiguous, else asks the server. Single-flight per chat: asked while
-    /// a load runs, it waits for that one. Answered by `History` in `dir`, or
-    /// by `LoadEnded` (see `loads.rs`).
+    /// a load runs, it waits for that one, except that a covering fetch
+    /// (`covered.rs`) already loads the older page. Answered by `History` in
+    /// `dir`, or by `LoadEnded` (see `loads.rs`).
     async fn load_more(&mut self, chat: ChatId, dir: HistoryDir) {
         if self.open != Some(chat) {
             return self.history_ended(chat, dir, None).await;
+        }
+        if dir == HistoryDir::Older && self.older_absorbed(chat) {
+            return; // the covering fetch running answers it
         }
         if self.history_busy.contains_key(&chat) {
             return self.defer_load(chat, dir);

@@ -28,7 +28,9 @@ pub(super) struct TailDiff {
 /// Compares a tail `page` with an attached `window`, both ascending by id. An
 /// empty window is reported as a gap: replace instead of merging. So is a
 /// partial page that starts above the window's newest message: the messages
-/// between them (more than a page arrived unseen) are known to neither.
+/// between them (more than a page arrived unseen) are known to neither. And
+/// so is a page whose messages all lie below a window it deletes entirely
+/// (task 10d): merged, the window would hold none of the tail.
 ///
 /// The page is authoritative over `range`
 /// ([`HistoryReply::authoritative_range`]): from the oldest id the server
@@ -72,6 +74,15 @@ pub(super) fn tail_diff(
             .map(|w| w.id)
             .filter(|id| (lo..=top).contains(id) && ids.binary_search(id).is_err())
             .collect();
+        // Every window message up to the top is gone, yet the server sent
+        // history below the window, which a merge ignores: the window would
+        // show none of what is left of the tail. Replace it instead.
+        let kept = window
+            .iter()
+            .any(|w| w.id <= top && diff.deleted.binary_search(&w.id).is_err());
+        if !kept && page.messages.iter().any(|m| m.id < oldest) {
+            diff.gap = true;
+        }
     }
     diff
 }
@@ -192,6 +203,27 @@ mod tests {
         let diff = tail_diff(&window, &whole, Some((MIN_ID, MsgId(11))));
         assert!(!diff.gap, "the whole history: 1..=3 were deleted");
         assert_eq!(diff.deleted, vec![MsgId(1), MsgId(2), MsgId(3)]);
+    }
+
+    /// Task 10d, finding 1: the window held 51..=100; 31..=100 were deleted
+    /// and the server's whole history is 1..=30. Merged, every window message
+    /// would go and the page would be ignored (it is below the window).
+    #[test]
+    fn a_tail_entirely_below_the_window_replaces_it() {
+        let window: VecDeque<Message> = msgs(&(51..=100).collect::<Vec<_>>()).into();
+        let page = HistoryPage {
+            messages: msgs(&(1..=30).collect::<Vec<_>>()),
+            has_more: false,
+        };
+        assert!(tail_diff(&window, &page, Some((MIN_ID, MsgId(100)))).gap);
+        // Part of the window survives: a merge keeps it contiguous.
+        let page = HistoryPage {
+            messages: msgs(&(1..=60).collect::<Vec<_>>()),
+            has_more: false,
+        };
+        let diff = tail_diff(&window, &page, Some((MIN_ID, MsgId(100))));
+        assert!(!diff.gap);
+        assert_eq!(diff.deleted.len(), 40);
     }
 
     #[test]

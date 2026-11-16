@@ -923,6 +923,35 @@ Open items:
 - Manual checks: retry timing under a real full queue, and deactivation with real window switching.
 
 
+**Task 10d status (2026-11-17): round 16 re-check fixes to send coverage and the chat UI's retries, done against the fake.** Each regression test fails with its fix reverted (checked one fix at a time by disabling it in place). Core tests are in `crates/core/src/actor/tests/review10d.rs` unless noted, app tests in `crates/app/src/chat/tests.rs`.
+1. **Coverage certified messages the merge never applied (HIGH).** Two changes:
+   - `merge::tail_diff` reports a gap (replace, not merge) when the merge would delete every window message up to the authoritative top while the page holds messages below the window. A merge ignores those, so the window would hold none of the tail.
+   - `covered.rs` no longer takes the server's claimed range as evidence. `applied_lo` derives it from the window after the page was applied (and emitted): no evidence from a window that was replaced, is gone or is detached from the tail, and never below the window's oldest message unless the window holds the start of history. So ignored, trimmed or deleted messages prove nothing, and a send whose message is not shown keeps its echo.
+   - Tests: `coverage_counts_only_history_the_window_shows` (the round-16 scenario: the refresh now shows 1..=30, message 11 included, then covers), `ignored_older_messages_are_no_evidence` (61..=100 deleted: the merge keeps 51..=60, the cover starts at 51, and only the older page that shows 11 covers the send), `merge::a_tail_entirely_below_the_window_replaces_it`.
+2. **Frame-command backoff was not enforced.** `ChatShell::frame_seen` attempts `LoadOlder`/`LoadNewer`/`MarkRead`/`ViewingTail` only when `frame_retry` is ready. A skipped frame leaves the backoff alone, a frame that sends nothing leaves it alone too, and only an admitted command resets it. Focus sync runs first on its own `focus_retry`, so either can be retried without the other. Test: `refused_frame_commands_back_off_and_give_up` (1,000 frames over 100 s against a refusing core: 5 attempts, no wake-up after that, Retry offered; a refused deactivation is still retried; activation restarts). The tests that expected an immediate retry now retry after `FIRST_DELAY`, including `shell::tests::fake::a_refused_deactivation_stops_reads_and_is_retried`.
+3. **Multiple live timers, and stale ones bypassed the focus backoff.** `ChatShell` owns the one retry timer (`RetryTimer { due, id, task }`). `schedule_retry` returns a new id only for an earlier due instant and replaces the timer, which drops (cancels) the previous task. `arm_retry` stores the spawned `Task`. `retry_fired(id)` rejects a stale id, and `retry_wakeup` resends focus only when `focus_retry` is ready. Tests: `one_wakeup_at_a_time_and_stale_ones_do_nothing`, `a_replaced_wakeup_task_is_cancelled` (gpui executor: only the replacing timer runs).
+4. **Exhausted retries stayed stuck.** `ChatShell::fresh_trigger` resets every waiting or exhausted retry (history in both directions, including parked ones, dialogs paging, frame commands and focus). It runs on the user's Retry, on `Connection(Online)` after any other state (`Event::Connection` now also reaches the shell, through a one-line change in `shell/session.rs`) and on window activation, but never on render. A `Reconciled` no longer resets anything. When retries give up, the message pane shows a "Couldn't load messages · Retry" pill (`history_gave_up`: a direction with history left, or the frame commands), and the sidebar shows "Couldn't load more chats · Retry" (`ChatList::gave_up`). Both call `Session::retry_loads`. Tests: `exhausted_newer_loads_recover_while_detached` (a detached window exhausts newer loads 3 times and recovers each time, through Retry, coming back online and activation; a render alone does not), and `failed_history_loads_retry_a_bounded_number_of_times` (now: a reconcile is no trigger, coming online is).
+5. **`Reconciled` acknowledged a load core still ran.** `MessageWindow::reconciled` is gone. A pending load ends only with `History` in its direction or `LoadEnded`, or when a new view arrives. On the core side:
+   - when `on_tail` replaces a view, it drops loads deferred for the chat (the UI forgets them with the old view);
+   - a `LoadOlder` asked while a covering fetch runs is answered by that fetch (finding 6), so no direction ever gets two answers for one request.
+   - Correlating by request id would need a `Command`/`Event` API change; not done, since these rules make it unnecessary.
+   - Test: `reconciled_does_not_end_a_pending_load`, which replaces 10c's `a_load_ended_by_reconciled_is_asked_again`. That test asserted the duplicate.
+6. **Covering fetches displaced the tail and delayed user loads.** These fetches still go into the window, chosen over a side buffer. Evidence must be history the UI was sent (finding 1), and a side buffer would let an echo go while its message is neither shown nor in the list. It would also need a second job kind and would fetch the same pages again when the user scrolls. Instead, covering fetches are background work:
+   - `run_cover_fetch` runs from the actor loop after `run_deferred_loads`, never from a completion handler. It requires an idle chat with no deferred load, an attached window with room, a window starting inside the cover, and budget left.
+   - Its page is applied with `Windows::prepend_fitting`, which inserts only the adjacent messages that fit under the cap and the byte budget and never drops one, so the viewed end is never evicted and the window never detaches.
+   - On completion, the page extends the cover only while the cover's view is current, the page continues it and the window is still attached.
+   - Whatever cannot be applied this way leaves the echo unresolved.
+   - Tests: `a_load_asked_during_a_covering_fetch_is_answered_by_it` (4 pages, not 5, and the first answers the user), `store::windows::tests::prepend_fitting_never_trims_and_stays_contiguous`.
+   - The near-cap case is not reachable through the actor today: covering fetches start right after a replacing tail, with at most 50 + 4×50 messages. So it is covered at the store level only.
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (347 core with 3 ignored, 142 app), `abyss --fake` stays up for 5 s.
+
+Open items:
+- The 10c open item stands: a merged refresh leaves the window's older part, which may predate the acceptance. The cover then starts at the tail's range, and covering fetches start only when the window begins inside the cover. An echo can stay until a replacing tail, a reopen or the 256-echo cap.
+- Core still ends both history directions on a panicked history task, and `purge_queued` on a rebuild drops a queued load without `LoadEnded`. The rebuild's `ChatInvalidated` resets the UI, so neither case strands it.
+- Manual checks: the Retry pills' placement, and real-network retry timing.
+- Section 13 still carries merge-conflict residue from an earlier merge on main (the `|||||||` / `<<<<<<<<<` lines and the duplicated 11e/10c notes around this note). Left for the coordinator, to avoid colliding with task 6d's edits.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.
@@ -1083,6 +1112,14 @@ Open items:
   - History stayed pending when core ignored a load during an unchanged light refresh (only `Reconciled` followed).
   - Two `Reconciled` events did not prove an unconfirmed send was covered: with more than 50 newer messages, its echo vanished although no response held it.
   - **Low:** the app's unknown-id ordering fallback differed from core's (`last_id` None→Some at the same date).
+
+- **Round 16 (re-check of task 10c, 2026-11-17).** All fixed in task 10d (section 13):
+  - **High:** `SendsCovered` could certify messages the merge never applied. A merge ignored a tail lying entirely below the window, deleted the window, and reported coverage from the server's claimed range.
+  - The frame-command backoff was recorded but never enforced: refused loads, read marks and `ViewingTail` were retried every frame.
+  - Timers were detached without cancelling their predecessors, and every callback synced focus without checking its backoff.
+  - Exhausted history and dialogs retries stayed stuck: a detached window is never refreshed, and there was no Retry control.
+  - `Reconciled` cleared pending loads that core still ran after it (deferred), so the UI asked again and core fetched a page twice.
+  - Automatic covering fetches ignored pending user work and window capacity. They started from completion handlers ahead of deferred user loads, and a prepend could trim the viewed end.
 
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 

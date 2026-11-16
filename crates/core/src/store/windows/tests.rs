@@ -109,6 +109,30 @@ fn prepend_past_cap_slides_and_detaches_from_tail() {
     );
 }
 
+/// Task 10d, finding 6: a page core fetches on its own fills only the room
+/// left and never drops the newest messages (the end the user looks at).
+#[test]
+fn prepend_fitting_never_trims_and_stays_contiguous() {
+    let mut w = Windows::default();
+    let c = user(1);
+    let g = w.open(c);
+    for i in 1..=CAP - 3 {
+        w.upsert(msg(c, CAP + i, "")); // CAP+1 ..= 2*CAP-3
+    }
+    let older: Vec<_> = (1..=10).map(|i| msg(c, CAP + 1 - i, "")).collect();
+    let change = w.prepend_fitting(c, g, last(older)).unwrap();
+    let win = w.get(c).unwrap();
+    assert_eq!(win.messages().len(), MAX_MESSAGES_PER_CHAT);
+    assert!(change.removed.is_empty(), "nothing dropped");
+    assert_eq!(ids(&w, c).first(), Some(&(CAP - 2)), "the 3 adjacent ones");
+    assert_eq!(ids(&w, c).last(), Some(&(2 * CAP - 3)), "the tail stays");
+    let win = w.get(c).unwrap();
+    assert!(!win.has_newer(), "still attached");
+    assert!(win.has_older(), "the rest did not fit: more exists");
+    let full = w.prepend_fitting(c, g, last(vec![msg(c, 1, "")])).unwrap();
+    assert_eq!(full, Change::default(), "no room: nothing changes");
+}
+
 #[test]
 fn detached_window_ignores_live_messages_then_reattaches() {
     let mut w = Windows::default();

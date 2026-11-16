@@ -93,8 +93,9 @@ enum End {
 /// One direction's history loading.
 #[derive(Clone, Copy, Debug, Default)]
 struct DirLoad {
-    /// Core admitted a load and has not answered it (`History` in this
-    /// direction, `LoadEnded`, or a `Reconciled` of the view).
+    /// Core admitted a load and has not answered it: `History` in this
+    /// direction or `LoadEnded` (a new view forgets it). A `Reconciled`
+    /// does not end it; core still runs a load it deferred.
     pending: bool,
     /// Core said there was nothing to load: wait for the next history
     /// event of the window before asking again, so a disagreement about
@@ -358,13 +359,22 @@ impl MessageWindow {
         Applied::Reset
     }
 
-    /// Core reconciled `view` with the server: any load it was asked for is
-    /// over (core finished or queued it; asking again is harmless), and a
-    /// parked or failing direction may ask again.
-    pub(crate) fn reconciled(&mut self, view: ViewGen) {
-        if self.view == Some(view) {
-            self.pending = Pending::default();
+    /// A fresh trigger (the user's Retry, reconnection, activation): a
+    /// direction that waits out a backoff, gave up or is parked may ask
+    /// again at once. A load core still runs stays pending.
+    pub(crate) fn retry_now(&mut self) {
+        for load in [&mut self.pending.older, &mut self.pending.newer] {
+            if !load.pending {
+                *load = DirLoad::default();
+            }
         }
+    }
+
+    /// Whether a direction with history left stopped retrying its failed
+    /// loads (until [`Self::retry_now`]).
+    pub(crate) fn gave_up(&self) -> bool {
+        (self.has_older && self.pending.older.retry.gave_up())
+            || (self.has_newer && self.pending.newer.retry.gave_up())
     }
 
     /// A load in `dir` ended without history (`Event::LoadEnded`): nothing

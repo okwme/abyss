@@ -19,10 +19,10 @@ pub(crate) mod viewport;
 use std::collections::HashSet;
 use std::time::Instant;
 
-use abyss_core::api::{Event, LoadTarget, UserError, WindowState};
+use abyss_core::api::{ConnState, Event, LoadTarget, UserError, WindowState};
 use abyss_core::model::{ChatId, ChatSummary, Message, MsgId};
 use abyss_core::store::ViewGen;
-use gpui::{FollowMode, ListAlignment, ListState, px};
+use gpui::{FollowMode, ListAlignment, ListState, Task, px};
 
 pub(crate) use self::commands::{Admit, Refused};
 use self::list::{ChatList, Pages};
@@ -77,11 +77,24 @@ pub(crate) struct ChatShell {
     /// Frame-driven commands (loads, read marks, the live tail) core
     /// refused: the next frame retries, and a wake-up makes sure one comes.
     frame_retry: Backoff,
-    /// When the pending wake-up for retries fires, if one is scheduled.
-    retry_timer: Option<Instant>,
+    /// The one pending wake-up for retries, if one is scheduled.
+    retry_timer: Option<RetryTimer>,
+    /// Names wake-ups, so a stale one (replaced since) is ignored.
+    timer_gen: u64,
+    /// Core's connection, as last reported (a reconnection is a fresh
+    /// trigger for retries).
+    conn: Option<ConnState>,
     countdown: Countdown,
     /// Where the message rows were painted this frame.
     painted: viewport::Painted,
+}
+
+/// The retry wake-up: when it is due, its name, and its task (dropping the
+/// task cancels the wake-up).
+struct RetryTimer {
+    due: Instant,
+    id: u64,
+    task: Option<Task<()>>,
 }
 
 /// Whether a flood-wait countdown ticker runs.
@@ -111,6 +124,8 @@ impl Default for ChatShell {
             focus_retry: Backoff::default(),
             frame_retry: Backoff::default(),
             retry_timer: None,
+            timer_gen: 0,
+            conn: None,
             countdown: Countdown::Idle,
             painted: viewport::Painted::default(),
         }
@@ -279,9 +294,9 @@ impl ChatShell {
             }
             // `LoadEnded` needs the time: see [`Self::load_ended`]. Errors
             // never end a load: core says which load ended.
+            Event::Connection(state) => self.on_connection(state),
             Event::Auth(_)
             | Event::CredentialSource(_)
-            | Event::Connection(_)
             | Event::Error(_)
             | Event::LoadEnded { .. } => {}
         }
@@ -318,21 +333,49 @@ impl ChatShell {
             .fold(focus, earliest)
     }
 
-    /// A wake-up for `due` is to be scheduled unless an earlier one already
-    /// is; returns whether to schedule it. At most one is outstanding per
-    /// distinct earlier instant, so wake-ups never outnumber failures.
-    pub(crate) fn schedule_retry(&mut self, due: Instant) -> bool {
-        if self.retry_timer.is_some_and(|t| t <= due) {
+    /// A wake-up for `due` is to be scheduled unless one is already due no
+    /// later. Returns the new wake-up's name, for [`Self::arm_retry`] and
+    /// [`Self::retry_fired`]. It replaces the previous wake-up, whose task is
+    /// dropped (cancelled): at most one is ever outstanding.
+    pub(crate) fn schedule_retry(&mut self, due: Instant) -> Option<u64> {
+        if self.retry_timer.as_ref().is_some_and(|t| t.due <= due) {
+            return None;
+        }
+        self.timer_gen = self.timer_gen.wrapping_add(1);
+        self.retry_timer = Some(RetryTimer {
+            due,
+            id: self.timer_gen,
+            task: None,
+        });
+        Some(self.timer_gen)
+    }
+
+    /// Hands the shell the task of wake-up `id`, so replacing the wake-up
+    /// cancels it. A task of a wake-up already replaced is cancelled now.
+    pub(crate) fn arm_retry(&mut self, id: u64, task: Task<()>) {
+        if let Some(t) = self.retry_timer.as_mut().filter(|t| t.id == id) {
+            t.task = Some(task);
+        }
+    }
+
+    /// Wake-up `id` fired. Returns whether it is the current one; a stale
+    /// one (replaced since) must do nothing.
+    pub(crate) fn retry_fired(&mut self, id: u64) -> bool {
+        if self.retry_timer.as_ref().is_none_or(|t| t.id != id) {
             return false;
         }
-        self.retry_timer = Some(due);
+        // Its task is the one running this: let it finish on its own.
+        if let Some(task) = self.retry_timer.take().and_then(|t| t.task) {
+            task.detach();
+        }
         true
     }
 
-    /// The wake-up for `due` fired.
-    pub(crate) fn retry_fired(&mut self, due: Instant) {
-        if self.retry_timer == Some(due) {
-            self.retry_timer = None;
+    /// Core's connection changed. Coming (back) online is a fresh trigger.
+    fn on_connection(&mut self, state: ConnState) {
+        let was = self.conn.replace(state);
+        if state == ConnState::Online && was != Some(ConnState::Online) {
+            self.fresh_trigger();
         }
     }
 
@@ -352,13 +395,10 @@ impl ChatShell {
         self.after_echo_change();
     }
 
-    /// Core merged the server's tail of `chat` into `view`. It also ends
-    /// any history load asked of that view: core answers a load asked while
-    /// the tail loaded after it, and asking again is harmless.
+    /// Core merged the server's tail of `chat` into `view`. It ends no
+    /// history load: core answers each one itself (`History` in its
+    /// direction or `LoadEnded`), also one asked while the tail loaded.
     fn on_reconciled(&mut self, chat: ChatId, view: ViewGen, newest: Option<MsgId>) {
-        if let Some(w) = self.open_window(chat) {
-            w.reconciled(view);
-        }
         let on_screen = self
             .window
             .as_ref()

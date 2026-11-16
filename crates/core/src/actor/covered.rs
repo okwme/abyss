@@ -8,22 +8,32 @@
 //! - an upper bound: a tail requested after the server accepted the send
 //!   reaches at least to it (or it was deleted).
 //!
-//! So server history requested after the acceptance, applied to the chat's
-//! window and contiguous from just above `floor` up to such a tail, holds
-//! the send's message (unless it was deleted). Core tracks that range per
-//! chat (a [`Cover`]), reports the sends it covers (`SendsCovered`), and
-//! when the tail alone does not reach back far enough (more than a page of
-//! newer messages), fetches older pages into the window, at most
-//! [`MAX_COVER_FETCHES`] per tail.
+//! So server history requested after the acceptance, contiguous from just
+//! above `floor` up to such a tail, holds the send's message (unless it was
+//! deleted). The evidence counts only what the window actually holds after
+//! the page was applied, and so was sent to the UI: messages a merge
+//! ignored or a cap trimmed prove nothing, and a window detached from the
+//! tail proves nothing. Core tracks that range per chat (a [`Cover`]),
+//! reports the sends it covers (`SendsCovered`), and when the tail alone
+//! does not reach back far enough (more than a page of newer messages),
+//! fetches older pages itself, at most [`MAX_COVER_FETCHES`] per tail.
+//!
+//! Those fetches are background work. They run only when the chat is idle
+//! and no load the user asked for waits (`run_cover_fetch`, after the
+//! deferred loads), they insert only what fits without dropping a message
+//! (`Windows::prepend_fitting`), and a `LoadOlder` asked while one runs is
+//! answered by it rather than queued behind it. Whatever cannot be applied
+//! that way leaves the echo unresolved.
 
 use std::collections::HashMap;
 
 use super::Actor;
+use super::apply::MIN_ID;
 use super::jobs::ReqId;
 use crate::api::{Event, HistoryDir};
 use crate::backend::Backend;
 use crate::model::{ChatId, MsgId};
-use crate::store::ViewGen;
+use crate::store::{MAX_MESSAGES_PER_CHAT, ViewGen};
 
 /// Older pages core fetches on its own, per covering tail, to reach a send.
 pub(super) const MAX_COVER_FETCHES: u8 = 4;
@@ -36,6 +46,9 @@ pub(super) struct Cover {
     lo: MsgId,
     req: ReqId,
     fetches: u8,
+    /// The covering fetch last begun; it runs while it is the chat's
+    /// single-flight load (`ReqId`s are never reused).
+    fetching: Option<ReqId>,
 }
 
 /// Covers of chats with a `SentUnconfirmed` send awaiting one; an entry
@@ -43,19 +56,47 @@ pub(super) struct Cover {
 #[derive(Debug, Default)]
 pub(super) struct Covers(HashMap<ChatId, Cover>);
 
+impl Covers {
+    /// Whether `req` is a covering fetch of `chat` (its page is applied
+    /// with [`crate::store::Windows::prepend_fitting`]).
+    pub(super) fn is_fetch(&self, chat: ChatId, req: ReqId) -> bool {
+        self.0.get(&chat).is_some_and(|c| c.fetching == Some(req))
+    }
+}
+
 impl<B: Backend> Actor<B> {
+    /// From where up `view` of `chat` now holds the history a page claimed
+    /// from `claimed` up: never below the window's oldest message (unless
+    /// the window holds the start of history). `None` when the window is
+    /// gone, replaced or detached from the tail, or holds nothing of it.
+    fn applied_lo(&self, chat: ChatId, view: ViewGen, claimed: MsgId) -> Option<MsgId> {
+        let w = self
+            .windows
+            .get(chat)
+            .filter(|w| w.view_gen() == view && !w.has_newer())?;
+        let bottom = if w.has_older() {
+            w.messages().front()?.id
+        } else {
+            MIN_ID
+        };
+        Some(claimed.max(bottom))
+    }
+
     /// A server tail requested as `req` was applied to `view` of `chat`,
-    /// authoritative from `lo` up (`None`: it covered nothing).
+    /// authoritative from `claimed` up (`None`: it covered nothing).
     pub(super) async fn tail_covers(
         &mut self,
         chat: ChatId,
         view: ViewGen,
         req: ReqId,
-        lo: Option<MsgId>,
+        claimed: Option<MsgId>,
     ) {
         let sends = &self.sends;
         self.covers.0.retain(|c, _| sends.awaits_cover(*c));
-        let Some(lo) = lo.filter(|_| self.sends.awaits_cover(chat)) else {
+        let lo = claimed
+            .filter(|_| self.sends.awaits_cover(chat))
+            .and_then(|claimed| self.applied_lo(chat, view, claimed));
+        let Some(lo) = lo else {
             self.covers.0.remove(&chat);
             return;
         };
@@ -64,24 +105,29 @@ impl<B: Backend> Actor<B> {
             lo,
             req,
             fetches: 0,
+            fetching: None,
         };
         self.covers.0.insert(chat, cover);
         self.settle_cover(chat).await;
     }
 
-    /// A server page of history older than `edge` was applied to `view`,
-    /// authoritative from `lo` (`None`: it covered nothing). It extends the
-    /// chat's cover when it continues it (`edge` is inside it).
+    /// A server page of history older than `edge`, requested as `req`, was
+    /// applied to `view`, authoritative from `claimed` (`None`: it covered
+    /// nothing). It extends the chat's cover when it continues it (`edge` is
+    /// inside it) and the window still holds it from the tail down.
     pub(super) async fn older_covers(
         &mut self,
         chat: ChatId,
         view: ViewGen,
-        edge: MsgId,
-        lo: Option<MsgId>,
+        (req, edge): (ReqId, MsgId),
+        claimed: Option<MsgId>,
     ) {
-        let Some(lo) = lo else {
-            return;
-        };
+        if let Some(c) = self.covers.0.get_mut(&chat)
+            && c.fetching == Some(req)
+        {
+            c.fetching = None;
+        }
+        let lo = claimed.and_then(|claimed| self.applied_lo(chat, view, claimed));
         let Some(cover) = self
             .covers
             .0
@@ -90,12 +136,15 @@ impl<B: Backend> Actor<B> {
         else {
             return;
         };
-        cover.lo = cover.lo.min(lo);
+        match lo {
+            Some(lo) => cover.lo = cover.lo.min(lo),
+            // Detached by a user's page: the cover no longer reaches the tail.
+            None => return,
+        }
         self.settle_cover(chat).await;
     }
 
-    /// Reports the sends `chat`'s cover reaches, then fetches further back
-    /// if some still wait for it.
+    /// Reports the sends `chat`'s cover reaches.
     async fn settle_cover(&mut self, chat: ChatId) {
         let Some(cover) = self.covers.0.get(&chat).copied() else {
             return;
@@ -107,35 +156,53 @@ impl<B: Backend> Actor<B> {
         }
         if !self.sends.awaits_cover(chat) {
             self.covers.0.remove(&chat);
-            return;
         }
-        self.fetch_cover(chat, cover).await;
     }
 
-    /// Loads the page older than the window when the window starts inside
-    /// the cover (so the page continues it), the chat is open and idle, and
-    /// the fetch budget is not spent.
-    async fn fetch_cover(&mut self, chat: ChatId, cover: Cover) {
+    /// Background work of the actor loop, after deferred user loads: loads
+    /// the page older than the open chat's window when its cover still
+    /// waits, the window starts inside the cover (so the page continues
+    /// it), is attached and has room, no load runs or waits, and the fetch
+    /// budget is not spent.
+    pub(super) async fn run_cover_fetch(&mut self) {
+        let Some(chat) = self.open else {
+            return;
+        };
+        let Some(cover) = self.covers.0.get(&chat).copied() else {
+            return;
+        };
         if cover.fetches >= MAX_COVER_FETCHES
-            || self.open != Some(chat)
             || self.history_busy.contains_key(&chat)
+            || self.deferred.iter().any(|(c, _)| *c == chat)
+            || !self.sends.awaits_cover(chat)
         {
             return;
         }
         let Some(edge) = self
             .windows
             .get(chat)
-            .filter(|w| w.view_gen() == cover.view && w.has_older())
+            .filter(|w| w.view_gen() == cover.view && w.has_older() && !w.has_newer())
+            .filter(|w| w.messages().len() < MAX_MESSAGES_PER_CHAT)
             .and_then(|w| w.messages().front())
             .map(|m| m.id)
             .filter(|oldest| *oldest >= cover.lo)
         else {
             return;
         };
+        let load = self.begin_load(chat, cover.view);
         if let Some(c) = self.covers.0.get_mut(&chat) {
             c.fetches = c.fetches.saturating_add(1);
+            c.fetching = Some(load.req);
         }
-        let load = self.begin_load(chat, cover.view);
         self.fetch_more(load, HistoryDir::Older, edge).await;
+    }
+
+    /// Whether a `LoadOlder` of `chat` is answered by the covering fetch
+    /// running now: its page is what the user asked for, so the load is not
+    /// queued behind it (which would fetch the same page twice).
+    pub(super) fn older_absorbed(&self, chat: ChatId) -> bool {
+        self.history_busy
+            .get(&chat)
+            .is_some_and(|load| self.covers.is_fetch(chat, load.req))
     }
 }

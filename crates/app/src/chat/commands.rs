@@ -39,6 +39,8 @@ impl ChatShell {
         self.window = Some(MessageWindow::new(chat));
         self.revealed.clear();
         self.read_sent = None;
+        // The user's choice: frame commands for the new chat start afresh.
+        self.frame_retry.reset();
         self.shown_echoes = self.echo_count();
         self.rows.reset(self.shown_echoes);
         self.rows.set_follow_mode(FollowMode::Tail);
@@ -153,20 +155,38 @@ impl ChatShell {
     /// After a frame was painted: load more history near either end, mark
     /// read up to the newest message on screen while the window is active,
     /// and tell core whether the live tail is on screen. `seen` is `None`
-    /// when no row was laid out. A refusal is retried on a later frame, and
-    /// [`Self::retry_due`] makes sure one comes.
+    /// when no row was laid out. A refusal is retried on a later frame once
+    /// its backoff allows ([`Self::retry_due`] makes sure one comes), and not
+    /// at all after [`MAX_FAILURES`](super::retry::MAX_FAILURES) in a row
+    /// until a fresh trigger ([`Self::fresh_trigger`]). Focus sync has its
+    /// own backoff, so either can be retried without the other.
     pub(crate) fn frame_seen(
         &mut self,
         seen: Option<Seen>,
         now: Instant,
         admit: Admit<'_>,
     ) -> Result<(), Refused> {
-        let res = self.frame_commands(seen, now, admit);
-        match res {
-            Ok(()) => self.frame_retry.reset(),
-            Err(_) => self.frame_retry.failed(now),
+        let focus = if self.focus_out_of_sync() && self.focus_retry.ready(now) {
+            self.sync_focus(now, admit)
+        } else {
+            Ok(())
+        };
+        if !self.frame_retry.ready(now) {
+            // Skipped, not succeeded: the backoff stands.
+            return focus;
         }
-        res
+        let mut tried = false;
+        let mut counting = |cmd: Command| {
+            tried = true;
+            admit(cmd)
+        };
+        let res = self.frame_commands(seen, now, &mut counting);
+        match res {
+            Err(_) => self.frame_retry.failed(now),
+            Ok(()) if tried => self.frame_retry.reset(),
+            Ok(()) => {}
+        }
+        focus.and(res)
     }
 
     fn frame_commands(
@@ -175,9 +195,6 @@ impl ChatShell {
         now: Instant,
         admit: Admit<'_>,
     ) -> Result<(), Refused> {
-        if self.focus_out_of_sync() && self.focus_retry.ready(now) {
-            self.sync_focus(now, admit)?;
-        }
         let active = self.active == WindowState::Active;
         let Some(w) = self.window.as_mut() else {
             return self.set_viewing(None, admit);
@@ -218,7 +235,8 @@ impl ChatShell {
 
     /// The window gained or lost focus. The shell follows at once (no read
     /// mark and no live tail while inactive); core is told now, or, if it
-    /// refuses, after a backoff ([`Self::retry_due`]).
+    /// refuses, after a backoff ([`Self::retry_due`]). Activation is a fresh
+    /// trigger: retries that gave up may start over.
     pub(crate) fn set_focus(
         &mut self,
         state: WindowState,
@@ -228,8 +246,47 @@ impl ChatShell {
         if self.active != state {
             self.active = state;
             self.focus_retry.reset();
+            if state == WindowState::Active {
+                self.fresh_trigger();
+            }
         }
         self.sync_focus(now, admit)
+    }
+
+    /// A genuine transition (activation, reconnection, the user's Retry):
+    /// every automatic retry that waits or gave up may try again at once.
+    /// Never called from rendering.
+    pub(crate) fn fresh_trigger(&mut self) {
+        self.focus_retry.reset();
+        self.frame_retry.reset();
+        self.list.retry_now();
+        if let Some(w) = self.window.as_mut() {
+            w.retry_now();
+        }
+    }
+
+    /// Whether automatic retries of loads gave up, so the UI offers Retry:
+    /// history of the open chat (or the frame commands that ask for it),
+    /// and dialogs pages.
+    pub(crate) fn history_gave_up(&self) -> bool {
+        self.window.as_ref().is_some_and(MessageWindow::gave_up) || self.frame_retry.gave_up()
+    }
+
+    /// The user pressed Retry.
+    pub(crate) fn retry_loads(&mut self) {
+        self.fresh_trigger();
+    }
+
+    /// The current retry wake-up fired ([`Self::retry_fired`]): resends what
+    /// is due now, focus if its backoff allows and a dialogs page; the caller
+    /// then redraws, so the frame check retries the rest.
+    pub(crate) fn retry_wakeup(&mut self, now: Instant, admit: Admit<'_>) -> Result<(), Refused> {
+        let focus = if self.focus_out_of_sync() && self.focus_retry.ready(now) {
+            self.sync_focus(now, admit)
+        } else {
+            Ok(())
+        };
+        focus.and(self.request_dialogs(now, admit))
     }
 
     /// Whether core's idea of the window (its state, the live tail) lags

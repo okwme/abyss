@@ -72,9 +72,16 @@ fn sidebar(session: &Session, cx: &mut Context<'_, Root>) -> Div {
             .flex_1()
             .into_any_element()
     };
+    let retry = session
+        .shell
+        .list
+        .gave_up()
+        .then(|| retry_button("retry-chats", copy::RETRY_CHATS, cx).bottom_3());
     div()
         .w(px(SIDEBAR_WIDTH))
         .h_full()
+        .relative()
+        .children(retry)
         .flex()
         .flex_col()
         .border_r_1()
@@ -255,6 +262,12 @@ fn chat_pane(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
                 .relative()
                 .child(body)
                 .children(detached.then(|| jump_button(cx)))
+                .children(
+                    session
+                        .shell
+                        .history_gave_up()
+                        .then(|| retry_button("retry-history", copy::RETRY_HISTORY, cx).top_3()),
+                )
                 .child(after_paint),
         )
         .child(composer_area(session, chat))
@@ -287,6 +300,20 @@ fn jump_button(cx: &mut Context<'_, Root>) -> Stateful<Div> {
         .right_3()
         .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
             root.with_session(|s, cx| s.jump_to_latest(window, cx), cx);
+        }))
+}
+
+/// Offered once automatic retries gave up: retries everything now.
+fn retry_button(
+    id: &'static str,
+    label: &'static str,
+    cx: &mut Context<'_, Root>,
+) -> Stateful<Div> {
+    pill(id, label)
+        .absolute()
+        .left_3()
+        .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
+            root.with_session(|s, cx| s.retry_loads(window, cx), cx);
         }))
 }
 

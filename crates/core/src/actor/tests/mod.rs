@@ -12,6 +12,7 @@ mod lifecycle;
 mod logout;
 mod onboarding;
 mod review10c;
+mod review10d;
 mod review4b;
 mod review4c;
 mod review6c;

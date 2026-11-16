@@ -4,10 +4,10 @@
 //! the message list showed after each painted frame, and wakes the shell
 //! when a refused or failed command's backoff ends (`chat::retry`).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use abyss_core::SendError;
-use abyss_core::api::{Command, Event, LoadTarget, SendState, UserError, WindowState};
+use abyss_core::api::{Command, ConnState, Event, LoadTarget, SendState, UserError, WindowState};
 use abyss_core::model::{ChatId, LocalId};
 use gpui::{App, Context, Focusable, Subscription, WeakEntity, Window};
 
@@ -98,39 +98,50 @@ impl Session {
 
     /// Wakes the shell once when the earliest waiting retry is due (a
     /// refused focus change, dialogs page, frame command or a failed load),
-    /// unless an earlier wake-up is already scheduled.
+    /// unless a wake-up no later is already scheduled. The shell owns the
+    /// one timer task: a new wake-up drops (cancels) the one it replaces.
     fn schedule_retry(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         let now = cx.background_executor().now();
         let Some(due) = self.shell.retry_due(now) else {
             return;
         };
-        if !self.shell.schedule_retry(due) {
+        let Some(id) = self.shell.schedule_retry(due) else {
             return;
-        }
+        };
         let wait = due.saturating_duration_since(now);
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(wait).await;
             this.update_in(cx, |root, window, cx| {
-                root.with_session(|s, cx| s.retry_fired(due, window, cx), cx);
+                root.with_session(|s, cx| s.retry_fired(id, window, cx), cx);
             })
             .ok();
-        })
-        .detach();
+        });
+        self.shell.arm_retry(id, task);
     }
 
-    /// A retry wake-up: re-sends what is due (focus, dialogs) and redraws,
-    /// so the frame check retries frame-driven commands.
-    fn retry_fired(&mut self, due: Instant, window: &mut Window, cx: &mut Context<'_, Root>) {
-        self.shell.retry_fired(due);
+    /// Wake-up `id` fired. Unless it is stale, re-sends what is due
+    /// (focus, dialogs) and redraws, so the frame check retries
+    /// frame-driven commands once their backoff allows.
+    fn retry_fired(&mut self, id: u64, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if !self.shell.retry_fired(id) {
+            return;
+        }
         let now = cx.background_executor().now();
         self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
-            let focus = if s.focus_out_of_sync() {
-                s.sync_focus(now, admit)
-            } else {
-                Ok(())
-            };
-            focus.and(s.request_dialogs(now, admit))
+            s.retry_wakeup(now, admit)
         });
+        cx.notify();
+    }
+
+    /// The user pressed Retry after automatic retries gave up (history or
+    /// dialogs): everything waiting may ask again now.
+    pub(super) fn retry_loads(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        self.shell.retry_loads();
+        let now = cx.background_executor().now();
+        self.drive(OnRefusal::Notice, window, cx, |s, admit| {
+            s.request_dialogs(now, admit)
+        });
+        // Redraw, so the frame check asks for history.
         cx.notify();
     }
 
@@ -160,14 +171,16 @@ impl Session {
                 ..
             }
         );
-        let paged = matches!(
-            event,
-            Event::DialogsPaging { .. }
-                | Event::LoadEnded {
-                    target: LoadTarget::Dialogs,
-                    ..
-                }
-        );
+        let online = matches!(event, Event::Connection(ConnState::Online));
+        let paged = online
+            || matches!(
+                event,
+                Event::DialogsPaging { .. }
+                    | Event::LoadEnded {
+                        target: LoadTarget::Dialogs,
+                        ..
+                    }
+            );
         let now = cx.background_executor().now();
         if let Event::LoadEnded { target, error } = event {
             self.shell.load_ended(target, error, now);
@@ -184,6 +197,11 @@ impl Session {
             self.drive(OnRefusal::Quiet, window, cx, |s, admit| {
                 s.request_dialogs(now, admit)
             });
+        }
+        if online {
+            // Back online (a fresh trigger): redraw, so the frame check asks
+            // for what gave up meanwhile.
+            cx.notify();
         }
         self.schedule_retry(window, cx);
     }

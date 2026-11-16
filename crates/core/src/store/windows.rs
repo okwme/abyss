@@ -317,6 +317,40 @@ impl Windows {
         Ok(change)
     }
 
+    /// Adds a page of older history without ever dropping a message: of the
+    /// page's messages older than the window, only the newest ones (adjacent
+    /// to the window, so it stays contiguous) that fit under the per-chat cap
+    /// and the byte budget are inserted. For pages core fetches on its own,
+    /// which must never move the end the user is looking at. When some did
+    /// not fit, older history is still marked as existing.
+    pub fn prepend_fitting(
+        &mut self,
+        chat: ChatId,
+        view_gen: ViewGen,
+        page: HistoryPage,
+    ) -> Result<Change, Stale> {
+        let w = self.current(chat, view_gen)?;
+        let bound = w.oldest();
+        let room = MAX_MESSAGES_PER_CHAT.saturating_sub(w.messages.len());
+        let more = page.has_more;
+        let older = sorted_unique(page.messages, |id| bound.is_none_or(|o| id < o));
+        let mut change = Change::default();
+        let mut fitted = true;
+        for m in older.into_iter().rev() {
+            let bytes = self.bytes.saturating_add(m.retained_bytes());
+            if change.inserted.len() >= room || bytes > MAX_STORE_BYTES {
+                fitted = false;
+                break;
+            }
+            self.insert_sorted(chat, 0, m, &mut change);
+        }
+        if let Some(w) = self.by_chat.get_mut(&chat) {
+            w.has_older = more || !fitted;
+            debug_assert!(w.messages.len() <= MAX_MESSAGES_PER_CHAT);
+        }
+        Ok(change)
+    }
+
     /// Adds a page of newer history when scrolling back down a detached window.
     /// Past the cap, the oldest messages are dropped. `has_more = false` means
     /// the window has reached the live tail again.

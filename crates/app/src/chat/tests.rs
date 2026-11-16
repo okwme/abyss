@@ -1,6 +1,8 @@
 use std::time::Instant;
 
-use abyss_core::api::{Command, HistoryDir, LoadTarget, SendState, UserError, WindowState};
+use abyss_core::api::{
+    Command, ConnState, HistoryDir, LoadTarget, SendState, UserError, WindowState,
+};
 use abyss_core::model::{Body, ChatKind, LocalId, PeerKind, ThreadKey};
 use abyss_core::rich_text::RichText;
 use abyss_core::store::ViewGen;
@@ -9,7 +11,7 @@ use gpui::{
     list, point, px, size,
 };
 
-use super::retry::{FIRST_DELAY, MAX_FAILURES};
+use super::retry::{FIRST_DELAY, MAX_DELAY, MAX_FAILURES};
 use super::viewport::Seen;
 use super::*;
 
@@ -30,11 +32,14 @@ const CHAT: ChatId = ChatId {
 struct Core {
     sent: Vec<Command>,
     full: bool,
+    /// Every command offered, admitted or not.
+    attempts: usize,
 }
 
 impl Core {
     fn admit(&mut self) -> impl FnMut(Command) -> Result<(), Refused> + '_ {
         move |cmd| {
+            self.attempts += 1;
             if self.full {
                 return Err(Refused::Busy);
             }
@@ -320,11 +325,13 @@ fn unconfirmed_echo_stays_until_core_reports_it_covered() {
     assert_eq!(shell.echoes().count(CHAT), 0);
 }
 
-/// Task 10c, finding 4: core may answer a load asked while a light refresh
-/// ran with only `Reconciled`. That ends the load: the next frame asks
-/// again instead of waiting forever.
+/// Task 10d, finding 5 (replaces 10c's `a_load_ended_by_reconciled_is_asked_again`,
+/// which asserted the duplicate): core defers a load asked while a light
+/// refresh runs and starts it after the refresh's `Reconciled`. So
+/// `Reconciled` ends nothing: asking again would fetch a page twice. The
+/// load ends with its `History` or `LoadEnded`.
 #[test]
-fn a_load_ended_by_reconciled_is_asked_again() {
+fn reconciled_does_not_end_a_pending_load() {
     let mut core = Core::default();
     let mut shell = open(&mut core);
     let top = Some(Seen {
@@ -341,12 +348,13 @@ fn a_load_ended_by_reconciled_is_asked_again() {
     assert_eq!(older(&mut core), 1);
     shell.frame_seen(top, now(), &mut core.admit()).unwrap();
     assert_eq!(older(&mut core), 0, "pending");
-    shell.apply(reconciled(7, 100));
-    shell.frame_seen(top, now(), &mut core.admit()).unwrap();
-    assert_eq!(older(&mut core), 0, "another view's reconcile");
     shell.apply(reconciled(1, 100));
     shell.frame_seen(top, now(), &mut core.admit()).unwrap();
-    assert_eq!(older(&mut core), 1, "the refresh ended the load");
+    assert_eq!(older(&mut core), 0, "still pending: core runs it next");
+    // Its answer ends it; still near the top, the next page is asked.
+    shell.apply(history(1, HistoryDir::Older, 41..=50));
+    shell.frame_seen(top, now(), &mut core.admit()).unwrap();
+    assert_eq!(older(&mut core), 1, "answered by its history");
     // Core had nothing to load: parked until the window changes.
     let ended = LoadTarget::History {
         chat: CHAT,
@@ -397,9 +405,14 @@ fn failed_history_loads_retry_a_bounded_number_of_times() {
         "then it waits for a fresh trigger"
     );
     assert_eq!(shell.retry_due(t), None, "and schedules nothing");
+    assert!(shell.history_gave_up(), "Retry is offered");
     shell.apply(reconciled(1, 100));
     shell.frame_seen(top, t, &mut core.admit()).unwrap();
-    assert_eq!(core.take().len(), 1, "a reconcile is one");
+    assert!(core.take().is_empty(), "a refresh is no fresh trigger");
+    shell.apply(Event::Connection(ConnState::Online));
+    shell.frame_seen(top, t, &mut core.admit()).unwrap();
+    assert_eq!(core.take().len(), 1, "coming online is one");
+    assert!(!shell.history_gave_up());
 }
 
 /// Task 10c, finding 1 (HIGH): a refused `Window(Inactive)` still stops
@@ -566,7 +579,7 @@ fn mark_read_and_live_tail_follow_what_is_on_screen() {
     let cmds = core.take();
     assert_eq!(reads(&cmds), [101]);
     assert_eq!(viewing(&cmds), [Some(CHAT)]);
-    // A refused mark is asked again on the next frame.
+    // A refused mark is asked again on a frame after the backoff.
     shell.apply(live(102));
     core.full = true;
     assert!(
@@ -577,6 +590,10 @@ fn mark_read_and_live_tail_follow_what_is_on_screen() {
     core.full = false;
     shell
         .frame_seen(Some(at(51)), now(), &mut core.admit())
+        .unwrap();
+    assert!(core.take().is_empty(), "the backoff waits");
+    shell
+        .frame_seen(Some(at(51)), now() + FIRST_DELAY, &mut core.admit())
         .unwrap();
     assert_eq!(reads(&core.take()), [102]);
 }
@@ -603,7 +620,10 @@ fn scrolling_near_the_top_loads_older_once() {
     assert!(shell.frame_seen(at(2), now(), &mut core.admit()).is_err());
     core.full = false;
     shell.frame_seen(at(2), now(), &mut core.admit()).unwrap();
-    assert_eq!(older(&mut core), 1, "a refused load is asked again");
+    assert_eq!(older(&mut core), 0, "a refused load waits its backoff");
+    let after = now() + FIRST_DELAY;
+    shell.frame_seen(at(2), after, &mut core.admit()).unwrap();
+    assert_eq!(older(&mut core), 1, "then is asked again");
     shell.frame_seen(at(0), now(), &mut core.admit()).unwrap();
     assert_eq!(older(&mut core), 0, "in flight");
     shell.apply(history(1, HistoryDir::Older, 1..=50));
@@ -688,6 +708,184 @@ fn switching_chats_keeps_echoes_with_their_chat() {
         1,
         "the pending send is still shown"
     );
+}
+
+/// Task 10d, finding 2: refused frame commands (loads, read marks, the
+/// live tail) wait out their backoff and stop after `MAX_FAILURES`, however
+/// many frames are drawn. Focus sync keeps its own backoff meanwhile.
+#[test]
+fn refused_frame_commands_back_off_and_give_up() {
+    let mut core = Core::default();
+    let mut shell = open(&mut core);
+    // The top and the newest message on screen: every frame command is due.
+    let seen = Some(Seen {
+        first_row: 0,
+        last_message: Some(49),
+    });
+    core.full = true;
+    core.attempts = 0;
+    let mut t = now();
+    for _ in 0..1_000 {
+        let _ = shell.frame_seen(seen, t, &mut core.admit());
+        t += std::time::Duration::from_millis(100);
+    }
+    assert_eq!(core.attempts, usize::from(MAX_FAILURES), "bounded");
+    assert_eq!(shell.retry_due(t), None, "no wake-up once given up");
+    assert!(shell.history_gave_up(), "Retry is offered");
+    // A refused deactivation is still retried on its own backoff.
+    let _ = shell.set_focus(WindowState::Inactive, t, &mut core.admit());
+    core.full = false;
+    shell
+        .frame_seen(seen, t + FIRST_DELAY, &mut core.admit())
+        .unwrap();
+    assert!(
+        matches!(
+            core.take().as_slice(),
+            [Command::Window(WindowState::Inactive)]
+        ),
+        "focus is retried while the frame commands have given up"
+    );
+    // Activation is a fresh trigger: the frame commands go again.
+    shell
+        .set_focus(WindowState::Active, t, &mut core.admit())
+        .unwrap();
+    shell.frame_seen(seen, t, &mut core.admit()).unwrap();
+    let cmds = core.take();
+    assert!(cmds.iter().any(|c| matches!(c, Command::LoadOlder(CHAT))));
+    assert_eq!(reads(&cmds), [100]);
+    assert!(!shell.history_gave_up());
+}
+
+/// Task 10d, finding 3: one wake-up at a time; a stale one is ignored.
+#[test]
+fn one_wakeup_at_a_time_and_stale_ones_do_nothing() {
+    let mut core = Core::default();
+    let mut shell = open(&mut core);
+    let t = now();
+    let late = shell.schedule_retry(t + MAX_DELAY).expect("first");
+    assert_eq!(
+        shell.schedule_retry(t + MAX_DELAY * 2),
+        None,
+        "one is due sooner"
+    );
+    let soon = shell
+        .schedule_retry(t + FIRST_DELAY)
+        .expect("an earlier one replaces it");
+    assert_ne!(late, soon);
+    assert!(!shell.retry_fired(late), "the replaced wake-up is stale");
+    assert!(shell.retry_fired(soon));
+    assert!(!shell.retry_fired(soon), "fires once");
+    // A current wake-up resends focus only once its backoff allows.
+    core.full = true;
+    assert!(
+        shell
+            .set_focus(WindowState::Inactive, t, &mut core.admit())
+            .is_err()
+    );
+    core.full = false;
+    shell.retry_wakeup(t, &mut core.admit()).unwrap();
+    assert!(core.take().is_empty(), "the focus backoff has not ended");
+    shell
+        .retry_wakeup(t + FIRST_DELAY, &mut core.admit())
+        .unwrap();
+    assert!(matches!(
+        core.take().as_slice(),
+        [Command::Window(WindowState::Inactive)]
+    ));
+}
+
+/// Task 10d, finding 3: replacing a wake-up cancels its timer task, so
+/// only one ever runs.
+#[gpui::test]
+fn a_replaced_wakeup_task_is_cancelled(cx: &mut TestAppContext) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fired = Arc::new(AtomicUsize::new(0));
+    let mut shell = ChatShell::default();
+    let t = cx.executor().now();
+    let arm = |shell: &mut ChatShell, wait| {
+        let id = shell.schedule_retry(t + wait).unwrap();
+        let (fired, timer) = (Arc::clone(&fired), cx.executor().timer(wait));
+        let task = cx.executor().spawn(async move {
+            timer.await;
+            fired.fetch_add(1, Ordering::SeqCst);
+        });
+        shell.arm_retry(id, task);
+    };
+    arm(&mut shell, MAX_DELAY);
+    arm(&mut shell, FIRST_DELAY);
+    cx.executor().advance_clock(MAX_DELAY * 2);
+    cx.run_until_parked();
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the replaced one never ran"
+    );
+}
+
+/// Task 10d, finding 4: a detached window whose newer loads failed 5 times
+/// (refresh skips detached windows, so no `Reconciled` comes) recovers on
+/// the user's Retry, on reconnection and on activation. Never on render.
+#[test]
+fn exhausted_newer_loads_recover_while_detached() {
+    let mut core = Core::default();
+    let mut shell = open(&mut core);
+    shell.apply(Event::History {
+        chat: CHAT,
+        view: ViewGen(1),
+        dir: HistoryDir::Newer,
+        messages: vec![msg(101)],
+        removed: Vec::new(),
+        has_more: true,
+    });
+    let bottom = Some(Seen {
+        first_row: 40,
+        last_message: Some(50),
+    });
+    let ended = LoadTarget::History {
+        chat: CHAT,
+        dir: HistoryDir::Newer,
+    };
+    let newer = |core: &mut Core| {
+        core.take()
+            .iter()
+            .filter(|c| matches!(c, Command::LoadNewer(CHAT)))
+            .count()
+    };
+    let mut t = now();
+    // Draws frames for 30 s, failing every load: 5 asks (the first on the
+    // first frame), then none, and Retry is offered.
+    let mut exhaust = |shell: &mut ChatShell, core: &mut Core, why: &str| {
+        let mut asked = Vec::new();
+        for frame in 0..300 {
+            shell.frame_seen(bottom, t, &mut core.admit()).unwrap();
+            if newer(core) > 0 {
+                asked.push(frame);
+                shell.load_ended(ended, Some(UserError::Network), t);
+            }
+            t += std::time::Duration::from_millis(100);
+        }
+        assert_eq!(asked.len(), usize::from(MAX_FAILURES), "{why}");
+        assert_eq!(asked.first(), Some(&0), "{why}: asked at once");
+        assert!(shell.history_gave_up(), "Retry is offered");
+        assert!(shell.window().unwrap().has_newer(), "still detached");
+        t
+    };
+    let at = exhaust(&mut shell, &mut core, "first");
+    shell.frame_seen(bottom, at, &mut core.admit()).unwrap();
+    assert_eq!(newer(&mut core), 0, "rendering is no trigger");
+    shell.retry_loads();
+    exhaust(&mut shell, &mut core, "the user's Retry");
+    shell.apply(Event::Connection(ConnState::Online));
+    let at = exhaust(&mut shell, &mut core, "back online");
+    shell
+        .set_focus(WindowState::Inactive, at, &mut core.admit())
+        .unwrap();
+    shell
+        .set_focus(WindowState::Active, at, &mut core.admit())
+        .unwrap();
+    core.take();
+    exhaust(&mut shell, &mut core, "activation");
 }
 
 /// The message list with fixed 20 px rows, as a view (a list needs one),
