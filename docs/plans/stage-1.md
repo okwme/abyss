@@ -671,6 +671,18 @@ Deviations:
 
 Manual checks remaining: prepend anchoring and live-tail follow under real scrolling, mark-read timing, system wake after sleep, IME in the composer, and the rich-text rendering against the showcase chat.
 
+**Task 11b status (2026-11-16): review fixes to `GrammersBackend`, offline.**
+- **Pins survive refreshes** (`grammers/pins.rs`). Pins are no longer replaced by the first dialogs page. Each instance tracks the carried chats (for its lifetime), the last 264 chats addressed by history, sends or read marks (pinned *before* the request), and the last `MAX_DIALOGS` chats seen in any page, seeded with the retired instance's pins. Any change re-pins exactly that union (priority in that order under the session's `MAX_PINNED_PEERS` cap), so `retire` snapshots every hash core may still use. Test: page 2 loaded, a page-2 chat opened, page 1 refreshed, then a rebuild still addresses the open chat, the other page-2 chat and the page-1 chats.
+- **Response bounds.** `dialogs_parts`/`messages_parts` take the requested limit and reject a response, before any hashing, reserving or mapping, when it has more than `limit + 16` dialogs or history messages, more than `2 × (limit + 16)` dialog top messages, or more than `min(16 × limit + 16, MAX_DIRECTORY)` users plus chats. The call fails with `BackendError::Rejected` (logged as a count-free warning) instead of returning truncated data. `Directory::from_lists` reads at most `MAX_DIRECTORY` raw entries.
+- **`exclude_pinned`** is set on every page after the first, as in `iter_dialogs`.
+- **Page fullness** comes from the raw entry count, folders and communities included. The cursor is the last raw entry that names a peer (dialog or folder), so a page that ends in folders or excluded chats still continues.
+- **Debug redaction.** `DialogsParts`, `MessagesParts`, `MappedDialogs`, `Directory` and `PeerEntry` print counts or kinds only. A marker test covers text, names, titles, usernames and phones.
+- **Contract.** The target chat must hold at least 3 messages. `After(tail[0])` must return exactly the tail's successors. After `retire`, the suite rebuilds from the live snapshot with the chat carried, waits for the baseline, reads the chat without a dialogs reload (it must still hold the newest id), and stops and retires the rebuilt instance.
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (189 core tests with 3 ignored, 92 app tests). The grammers module has 56 tests.
+
+Left open: the pin set approximates core's retained dialogs by recency. A chat core still lists after more than `MAX_DIALOGS` newer distinct chats have been seen could lose its pin; this needs a long session with heavy churn. Typed stream-error causes and stream `updateMessageID` correlation stay with the actor work.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.

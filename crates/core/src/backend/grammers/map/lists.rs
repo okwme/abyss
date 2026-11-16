@@ -3,11 +3,10 @@
 
 use std::collections::HashMap;
 
-use grammers_client::session::types::PeerInfo;
 use grammers_client::tl;
 
 use super::message::{message, raw_date, raw_key};
-use super::peers::{Directory, channel_chat, chat_id};
+use super::peers::{Directory, MAX_DIRECTORY, channel_chat, chat_id};
 use crate::backend::{DialogsCursor, HistoryPage, HistoryQuery, Update};
 use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview};
 
@@ -15,8 +14,34 @@ use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview};
 /// request; the bound only guards against a malformed update.
 pub(crate) const MAX_DELETED_IDS: usize = 10_000;
 
-/// The parts of a `messages.Dialogs` response.
-#[derive(Debug)]
+/// Items a response may carry beyond the requested limit (folder entries,
+/// a message sent while the page was being built) before it is rejected.
+pub(crate) const RESPONSE_SLACK: usize = 16;
+/// Users plus chats a response may carry per requested item: a message's
+/// chat, sender, forward source, reply peer and the users a service message
+/// names. Capped by [`MAX_DIRECTORY`].
+pub(crate) const PEERS_PER_ITEM: usize = 16;
+
+/// A response carrying more than its request allows. It is rejected as a
+/// whole: mapping a truncated prefix would present partial data as the
+/// server's answer (a cursor past chats never shown, a `has_more` that lies).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Oversized;
+
+fn at_most(n: usize, max: usize) -> Result<(), Oversized> {
+    if n <= max { Ok(()) } else { Err(Oversized) }
+}
+
+/// Users plus chats allowed for a request of `limit` items.
+fn peer_budget(limit: usize) -> usize {
+    limit
+        .saturating_mul(PEERS_PER_ITEM)
+        .saturating_add(RESPONSE_SLACK)
+        .min(MAX_DIRECTORY)
+}
+
+/// The parts of a `messages.Dialogs` response, checked against the request.
+/// No `Debug` of the payload: it carries names, phones and message text.
 pub(crate) struct DialogsParts<'a> {
     pub(crate) dialogs: &'a [tl::enums::Dialog],
     pub(crate) messages: &'a [tl::enums::Message],
@@ -26,7 +51,38 @@ pub(crate) struct DialogsParts<'a> {
     pub(crate) complete: bool,
 }
 
-pub(crate) fn dialogs_parts(resp: &tl::enums::messages::Dialogs) -> DialogsParts<'_> {
+impl std::fmt::Debug for DialogsParts<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DialogsParts")
+            .field("dialogs", &self.dialogs.len())
+            .field("messages", &self.messages.len())
+            .field("users", &self.users.len())
+            .field("chats", &self.chats.len())
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+/// The parts of a dialogs page requested with `limit`, or [`Oversized`] when
+/// the response carries more dialogs, messages or peers than that request
+/// allows. Checked before anything is mapped, hashed or reserved.
+pub(crate) fn dialogs_parts(
+    resp: &tl::enums::messages::Dialogs,
+    limit: usize,
+) -> Result<DialogsParts<'_>, Oversized> {
+    let parts = raw_dialogs_parts(resp);
+    let items = limit.saturating_add(RESPONSE_SLACK);
+    at_most(parts.dialogs.len(), items)?;
+    // One top message per dialog; forum dialogs may add a topic's top.
+    at_most(parts.messages.len(), items.saturating_mul(2))?;
+    at_most(
+        parts.users.len().saturating_add(parts.chats.len()),
+        peer_budget(limit),
+    )?;
+    Ok(parts)
+}
+
+fn raw_dialogs_parts(resp: &tl::enums::messages::Dialogs) -> DialogsParts<'_> {
     use tl::enums::messages::Dialogs as D;
     match resp {
         D::Dialogs(d) => DialogsParts {
@@ -53,71 +109,67 @@ pub(crate) fn dialogs_parts(resp: &tl::enums::messages::Dialogs) -> DialogsParts
     }
 }
 
-/// A mapped dialogs page.
-#[derive(Debug, Default)]
+/// A mapped dialogs page. `Debug` shows counts only.
+#[derive(Default)]
 pub(crate) struct MappedDialogs {
     pub(crate) chats: Vec<ChatSummary>,
     pub(crate) next: Option<DialogsCursor>,
     /// Broadcast channels left out (plan section 7), for a debug count.
     pub(crate) excluded: usize,
-    /// Peers of the listed chats, to pin in the session.
-    pub(crate) pins: Vec<PeerInfo>,
+}
+
+impl std::fmt::Debug for MappedDialogs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedDialogs")
+            .field("chats", &self.chats.len())
+            .field("more", &self.next.is_some())
+            .field("excluded", &self.excluded)
+            .finish()
+    }
+}
+
+type Tops<'a> = HashMap<(ChatId, i32), &'a tl::enums::Message>;
+
+/// Where a raw dialog entry would continue the list: its peer and top
+/// message. Folders count (they hold a place in the list, and `iter_dialogs`
+/// continues after them too); communities carry no peer.
+fn cursor_point(d: &tl::enums::Dialog) -> Option<(ChatId, i32)> {
+    match d {
+        tl::enums::Dialog::Dialog(d) => Some((chat_id(&d.peer)?, d.top_message)),
+        tl::enums::Dialog::Folder(f) => Some((chat_id(&f.peer)?, f.top_message)),
+        tl::enums::Dialog::Community(_) => None,
+    }
 }
 
 /// Maps a dialogs page requested with `limit`. Folders and communities are
-/// skipped, broadcast channels excluded; the cursor continues after the last
-/// raw dialog, excluded or not, as `iter_dialogs` does.
+/// skipped, broadcast channels excluded. Whether more pages follow is decided
+/// from the raw response, as `iter_dialogs` does: a slice with `limit` raw
+/// entries, whatever display filtering left. The cursor continues after the
+/// last raw entry that names a peer, shown or not.
 pub(crate) fn dialogs(parts: &DialogsParts<'_>, dir: &Directory, limit: usize) -> MappedDialogs {
-    let tops: HashMap<(ChatId, i32), &tl::enums::Message> = parts
+    let tops: Tops<'_> = parts
         .messages
         .iter()
         .filter_map(|m| Some((raw_key(m)?, m)))
         .collect();
     let mut out = MappedDialogs {
-        chats: Vec::with_capacity(parts.dialogs.len()),
+        chats: Vec::with_capacity(parts.dialogs.len().min(limit)),
         ..MappedDialogs::default()
     };
-    let mut last = None;
-    let mut raw_count = 0usize;
     for d in parts.dialogs {
-        let tl::enums::Dialog::Dialog(d) = d else {
-            continue;
-        };
-        raw_count += 1;
-        let Some(chat) = chat_id(&d.peer) else {
-            continue;
-        };
-        let top = tops.get(&(chat, d.top_message)).copied();
-        last = Some((chat, d.top_message, top.map_or(0, raw_date)));
-        let Some(entry) = dir.get(chat) else {
-            continue;
-        };
-        if entry.broadcast {
-            out.excluded += 1;
-            continue;
-        }
-        let last_message = top.and_then(|m| message(m, dir));
-        let summary = ChatSummary {
-            id: chat,
-            title: entry.title.clone(),
-            kind: entry.kind,
-            pinned: d.pinned,
-            unread: count(d.unread_count),
-            unread_mentions: count(d.unread_mentions_count),
-            last: last_message.as_ref().map(Preview::of),
-            last_date: last_message.as_ref().map_or(0, |m| m.date),
-            can_send: entry.can_send,
-        };
-        if summary.is_valid() {
-            out.pins.push(entry.info.clone());
-            out.chats.push(summary);
+        if let tl::enums::Dialog::Dialog(d) = d {
+            summarize(d, &tops, dir, &mut out);
         }
     }
-    let more = !parts.complete && raw_count >= limit;
-    out.next = last
+    let more = !parts.complete && parts.dialogs.len() >= limit;
+    out.next = parts
+        .dialogs
+        .iter()
+        .rev()
+        .find_map(cursor_point)
         .filter(|_| more)
-        .map(|(chat, offset_id, offset_date)| DialogsCursor {
-            offset_date,
+        .map(|(chat, offset_id)| DialogsCursor {
+            offset_date: tops.get(&(chat, offset_id)).map_or(0, |m| raw_date(m)),
             offset_id,
             offset_peer: Some(chat),
             index: 0,
@@ -125,12 +177,42 @@ pub(crate) fn dialogs(parts: &DialogsParts<'_>, dir: &Directory, limit: usize) -
     out
 }
 
+/// Adds one raw dialog to the page, unless it is excluded or invalid.
+fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut MappedDialogs) {
+    let Some(chat) = chat_id(&d.peer) else {
+        return;
+    };
+    let Some(entry) = dir.get(chat) else {
+        return;
+    };
+    if entry.broadcast {
+        out.excluded += 1;
+        return;
+    }
+    let top = tops.get(&(chat, d.top_message)).copied();
+    let last_message = top.and_then(|m| message(m, dir));
+    let summary = ChatSummary {
+        id: chat,
+        title: entry.title.clone(),
+        kind: entry.kind,
+        pinned: d.pinned,
+        unread: count(d.unread_count),
+        unread_mentions: count(d.unread_mentions_count),
+        last: last_message.as_ref().map(Preview::of),
+        last_date: last_message.as_ref().map_or(0, |m| m.date),
+        can_send: entry.can_send,
+    };
+    if summary.is_valid() {
+        out.chats.push(summary);
+    }
+}
+
 fn count(n: i32) -> u32 {
     u32::try_from(n).unwrap_or(0)
 }
 
-/// The parts of a `messages.Messages` response.
-#[derive(Debug)]
+/// The parts of a `messages.Messages` response, checked against the request.
+/// No `Debug` of the payload: it carries names, phones and message text.
 pub(crate) struct MessagesParts<'a> {
     pub(crate) messages: &'a [tl::enums::Message],
     pub(crate) users: &'a [tl::enums::User],
@@ -138,7 +220,34 @@ pub(crate) struct MessagesParts<'a> {
     pub(crate) complete: bool,
 }
 
-pub(crate) fn messages_parts(resp: &tl::enums::messages::Messages) -> MessagesParts<'_> {
+impl std::fmt::Debug for MessagesParts<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessagesParts")
+            .field("messages", &self.messages.len())
+            .field("users", &self.users.len())
+            .field("chats", &self.chats.len())
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+/// The parts of a history page requested with `limit`, or [`Oversized`] when
+/// the response carries more messages or peers than that request allows.
+/// Checked before anything is mapped or sorted.
+pub(crate) fn messages_parts(
+    resp: &tl::enums::messages::Messages,
+    limit: usize,
+) -> Result<MessagesParts<'_>, Oversized> {
+    let parts = raw_messages_parts(resp);
+    at_most(parts.messages.len(), limit.saturating_add(RESPONSE_SLACK))?;
+    at_most(
+        parts.users.len().saturating_add(parts.chats.len()),
+        peer_budget(limit),
+    )?;
+    Ok(parts)
+}
+
+fn raw_messages_parts(resp: &tl::enums::messages::Messages) -> MessagesParts<'_> {
     use tl::enums::messages::Messages as M;
     match resp {
         M::Messages(m) => MessagesParts {
