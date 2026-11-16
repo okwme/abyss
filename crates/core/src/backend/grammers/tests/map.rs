@@ -731,7 +731,7 @@ fn history_resp(
 #[test]
 fn oversized_dialog_responses_are_rejected_before_mapping() {
     let items = 20 + lists::RESPONSE_SLACK;
-    let peers = 20 * lists::PEERS_PER_ITEM + lists::RESPONSE_SLACK;
+    let peers = lists::MAX_RESPONSE_PEERS;
     assert!(lists::dialogs_parts(&dialogs_resp(items, 2 * items, peers), 20).is_ok());
     for resp in [
         dialogs_resp(items + 1, 0, 0),
@@ -749,7 +749,7 @@ fn oversized_dialog_responses_are_rejected_before_mapping() {
 #[test]
 fn oversized_history_responses_are_rejected_before_mapping() {
     let items = 10 + lists::RESPONSE_SLACK;
-    let peers = 10 * lists::PEERS_PER_ITEM + lists::RESPONSE_SLACK;
+    let peers = lists::MAX_RESPONSE_PEERS;
     assert!(lists::messages_parts(&history_resp(items, peers - 1, 1), 10).is_ok());
     for resp in [
         history_resp(items + 1, 0, 0),
@@ -761,12 +761,91 @@ fn oversized_history_responses_are_rejected_before_mapping() {
             Some(lists::Oversized)
         );
     }
-    // The peer budget never exceeds what a directory holds.
+    // The peer bound is what a directory holds, whatever the limit.
+    assert_eq!(lists::MAX_RESPONSE_PEERS, MAX_DIRECTORY);
     let huge = history_resp(0, MAX_DIRECTORY, 1);
     assert_eq!(
         lists::messages_parts(&huge, 1_000).err(),
         Some(lists::Oversized)
     );
+}
+
+/// One history response holding `messages`, with users `1..=n_users`.
+fn history_with(messages: Vec<tl::enums::Message>, n_users: i64) -> tl::enums::messages::Messages {
+    tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+        messages,
+        topics: vec![],
+        chats: vec![],
+        users: users((1..=n_users).map(|i| user(i, "U", "")).collect()),
+    })
+}
+
+#[test]
+fn a_service_message_adding_many_users_is_accepted() {
+    use tl::enums::MessageAction as A;
+    // The old 16 × limit + 16 budget allowed 32 peers for limit 1; this
+    // response carries 201.
+    let added: Vec<i64> = (2..=201).collect();
+    let svc = service(
+        peer_chat(3),
+        9,
+        Some(peer_user(1)),
+        A::ChatAddUser(tl::types::MessageActionChatAddUser { users: added }),
+    );
+    let resp = history_with(vec![tl::enums::Message::Service(svc)], 201);
+    let parts = lists::messages_parts(&resp, 1).expect("legitimate response accepted");
+    let dir = Directory::from_lists(parts.users, parts.chats);
+    let page = lists::history(&parts, &dir, gid(3), HistoryQuery::Tail, 1);
+    assert_eq!(page.messages.len(), 1);
+    assert!(matches!(&page.messages[0].body, Body::Service(s) if s.starts_with("U added")));
+}
+
+fn forward_from(peer: tl::enums::Peer) -> tl::enums::MessageFwdHeader {
+    tl::enums::MessageFwdHeader::Header(tl::types::MessageFwdHeader {
+        imported: false,
+        saved_out: false,
+        from_id: Some(peer),
+        from_name: None,
+        date: 1_700_000_000,
+        channel_post: None,
+        post_author: None,
+        saved_from_peer: None,
+        saved_from_msg_id: None,
+        saved_from_id: None,
+        saved_from_name: None,
+        saved_date: None,
+        psa_type: None,
+    })
+}
+
+#[test]
+fn mentions_and_forwards_naming_many_peers_are_accepted() {
+    // Five messages, each forwarded from one user and mentioning 30 others:
+    // 155 peers for limit 5, where the old budget allowed 96.
+    let messages: Vec<tl::enums::Message> = (0..5_i64)
+        .map(|k| {
+            let base = k * 31;
+            let mut m = message(peer_user(7), i32::try_from(k + 1).unwrap(), &"x".repeat(30));
+            m.fwd_from = Some(forward_from(peer_user(base + 1)));
+            m.entities = Some(
+                (0..30_i32)
+                    .map(|i| {
+                        tl::enums::MessageEntity::MentionName(tl::types::MessageEntityMentionName {
+                            offset: i,
+                            length: 1,
+                            user_id: base + 2 + i64::from(i),
+                        })
+                    })
+                    .collect(),
+            );
+            tl::enums::Message::Message(m)
+        })
+        .collect();
+    let resp = history_with(messages, 155);
+    let parts = lists::messages_parts(&resp, 5).expect("legitimate response accepted");
+    let dir = Directory::from_lists(parts.users, parts.chats);
+    let page = lists::history(&parts, &dir, uid(7), HistoryQuery::Tail, 5);
+    assert_eq!(page.messages.len(), 5);
 }
 
 #[test]

@@ -243,6 +243,9 @@ pub(crate) async fn run<B: Backend>(backend: &B, target: Option<ChatId>, sends: 
     let chat = target
         .or_else(|| sendable.first().copied())
         .expect("a chat to check");
+    // As core does once the window opens: the chat's peer must survive the
+    // rebuild below.
+    client.retain_peers(&[chat]);
     let mut newest = check_history(&client, chat).await;
     if sends == Sends::Check {
         newest = Some(check_send(&client, chat).await);

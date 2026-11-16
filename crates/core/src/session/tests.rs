@@ -340,7 +340,17 @@ async fn unpinned_peers_return_to_fifo_on_replace() {
     let (persist, _store) = spawn_memory();
     let s = session(&persist);
     s.pin_peers([user(1, Some(1))]);
-    s.replace_pinned_peers([user(2, Some(2))]);
+    s.cache_peer(user(2, Some(2))).await.unwrap();
+    s.cache_peer(user(3, None)).await.unwrap();
+    let ids = [2, 3, 4].map(|id| PeerId::user(id).unwrap());
+    // 3 is known without a hash and 4 not at all: neither is pinned.
+    assert_eq!(
+        s.retain_pinned(&ids),
+        crate::session::Pinned {
+            pinned: 1,
+            unknown: 2
+        }
+    );
     for id in 10..10 + i64::try_from(MAX_UNPINNED_PEERS).unwrap() {
         s.cache_peer(user(id, Some(id))).await.unwrap();
     }

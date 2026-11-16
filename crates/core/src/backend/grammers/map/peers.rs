@@ -112,15 +112,6 @@ pub(crate) fn input_channel(peer: &tl::enums::InputPeer) -> Option<tl::enums::In
     }
 }
 
-/// Our chat for a peer the session knows, if its id is in range.
-pub(crate) fn info_chat(info: &PeerInfo) -> Option<ChatId> {
-    match info {
-        PeerInfo::User { id, .. } => user_chat(*id),
-        PeerInfo::Chat { id } => group_chat(*id),
-        PeerInfo::Channel { id, .. } => channel_chat(*id),
-    }
-}
-
 /// What the client shows and needs about one peer of a response. `Debug`
 /// shows the chat kind only: names and titles are private.
 #[derive(Clone)]

@@ -14,6 +14,24 @@ pub const MAX_UNPINNED_PEERS: usize = 2_000;
 /// 256 pending sends, plan section 2).
 pub const MAX_PINNED_PEERS: usize = MAX_DIALOGS + 8 + 256;
 
+/// The outcome of [`PeerMap::set_pins`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pinned {
+    /// Peers now pinned.
+    pub pinned: usize,
+    /// Requested peers left unpinned: unknown, or without an access hash.
+    pub unknown: usize,
+}
+
+/// Whether `info` is enough to address the peer: basic groups need no access
+/// hash, users and channels do.
+fn addressable(info: &PeerInfo) -> bool {
+    match info {
+        PeerInfo::Chat { .. } => true,
+        PeerInfo::User { auth, .. } | PeerInfo::Channel { auth, .. } => auth.is_some(),
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct PeerMap {
     infos: HashMap<PeerId, PeerInfo>,
@@ -67,18 +85,39 @@ impl PeerMap {
         self.pinned.len()
     }
 
-    /// Replaces the pinned set (for example after `DialogsReset`). Peers that
-    /// lose their pin become unpinned, newest last.
-    pub(crate) fn replace_pins(&mut self, infos: impl IntoIterator<Item = PeerInfo>) -> usize {
+    /// Makes the pinned set exactly the addressable peers among `ids`, in
+    /// order, up to [`MAX_PINNED_PEERS`]. A peer this map does not know, or
+    /// knows without the access hash it needs, is not pinned: it is counted
+    /// in [`Pinned::unknown`]. Peers that lose their pin become unpinned,
+    /// newest last.
+    pub(crate) fn set_pins(&mut self, ids: &[PeerId]) -> Pinned {
         let old = std::mem::take(&mut self.pinned);
-        let count = self.pin(infos);
+        let mut unknown = 0_usize;
+        for &id in ids {
+            if self.pinned.len() >= MAX_PINNED_PEERS {
+                break;
+            }
+            if self.infos.get(&id).is_some_and(addressable) {
+                self.pinned.insert(id);
+            } else {
+                unknown = unknown.saturating_add(1);
+            }
+        }
         for id in old {
             if !self.pinned.contains(&id) {
                 self.fifo.push_back(id);
             }
         }
         self.evict();
-        count
+        Pinned {
+            pinned: self.pinned.len(),
+            unknown,
+        }
+    }
+
+    /// The pinned peer ids, in no particular order.
+    pub(crate) fn pinned_ids(&self) -> Vec<PeerId> {
+        self.pinned.iter().copied().collect()
     }
 
     /// The pinned peers, for carrying across a rebuild.

@@ -71,7 +71,6 @@ use crate::api::PasswordBuf;
 use crate::model::{ChatId, MsgId};
 use crate::session::{AbyssSession, PersistHandle};
 use calls::Calls;
-use pins::Pins;
 
 /// Update channel between the runner and the stream (plan section 2; grammers'
 /// default is 100).
@@ -154,13 +153,10 @@ impl Backend for GrammersBackend {
     }
 
     async fn build(&self, seed: Seed) -> Result<Instance<Self>, BackendError> {
+        // The retired instance's pins (core's last required set) arrive in
+        // the snapshot and stay pinned until core's first `retain_peers` on
+        // this instance; `seed.peers` is a subset of them.
         let snapshot = self.snapshot(seed.session).await;
-        // The retired instance's pins (its dialogs, open chats and sends)
-        // stay pinned here until newer dialogs push them out.
-        let pins = Pins::new(
-            seed.peers.as_slice(),
-            snapshot.carried.iter().filter_map(map::info_chat),
-        );
         let session =
             Arc::new(AbyssSession::from_snapshot(snapshot).map_err(|_| BackendError::Transient)?);
         let SenderPool {
@@ -179,7 +175,7 @@ impl Backend for GrammersBackend {
             .await
             .map_err(|_| BackendError::Transient)?;
         Ok(Instance {
-            client: GrammersClient(Calls::new(client, Arc::clone(&session), pins)),
+            client: GrammersClient(Calls::new(client, Arc::clone(&session))),
             updates: GrammersUpdates::new(stream, session.baseline_established()),
             runner: Box::pin(runner.run()),
             control: GrammersControl {
@@ -280,6 +276,10 @@ impl Client for GrammersClient {
 
     async fn read_history(&self, chat: ChatId, max_id: MsgId) -> Result<(), BackendError> {
         self.0.read_history(chat, max_id).await
+    }
+
+    fn retain_peers(&self, required: &[ChatId]) {
+        self.0.retain(required);
     }
 }
 

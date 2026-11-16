@@ -1,7 +1,7 @@
 //! The call layer over a scripted invoker: retry classes (paused time),
 //! `random_id` stability, peer resolution and request shapes.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,12 +15,10 @@ use grammers_client::tl::{self, Deserializable as _, Serializable as _};
 use super::{dialog, message, peer_user, user, users};
 use crate::backend::grammers::calls::{Calls, history_offsets};
 use crate::backend::grammers::invoke::Invoke;
-use crate::backend::grammers::map::info_chat;
-use crate::backend::grammers::pins::Pins;
 use crate::backend::grammers::{GrammersControl, connection_params};
 use crate::backend::{BackendError, HistoryQuery, InstanceControl, SessionSnapshot};
 use crate::model::{ChatId, MsgId, PeerKind};
-use crate::session::AbyssSession;
+use crate::session::{AbyssSession, MAX_PINNED_PEERS};
 
 type Reply = Result<Vec<u8>, InvocationError>;
 
@@ -149,7 +147,7 @@ async fn setup(mock: &Arc<Mock>) -> Calls<Arc<Mock>> {
         })
         .await
         .unwrap();
-    Calls::new(Arc::clone(mock), session, Pins::new(&[], []))
+    Calls::new(Arc::clone(mock), session)
 }
 
 #[tokio::test(start_paused = true)]
@@ -379,11 +377,10 @@ fn retire(session: &Arc<AbyssSession>) -> SessionSnapshot {
 }
 
 /// The peer a rebuilt instance addresses `chat` with, if it can.
-async fn rebuilt_peer(snapshot: SessionSnapshot, carried: &[ChatId], chat: ChatId) -> Option<i64> {
-    let inherited: Vec<ChatId> = snapshot.carried.iter().filter_map(info_chat).collect();
+async fn rebuilt_peer(snapshot: SessionSnapshot, chat: ChatId) -> Option<i64> {
     let session = Arc::new(AbyssSession::from_snapshot(snapshot).unwrap());
     let mock = Mock::with(vec![Ok(history_reply(&[]))]);
-    let calls = Calls::new(Arc::clone(&mock), session, Pins::new(carried, inherited));
+    let calls = Calls::new(Arc::clone(&mock), session);
     calls.history(chat, HistoryQuery::Tail, 5).await.ok()?;
     let request = mock.requests().pop()?;
     match tl::functions::messages::GetHistory::from_boxed_bytes(&request)
@@ -412,17 +409,188 @@ async fn a_refreshed_first_page_keeps_later_pages_and_open_chats_across_a_rebuil
     calls.history(uid(24), HistoryQuery::Tail, 5).await.unwrap();
     calls.dialogs(None, 2).await.unwrap();
 
+    // Core's required set: the open chat, then its merged list.
+    calls.retain(&[uid(24), uid(25), uid(21), uid(22), uid(23)]);
+
     let session = Arc::clone(calls.session());
     let snapshot = retire(&session);
-    // Core carries the open chat; page-two and page-one chats it still lists
-    // must be addressable too.
     for (id, hash) in [(24, 24 * 7), (23, 23 * 7), (22, 22 * 7), (25, 25 * 7)] {
         assert_eq!(
-            rebuilt_peer(snapshot.clone(), &[uid(24)], uid(id)).await,
+            rebuilt_peer(snapshot.clone(), uid(id)).await,
             Some(hash),
             "chat {id} lost its access hash"
         );
     }
+}
+
+/// The user ids a snapshot carries pinned.
+fn carried_users(snapshot: &SessionSnapshot) -> HashSet<i64> {
+    snapshot
+        .carried
+        .iter()
+        .filter_map(|info| match info {
+            PeerInfo::User { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn uids(ids: impl IntoIterator<Item = i64>) -> Vec<ChatId> {
+    ids.into_iter().map(uid).collect()
+}
+
+/// Calls over a session that knows users `ids` (hash = 7 × id), unpinned.
+async fn knowing(ids: impl IntoIterator<Item = i64>, replies: Vec<Reply>) -> Calls<Arc<Mock>> {
+    Calls::new(Mock::with(replies), knowing_session(ids).await)
+}
+
+async fn knowing_session(ids: impl IntoIterator<Item = i64>) -> Arc<AbyssSession> {
+    let session = session();
+    for id in ids {
+        session
+            .cache_peer(PeerInfo::User {
+                id,
+                auth: Some(PeerAuth::from_hash(id * 7)),
+                bot: Some(false),
+                is_self: Some(false),
+            })
+            .await
+            .unwrap();
+    }
+    session
+}
+
+/// An invoker whose requests never complete.
+struct Hang;
+
+impl Invoke for Hang {
+    fn invoke<R>(
+        &self,
+        _request: &R,
+    ) -> impl Future<Output = Result<R::Return, InvocationError>> + Send
+    where
+        R: tl::RemoteCall + Send + Sync,
+        R::Return: Send,
+    {
+        std::future::pending()
+    }
+}
+
+/// Review round 7: at the 1,000-dialog boundary, a refresh with one newcomer
+/// made the page-recency tracker evict chat 50, which core keeps (core drops
+/// chat 1000 instead). The pins now follow core's list exactly.
+#[tokio::test]
+async fn capacity_boundary_refresh_keeps_what_core_keeps_across_a_rebuild() {
+    let mut replies: Vec<Reply> = (0..20_i64)
+        .map(|p| {
+            Ok(dialogs_slice(
+                &(p * 50 + 1..=p * 50 + 50).collect::<Vec<_>>(),
+            ))
+        })
+        .collect();
+    let mut refresh: Vec<i64> = vec![1001];
+    refresh.extend(1..=49);
+    replies.push(Ok(dialogs_slice(&refresh)));
+    let calls = knowing([], replies).await;
+    let mut cursor = None;
+    for _ in 0..20 {
+        cursor = calls.dialogs(cursor, 50).await.unwrap().next;
+    }
+    calls.retain(&uids(1..=1000));
+    calls.dialogs(None, 50).await.unwrap();
+    // `store::Dialogs::merge_first_page`: the page heads the list, the
+    // loaded chats below it are kept, and the list stays at 1,000.
+    calls.retain(&uids(std::iter::once(1001).chain(1..=999)));
+
+    let snapshot = retire(calls.session());
+    let carried = carried_users(&snapshot);
+    assert!(carried.contains(&50) && carried.contains(&1001));
+    assert!(!carried.contains(&1000), "core dropped it");
+    assert_eq!(carried.len(), 1000);
+    assert_eq!(rebuilt_peer(snapshot, uid(50)).await, Some(50 * 7));
+}
+
+/// Review round 7: a rebuild funnelled up to 1,264 inherited peers into the
+/// 1,000-slot dialog set, so the next repin lost 264 of them.
+#[tokio::test]
+async fn consecutive_rebuilds_keep_more_than_1000_inherited_peers() {
+    let all: Vec<ChatId> = uids(1..=1264);
+    let calls = knowing(1..=1264, vec![]).await;
+    calls.retain(&all);
+    let mut snapshot = retire(calls.session());
+    for round in 0..3 {
+        let session = Arc::new(AbyssSession::from_snapshot(snapshot).unwrap());
+        let calls = Calls::new(Mock::with(vec![Ok(history_reply(&[]))]), session);
+        // A call before core reconciles repins (the chat is already pinned).
+        calls
+            .history(uid(1264), HistoryQuery::Tail, 5)
+            .await
+            .unwrap();
+        if round == 2 {
+            calls.retain(&all);
+        }
+        snapshot = retire(calls.session());
+        assert_eq!(carried_users(&snapshot).len(), 1264, "round {round}");
+    }
+}
+
+#[tokio::test]
+async fn the_pinned_set_never_exceeds_the_session_cap() {
+    let calls = knowing(1..=2000, vec![Ok(history_reply(&[]))]).await;
+    calls.retain(&uids(1..=2000));
+    let (selected, unknown) = calls.pin_state();
+    assert_eq!((selected.len(), unknown), (MAX_PINNED_PEERS, 0));
+    assert_eq!(
+        carried_users(&retire(calls.session())).len(),
+        MAX_PINNED_PEERS
+    );
+}
+
+/// Review round 7: when only the priority of already-tracked chats changed,
+/// no repin ran, so the truncated union kept a stale membership.
+#[tokio::test]
+async fn a_priority_change_at_capacity_repins() {
+    let calls = knowing(1..=1300, vec![]).await;
+    calls.retain(&uids(1..=1264));
+    // Chat 1300 becomes an open window: core lists it first, which pushes
+    // the oldest dialog (1264) out of the cap.
+    calls.retain(&uids(std::iter::once(1300).chain(1..=1264)));
+    let carried = carried_users(&retire(calls.session()));
+    assert!(carried.contains(&1300));
+    assert!(!carried.contains(&1264));
+    assert_eq!(carried.len(), MAX_PINNED_PEERS);
+}
+
+#[tokio::test(start_paused = true)]
+async fn in_flight_chats_stay_pinned_until_the_call_ends() {
+    let session = knowing_session([7, 8, 9]).await;
+    let calls = Calls::new(Hang, Arc::clone(&session));
+    calls.retain(&[uid(7)]);
+    let mut call = Box::pin(calls.history(uid(9), HistoryQuery::Tail, 5));
+    let waited = tokio::time::timeout(Duration::from_secs(1), call.as_mut()).await;
+    assert!(waited.is_err(), "the call is still in flight");
+    // Core has not listed 9 yet; a rebuild now must still carry it.
+    assert_eq!(carried_users(&session.snapshot()), HashSet::from([7, 9]));
+    drop(call);
+    // Cancelled: the extra pin is released; core's set remains.
+    assert_eq!(carried_users(&session.snapshot()), HashSet::from([7]));
+}
+
+#[tokio::test]
+async fn listed_peers_without_a_hash_are_counted_then_pinned_once_learned() {
+    let calls = knowing([7], vec![Ok(dialogs_slice(&[8]))]).await;
+    calls.retain(&[uid(7), uid(8)]);
+    assert_eq!(calls.pin_state().1, 1, "8 is unknown");
+    assert_eq!(
+        carried_users(&calls.session().snapshot()),
+        HashSet::from([7])
+    );
+    calls.dialogs(None, 20).await.unwrap();
+    assert_eq!(calls.pin_state().1, 0);
+    assert_eq!(
+        carried_users(&calls.session().snapshot()),
+        HashSet::from([7, 8])
+    );
 }
 
 #[tokio::test]
