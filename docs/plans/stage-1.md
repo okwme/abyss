@@ -750,6 +750,10 @@ Manual checks remaining: prepend anchoring and live-tail follow under real scrol
   - The send-replay test only covers an unaccepted attempt. Fix: add an "accepted, response lost" fault plus fake server dedup by `random_id`, and check the 3-attempt cap across several rebuilds.
   - Shutdown during a retirement skips revoke. This one went to task 6.
 
+- **Round 5 (code review of task 11, 2026-11-16).** Six findings go to task 11b (backend-local): dialog-refresh pins losing access hashes before a rebuild, response cardinality bounds, `exclude_pinned` on later pages, folder entries ending pagination early, unredacted `Debug` on mapping types, and the contract suite accepting an empty `After`. Two go to task 4b because they cross into the actor:
+  - Typed stream-error causes: auth loss and migration must survive the stream boundary so core can run a local logout or the migration policy.
+  - `updateMessageID` correlation with the pending-send table.
+
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 
 History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This supersedes the "nothing on disk except the Keychain item" property in sections 3 and 9. The new property: **nothing plaintext on disk; everything on disk is undecryptable without a device-only Keychain key.**
