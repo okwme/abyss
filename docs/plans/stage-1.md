@@ -754,6 +754,21 @@ Manual checks remaining: prepend anchoring and live-tail follow under real scrol
   - Typed stream-error causes: auth loss and migration must survive the stream boundary so core can run a local logout or the migration policy.
   - `updateMessageID` correlation with the pending-send table.
 
+- **Round 6 (code review of tasks 9 and 10, 2026-11-16).** These go into fix passes after task 6 merges.
+  - **Core (task 4b):**
+    - A stale terminal dialogs cursor can hide chats; revalidate it from the fresh cursor.
+    - Unread suppression keys on `attached`, not on active, visible tail.
+    - A reopened cached chat shows nothing until the network answers; seed new views with a full snapshot.
+    - A short cache page falsely claims the live tail; let the server set the boundary.
+    - Add an explicit server-reconcile signal and last-message id to events for the app fixes below.
+  - **App (task 10b):**
+    - **High:** queue rejection strands the composer and send echoes; commit UI transitions only after admission.
+    - Dialog pagination stalls after a failed or filtered page; track request state and `has_more`.
+    - Mark-read runs before paint and counts rows above the viewport.
+    - Echo reconciliation is keyed on view resets.
+    - Dialog order drifts when two previews in one second are identical.
+    - A spoiler link leaks its target, and clicks overlap between copy and reveal.
+
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 
 History must survive restarts, so Stage 1 adds an encrypted on-disk cache. This supersedes the "nothing on disk except the Keychain item" property in sections 3 and 9. The new property: **nothing plaintext on disk; everything on disk is undecryptable without a device-only Keychain key.**
