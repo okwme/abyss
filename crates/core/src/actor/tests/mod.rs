@@ -12,6 +12,7 @@ mod lifecycle;
 mod logout;
 mod onboarding;
 mod review4b;
+mod review4c;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -272,11 +273,15 @@ async fn refresh_merges_the_first_page_into_loaded_pages() {
     // Pagination restarts from the fresh cursor instead of staying terminal.
     h.until(|e| matches!(e, Event::DialogsPaging { has_more: true }))
         .await;
+    // The newcomer is placed in server order ahead of provisional rows, so
+    // that page resends the whole list.
     let mut appended = Vec::new();
     for _ in 0..2 {
         h.send(Command::LoadDialogs).await;
-        let (ev, _) = h.until(|e| matches!(e, Event::DialogsAppended(_))).await;
-        if let Event::DialogsAppended(v) = ev {
+        let (ev, _) = h
+            .until(|e| matches!(e, Event::DialogsAppended(_) | Event::DialogsReset(_)))
+            .await;
+        if let Event::DialogsAppended(v) | Event::DialogsReset(v) = ev {
             appended.extend(v);
         }
     }
