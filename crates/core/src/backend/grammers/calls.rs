@@ -122,6 +122,11 @@ pub(crate) struct Calls<I> {
     /// access hash core may still need (see [`Pins`]). Held across the
     /// session update (never across an `.await`), so two updates cannot
     /// interleave.
+    ///
+    /// Lock order: `pins`, then the session's peer map (taken inside
+    /// `retain_pinned*`). Nothing takes `pins` while holding the peer map:
+    /// response caching (`cache_response`) releases it before [`Self::remember`]
+    /// takes `pins`.
     pins: Mutex<Pins>,
 }
 
@@ -133,7 +138,7 @@ impl<I> std::fmt::Debug for Calls<I> {
 
 /// A call in progress on a chat: its peer stays pinned until the guard drops,
 /// also when the call's future is cancelled.
-struct InFlight<'a, I> {
+pub(crate) struct InFlight<'a, I> {
     calls: &'a Calls<I>,
     id: Option<PeerId>,
 }
@@ -162,7 +167,13 @@ impl<I> Calls<I> {
     }
 
     fn apply(&self, pins: &mut Pins, set: &[PeerId]) {
-        let Pinned { unknown, .. } = self.session.retain_pinned(set);
+        self.apply_with(pins, set, None);
+    }
+
+    /// Applies `set`, merging `resolved` into the session first under the
+    /// same peer-map lock.
+    fn apply_with(&self, pins: &mut Pins, set: &[PeerId], resolved: Option<PeerInfo>) {
+        let Pinned { unknown, .. } = self.session.retain_pinned_with(resolved, set);
         if unknown > 0 {
             tracing::debug!(unknown, "listed peers without an access hash left unpinned");
         }
@@ -221,12 +232,15 @@ impl<I: Invoke> Calls<I> {
     }
 
     /// Caches every addressable peer of a response (grammers' `auto_cache_peers`
-    /// does the same for the responses it handles itself). Peers core listed
-    /// that the session could not pin are retried: the response may have
-    /// carried their hashes.
-    async fn remember(&self, dir: &Directory) {
-        for info in dir.infos() {
-            let _ = self.session.cache_peer(info).await;
+    /// does the same for the responses it handles itself), holding `handoff`
+    /// (the chats a dialogs page hands to core, and its cursor peer) until
+    /// core pins them: the response's other peers cannot evict them first.
+    /// Peers core listed that the session could not pin are retried: the
+    /// response may have carried their hashes.
+    fn remember(&self, dir: &Directory, handoff: &[ChatId]) {
+        let held: Vec<PeerId> = handoff.iter().filter_map(|&c| map::peer_id(c)).collect();
+        if self.session.cache_response(&held, dir.infos()).is_err() {
+            tracing::warn!("session poisoned; response peers not cached");
         }
         let mut pins = self.pins();
         if let Some(set) = pins.unresolved() {
@@ -241,12 +255,32 @@ impl<I: Invoke> Calls<I> {
         &self,
         chat: ChatId,
     ) -> Result<(tl::enums::InputPeer, InFlight<'_, I>), BackendError> {
-        let peer = self.resolve(chat).await?;
+        let info = self.info(chat).await;
+        let peer = map::input_peer(chat, info.as_ref()).ok_or(BackendError::Rejected)?;
+        Ok((peer, self.track(chat, info)))
+    }
+
+    /// Takes the in-flight guard for `chat`, resolved to `info` before any
+    /// lock was held. Another call may have evicted `info` since, so the
+    /// pin carries it: under `pins`, the session merges `info` and applies
+    /// the selection under one peer-map lock. When the selection is already
+    /// applied with nothing unknown, `chat` (if selected) is pinned and
+    /// cannot have been evicted.
+    pub(crate) fn track(&self, chat: ChatId, info: Option<PeerInfo>) -> InFlight<'_, I> {
         let mut pins = self.pins();
         let id = map::peer_id(chat).filter(|&id| pins.begin(id));
-        self.repin(&mut pins);
+        if id.is_some() && (pins.changed().is_some() || pins.has_unknown()) {
+            let set = pins.selected();
+            self.apply_with(&mut pins, &set, info);
+        }
         drop(pins);
-        Ok((peer, InFlight { calls: self, id }))
+        InFlight { calls: self, id }
+    }
+
+    /// The first half of [`Self::resolve_used`], for interleaving tests.
+    #[cfg(test)]
+    pub(crate) async fn lookup(&self, chat: ChatId) -> Option<PeerInfo> {
+        self.info(chat).await
     }
 
     pub(crate) async fn dialogs(
@@ -276,12 +310,15 @@ impl<I: Invoke> Calls<I> {
         let limit = usize::try_from(limit).unwrap_or(0);
         let parts = map::dialogs_parts(&resp, limit).map_err(|map::Oversized| oversized())?;
         let dir = Directory::from_lists(parts.users, parts.chats);
-        self.remember(&dir).await;
         let mapped = map::dialogs(&parts, &dir, limit);
+        let cursor = mapped.next.as_ref().and_then(|c| c.offset_peer);
+        let handoff: Vec<ChatId> = mapped.chats.iter().map(|c| c.id).chain(cursor).collect();
+        self.remember(&dir, &handoff);
         if mapped.excluded > 0 {
             tracing::debug!(excluded = mapped.excluded, "broadcast channels left out");
         }
-        // No pinning here: core lists the chats it keeps (`retain`).
+        // No pinning here: core lists the chats it keeps (`retain`); until
+        // then the page's peers are held (`remember`).
         Ok(DialogsPage {
             chats: mapped.chats,
             next: mapped.next,
@@ -313,7 +350,7 @@ impl<I: Invoke> Calls<I> {
         let limit = usize::try_from(limit).unwrap_or(0);
         let parts = map::messages_parts(&resp, limit).map_err(|map::Oversized| oversized())?;
         let dir = Directory::from_lists(parts.users, parts.chats);
-        self.remember(&dir).await;
+        self.remember(&dir, &[]);
         Ok(map::history(&parts, &dir, chat, query, limit))
     }
 

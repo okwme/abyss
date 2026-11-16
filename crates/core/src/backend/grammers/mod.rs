@@ -142,7 +142,7 @@ impl Backend for GrammersBackend {
     async fn build(&self, seed: Seed) -> Result<Instance<Self>, BackendError> {
         // The retired instance's pins (core's last required set) arrive in
         // the snapshot and stay pinned until core's first `retain_peers` on
-        // this instance; `seed.peers` is a subset of them.
+        // this instance.
         let creds = self.slot.wait().await;
         let snapshot = self.snapshot(seed.session).await;
         let session =

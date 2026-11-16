@@ -25,8 +25,7 @@ use crate::api::{
     ClientGen, ConnState, Event, LogoutStatus, RemoteLogout, StorageError, UserError,
 };
 use crate::backend::{
-    Backend, BackendError, CarriedPeers, Instance, InstanceControl, Seed, SessionSeed,
-    SessionSnapshot,
+    Backend, BackendError, Instance, InstanceControl, Seed, SessionSeed, SessionSnapshot,
 };
 
 /// First rebuild delay; doubles per attempt.
@@ -374,22 +373,13 @@ impl<B: Backend> Actor<B> {
             .session
             .clone()
             .map_or(SessionSeed::Stored, SessionSeed::Live);
-        let seed = Seed {
-            session,
-            peers: self.carried_peers(),
-        };
+        let seed = Seed { session };
         let backend = Arc::clone(&self.backend);
         self.life.phase = Phase::Building;
         self.life.step = Some(tokio::spawn(async move {
             tokio::time::sleep(delay).await;
             Step::Built(backend.build(seed).await)
         }));
-    }
-
-    fn carried_peers(&self) -> CarriedPeers {
-        let mut sends = self.sends.chats();
-        sends.sort_unstable();
-        CarriedPeers::new(self.windows.chats().chain(sends))
     }
 
     pub(super) async fn on_step(&mut self, res: Result<Step<B>, JoinError>) {

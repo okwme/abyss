@@ -281,7 +281,12 @@ async fn rebuild_carries_the_live_session_and_peers() {
     // A write arriving on the retired instance after retirement is dropped.
     assert!(h.fake.late_critical_write().await);
     assert_eq!(snapshot.rev().unwrap(), 2);
-    let peers = seeds[1].peers.as_slice();
+    // The peers come with the session: core hands the rebuilt instance the
+    // open window and the pending send's chat to keep pinned.
+    let peers = h
+        .fake
+        .retained_peers()
+        .expect("core reconciled the rebuilt instance");
     assert!(peers.contains(&chat(2)) && peers.contains(&chat(1)));
     h.stop().await;
 }

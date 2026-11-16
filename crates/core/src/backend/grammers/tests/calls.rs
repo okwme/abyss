@@ -9,7 +9,7 @@ use std::time::Duration;
 use grammers_client::InvocationError;
 use grammers_client::sender::{ReadError, RpcError, SenderPool};
 use grammers_client::session::Session as _;
-use grammers_client::session::types::{PeerAuth, PeerInfo};
+use grammers_client::session::types::{PeerAuth, PeerId, PeerInfo};
 use grammers_client::tl::{self, Deserializable as _, Serializable as _};
 
 use super::{dialog, message, peer_user, user, users};
@@ -350,6 +350,12 @@ fn uid(id: i64) -> ChatId {
 
 /// A full dialogs slice listing users `ids` (top message id = user id).
 fn dialogs_slice(ids: &[i64]) -> Vec<u8> {
+    dialogs_slice_with(ids, std::iter::empty())
+}
+
+/// [`dialogs_slice`] whose users also list `extra` (auxiliary peers), after
+/// the dialogs' own users.
+fn dialogs_slice_with(ids: &[i64], extra: impl IntoIterator<Item = i64>) -> Vec<u8> {
     let top = |id: i64| i32::try_from(id).unwrap();
     tl::enums::messages::Dialogs::Slice(tl::types::messages::DialogsSlice {
         count: 1_000,
@@ -362,7 +368,13 @@ fn dialogs_slice(ids: &[i64]) -> Vec<u8> {
             .map(|&id| tl::enums::Message::Message(message(peer_user(id), top(id), "m")))
             .collect(),
         chats: vec![],
-        users: users(ids.iter().map(|&id| user(id, "U", "")).collect()),
+        users: users(
+            ids.iter()
+                .copied()
+                .chain(extra)
+                .map(|id| user(id, "U", ""))
+                .collect(),
+        ),
     })
     .to_bytes()
 }
@@ -521,7 +533,10 @@ async fn consecutive_rebuilds_keep_more_than_1000_inherited_peers() {
     for round in 0..3 {
         let session = Arc::new(AbyssSession::from_snapshot(snapshot).unwrap());
         let calls = Calls::new(Mock::with(vec![Ok(history_reply(&[]))]), session);
-        // A call before core reconciles repins (the chat is already pinned).
+        // A call on an inherited chat before core reconciles: the selection's
+        // membership is unchanged, so nothing is repinned (see
+        // `a_call_before_reconciliation_repins_without_losing_inherited_peers`
+        // for a call that changes it).
         calls
             .history(uid(1264), HistoryQuery::Tail, 5)
             .await
@@ -723,5 +738,193 @@ async fn logs_never_carry_text_phones_or_payloads() {
     );
     for needle in ["secret", "Secret", "+44", "7700900123"] {
         assert!(!out.contains(needle), "{needle:?} leaked into: {out}");
+    }
+}
+
+/// A history page whose users list `ids` (auxiliary peers only).
+fn history_naming(ids: impl IntoIterator<Item = i64>) -> Vec<u8> {
+    tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+        messages: vec![],
+        topics: vec![],
+        chats: vec![],
+        users: users(ids.into_iter().map(|id| user(id, "U", "")).collect()),
+    })
+    .to_bytes()
+}
+
+/// Review round 10: a full-size (4,096-peer) dialogs response cached its
+/// whole directory, in hash order, through a 2,000-peer FIFO, evicting its
+/// own dialogs before core retained them.
+#[tokio::test]
+async fn a_full_size_dialogs_response_keeps_its_dialogs_for_core() {
+    let page: Vec<i64> = (1..=100).collect();
+    let reply = dialogs_slice_with(&page, 10_000..10_000 + 3_996);
+    let calls = knowing([], vec![Ok(reply)]).await;
+    let got = calls.dialogs(None, 100).await.unwrap();
+    assert_eq!(got.chats.len(), 100);
+    assert!(got.next.is_some());
+    calls.retain(&uids(page.iter().copied()));
+    assert_eq!(calls.pin_state().1, 0, "every dialog is addressable");
+    assert_eq!(carried_users(&retire(calls.session())).len(), 100);
+}
+
+/// Review round 10 (small variant): with a full FIFO, a two-peer page naming
+/// the oldest known peer and a newcomer lost the known one.
+#[tokio::test]
+async fn a_two_peer_page_over_a_full_fifo_keeps_both() {
+    let calls = knowing(1..=2000, vec![Ok(dialogs_slice(&[1, 5000]))]).await;
+    calls.dialogs(None, 2).await.unwrap();
+    calls.retain(&uids([1, 5000]));
+    assert_eq!(calls.pin_state().1, 0);
+    assert_eq!(
+        carried_users(&retire(calls.session())),
+        HashSet::from([1, 5000])
+    );
+}
+
+/// Two pages, then a 4,096-peer history response, all before core
+/// reconciles: both pages (and the cursor peer) are still addressable.
+#[tokio::test]
+async fn responses_before_reconciliation_do_not_evict_handed_off_pages() {
+    let calls = knowing(
+        [7],
+        vec![
+            Ok(dialogs_slice(&(1..=100).collect::<Vec<_>>())),
+            Ok(dialogs_slice(&(101..=200).collect::<Vec<_>>())),
+            Ok(history_naming(20_000..20_000 + 4_096)),
+        ],
+    )
+    .await;
+    let first = calls.dialogs(None, 100).await.unwrap();
+    let second = calls.dialogs(first.next, 100).await.unwrap();
+    assert_eq!(second.next.and_then(|c| c.offset_peer), Some(uid(200)));
+    calls.history(uid(7), HistoryQuery::Tail, 5).await.unwrap();
+    calls.retain(&uids(1..=200));
+    assert_eq!(calls.pin_state().1, 0);
+    assert_eq!(carried_users(&retire(calls.session())).len(), 200);
+}
+
+/// Review round 10, finding 2: the guard's peer was resolved, then evicted
+/// by another worker's response, then pinned: it was counted unknown and
+/// missing from the snapshot. The resolved info is now merged and pinned
+/// under one peer-map lock.
+#[tokio::test]
+async fn a_peer_evicted_between_lookup_and_pin_is_still_pinned() {
+    let calls = knowing([7], vec![]).await;
+    let info = calls.lookup(uid(7)).await;
+    assert!(info.is_some());
+    // Another worker's response evicts the unpinned entry.
+    calls
+        .session()
+        .cache_response(&[], (1000..3001).map(knowing_info))
+        .unwrap();
+    assert_eq!(
+        calls
+            .session()
+            .peer(PeerId::user(7).unwrap())
+            .await
+            .unwrap(),
+        None
+    );
+    let guard = calls.track(uid(7), info);
+    let (selected, unknown) = calls.pin_state();
+    assert_eq!((selected.len(), unknown), (1, 0));
+    assert_eq!(
+        carried_users(&calls.session().snapshot()),
+        HashSet::from([7])
+    );
+    drop(guard);
+}
+
+fn knowing_info(id: i64) -> PeerInfo {
+    PeerInfo::User {
+        id,
+        auth: Some(PeerAuth::from_hash(id * 7)),
+        bot: Some(false),
+        is_self: Some(false),
+    }
+}
+
+/// A rebuilt instance whose session pinned `ids` (inherited, before core's
+/// first `retain_peers`).
+async fn inheriting(ids: impl IntoIterator<Item = i64> + Clone) -> Arc<AbyssSession> {
+    let calls = knowing(ids.clone(), vec![]).await;
+    calls.retain(&uids(ids));
+    Arc::new(AbyssSession::from_snapshot(retire(calls.session())).unwrap())
+}
+
+/// Review round 10, test gap: a call that changes the selection's membership
+/// before core reconciles adds its chat and keeps every inherited peer.
+#[tokio::test(start_paused = true)]
+async fn a_call_before_reconciliation_repins_without_losing_inherited_peers() {
+    let session = inheriting(1..=1263).await;
+    session.cache_peer(knowing_info(5000)).await.unwrap();
+    let calls = Calls::new(Hang, Arc::clone(&session));
+    let mut call = Box::pin(calls.history(uid(5000), HistoryQuery::Tail, 5));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), call.as_mut())
+            .await
+            .is_err()
+    );
+    let carried = carried_users(&session.snapshot());
+    assert_eq!(carried.len(), MAX_PINNED_PEERS);
+    assert!(carried.contains(&5000) && carried.contains(&1263));
+    drop(call);
+    let carried = carried_users(&session.snapshot());
+    assert_eq!(carried.len(), 1263);
+    assert!(!carried.contains(&5000));
+}
+
+/// Review round 10, test gap: core's first set on a rebuilt instance is
+/// smaller than the inherited one; the rest are unpinned but still cached.
+#[tokio::test]
+async fn reconciliation_to_a_smaller_set_unpins_the_rest() {
+    let session = inheriting(1..=1264).await;
+    let calls = Calls::new(Hang, Arc::clone(&session));
+    calls.retain(&uids(1..=10));
+    assert_eq!(carried_users(&session.snapshot()), (1..=10).collect());
+    assert!(
+        session
+            .peer(PeerId::user(11).unwrap())
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Review round 10, test gap: a guard released before or after core's
+/// reconciliation ends with core's set either way.
+#[tokio::test(start_paused = true)]
+async fn guard_release_and_reconciliation_commute() {
+    for release_first in [true, false] {
+        let session = inheriting([1, 2]).await;
+        session.cache_peer(knowing_info(9)).await.unwrap();
+        let calls = Calls::new(Hang, Arc::clone(&session));
+        let mut call = Box::pin(calls.history(uid(9), HistoryQuery::Tail, 5));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), call.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(carried_users(&session.snapshot()), HashSet::from([1, 2, 9]));
+        if release_first {
+            drop(call);
+            assert_eq!(carried_users(&session.snapshot()), HashSet::from([1, 2]));
+            calls.retain(&uids([2, 3]));
+        } else {
+            calls.retain(&uids([2, 3]));
+            assert_eq!(
+                carried_users(&session.snapshot()),
+                HashSet::from([2, 9]),
+                "the in-flight chat outlives core's set"
+            );
+            drop(call);
+        }
+        assert_eq!(
+            carried_users(&session.snapshot()),
+            HashSet::from([2]),
+            "release first: {release_first}"
+        );
+        assert_eq!(calls.pin_state().1, 1, "3 is unknown");
     }
 }
