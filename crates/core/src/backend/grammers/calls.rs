@@ -18,7 +18,7 @@ use super::map::{self, Directory};
 use super::pins::Pins;
 use crate::backend::{BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery};
 use crate::model::{ChatId, MsgId};
-use crate::session::{AbyssSession, Pinned};
+use crate::session::{AbyssSession, PinRequest, Pinned};
 
 /// Telegram's page size limit for dialogs and history.
 pub(crate) const MAX_PAGE: u32 = 100;
@@ -126,7 +126,9 @@ pub(crate) struct Calls<I> {
     /// Lock order: `pins`, then the session's peer map (taken inside
     /// `retain_pinned*`). Nothing takes `pins` while holding the peer map:
     /// response caching (`cache_response`) releases it before [`Self::remember`]
-    /// takes `pins`.
+    /// takes `pins`, and the update stream's `cache_peer` never takes `pins`
+    /// at all; a desired peer those make addressable is pinned inside the
+    /// peer map (`session::PinRequest`), with no other lock taken.
     pins: Mutex<Pins>,
 }
 
@@ -159,25 +161,30 @@ impl<I> Calls<I> {
         self.pins.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Hands the session the selected set when it changed.
+    /// Hands the session the selected set when it changed, or when the last
+    /// application left listed peers unknown (the session may have learned
+    /// them since, so the count can change).
     fn repin(&self, pins: &mut Pins) {
-        if let Some(set) = pins.changed() {
-            self.apply(pins, &set);
+        if pins.changed().is_some() || pins.has_unknown() {
+            self.apply(pins, None);
         }
     }
 
-    fn apply(&self, pins: &mut Pins, set: &[PeerId]) {
-        self.apply_with(pins, set, None);
-    }
-
-    /// Applies `set`, merging `resolved` into the session first under the
-    /// same peer-map lock.
-    fn apply_with(&self, pins: &mut Pins, set: &[PeerId], resolved: Option<PeerInfo>) {
-        let Pinned { unknown, .. } = self.session.retain_pinned_with(resolved, set);
+    /// Applies the selected set (core's ids as required, the rest as
+    /// transient), merging `resolved` into the session first under the same
+    /// peer-map lock.
+    fn apply(&self, pins: &mut Pins, resolved: Option<PeerInfo>) {
+        let set = pins.selected();
+        let (required, transient) = pins.split(&set);
+        let request = PinRequest {
+            required,
+            transient,
+        };
+        let Pinned { unknown, .. } = self.session.retain_pinned_with(resolved, request);
         if unknown > 0 {
             tracing::debug!(unknown, "listed peers without an access hash left unpinned");
         }
-        pins.applied(set, unknown);
+        pins.applied(&set, unknown);
     }
 
     /// Core's required set (`Client::retain_peers`): pinned exactly, plus
@@ -243,8 +250,8 @@ impl<I: Invoke> Calls<I> {
             tracing::warn!("session poisoned; response peers not cached");
         }
         let mut pins = self.pins();
-        if let Some(set) = pins.unresolved() {
-            self.apply(&mut pins, &set);
+        if pins.has_unknown() {
+            self.apply(&mut pins, None);
         }
     }
 
@@ -270,8 +277,7 @@ impl<I: Invoke> Calls<I> {
         let mut pins = self.pins();
         let id = map::peer_id(chat).filter(|&id| pins.begin(id));
         if id.is_some() && (pins.changed().is_some() || pins.has_unknown()) {
-            let set = pins.selected();
-            self.apply_with(&mut pins, &set, info);
+            self.apply(&mut pins, info);
         }
         drop(pins);
         InFlight { calls: self, id }

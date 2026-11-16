@@ -2,15 +2,24 @@
 //! here: it lives in the critical state and is never evicted.
 //!
 //! Every known peer is in exactly one of three states:
-//! - **pinned**: core's required set plus the chats of calls in progress, at
-//!   most [`MAX_PINNED_PEERS`]; carried across a rebuild, never evicted;
+//! - **pinned**: the addressable peers of the desired set (below), at most
+//!   [`MAX_PINNED_PEERS`]; carried across a rebuild, never evicted;
 //! - **held**: the chats of a dialogs page (and its cursor's peer) handed to
-//!   core and not yet pinned by core's next `retain_peers`. A handoff holds
-//!   at most [`MAX_HANDOFF_PEERS`] ids and at most [`MAX_HANDOFFS`] are held
-//!   at once (the oldest is released first). Never evicted, never carried;
-//!   a held id leaves its handoff when it is pinned;
+//!   core and not yet pinned by core's *required* set. A handoff holds at
+//!   most [`MAX_HANDOFF_PEERS`] ids and at most [`MAX_HANDOFFS`] are held at
+//!   once (the oldest is released first). Never evicted, never carried. A
+//!   held id leaves its handoff only when core's required set pins it: a
+//!   transient pin (a call in progress, or an inherited pin before core's
+//!   first set) does not end it, since that pin can end before core has
+//!   seen the page;
 //! - **queued**: everything else, at most [`MAX_UNPINNED_PEERS`], the least
 //!   recently touched evicted first. Updating a queued peer touches it.
+//!
+//! The **desired** set is the last [`PinRequest`]: core's required ids, then
+//! transient ones, at most [`MAX_PINNED_PEERS`] identities (known or not). A
+//! desired peer that becomes addressable on any insertion (a response, an
+//! update) is pinned there and then, under the same lock, so it cannot be
+//! evicted before the backend next applies its selection.
 //!
 //! So the map holds at most `MAX_PINNED_PEERS + MAX_HANDOFFS ×
 //! MAX_HANDOFF_PEERS + MAX_UNPINNED_PEERS` peers, however large a response
@@ -46,6 +55,31 @@ pub struct Pinned {
     pub unknown: usize,
 }
 
+/// What the session pins: core's required set (`Client::retain_peers`), then
+/// transient ids (chats of calls in progress, or the inherited pins before
+/// core's first set). Only a required id ends a dialogs handoff's hold.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PinRequest<'a> {
+    /// Core's required set, in priority order.
+    pub required: &'a [PeerId],
+    /// Pinned while they last, without ending any hold.
+    pub transient: &'a [PeerId],
+}
+
+/// Why a desired id is desired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Want {
+    Required,
+    Transient,
+}
+
+/// Whether [`PeerMap::promote`] pinned the peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Promoted {
+    Yes,
+    No,
+}
+
 /// Whether `info` is enough to address the peer: basic groups need no access
 /// hash, users and channels do.
 fn addressable(info: &PeerInfo) -> bool {
@@ -65,6 +99,9 @@ struct Slot {
 pub(crate) struct PeerMap {
     slots: HashMap<PeerId, Slot>,
     pinned: HashSet<PeerId>,
+    /// The last [`PinRequest`], at most [`MAX_PINNED_PEERS`] ids; `pinned`
+    /// is its addressable part (plus any [`Self::pin`]ned carried peers).
+    desired: HashMap<PeerId, Want>,
     /// Held handoffs, oldest first; each distinct, at most
     /// [`MAX_HANDOFF_PEERS`] ids.
     handoffs: VecDeque<Vec<PeerId>>,
@@ -85,7 +122,8 @@ impl PeerMap {
 
     /// Caches `info`, merging with what is known (`extend_info`: a `None`
     /// field, as in Telegram's "min" constructors, never clears a known hash).
-    /// A queued peer moves to the back of the queue.
+    /// A queued peer moves to the back of the queue; a desired peer that is
+    /// now addressable is pinned instead.
     pub(crate) fn insert(&mut self, info: PeerInfo) {
         let id = info.id();
         let queue = match self.slots.entry(id) {
@@ -98,9 +136,27 @@ impl PeerMap {
                 !self.protected(id)
             }
         };
-        if queue {
+        if self.promote(id) == Promoted::No && queue {
             self.enqueue(id);
         }
+    }
+
+    /// Pins a desired, addressable, unpinned peer (see the module docs). A
+    /// required one also leaves its handoffs, as [`Self::set_pins`] would.
+    fn promote(&mut self, id: PeerId) -> Promoted {
+        let Some(&want) = self.desired.get(&id) else {
+            return Promoted::No;
+        };
+        let addressable = self.slots.get(&id).is_some_and(|s| addressable(&s.info));
+        if !addressable || self.pinned.contains(&id) || self.pinned.len() >= MAX_PINNED_PEERS {
+            return Promoted::No;
+        }
+        self.pinned.insert(id);
+        self.dequeue(id);
+        if want == Want::Required {
+            self.release_where(|_, held| held == id);
+        }
+        Promoted::Yes
     }
 
     /// Caches the peers of one response under one lock. `handoff` (a dialogs
@@ -136,18 +192,18 @@ impl PeerMap {
         self.pinned.len()
     }
 
-    /// Makes the pinned set exactly the addressable peers among `ids`, in
-    /// order, up to [`MAX_PINNED_PEERS`]. A peer this map does not know, or
-    /// knows without the access hash it needs, is not pinned: it is counted
-    /// in [`Pinned::unknown`]. A pinned id leaves its handoffs. Peers that
-    /// lose their pin and are not held are queued, newest last.
-    pub(crate) fn set_pins(&mut self, ids: &[PeerId]) -> Pinned {
+    /// Makes `request` the desired set and the pinned set exactly its
+    /// addressable peers. A peer this map does not know, or knows without
+    /// the access hash it needs, is not pinned: it is counted in
+    /// [`Pinned::unknown`], and pinned by the insertion that makes it
+    /// addressable. A pinned *required* id leaves its handoffs; a transient
+    /// one stays held. Peers that lose their pin and are not held are
+    /// queued, newest last.
+    pub(crate) fn set_pins(&mut self, request: PinRequest<'_>) -> Pinned {
         let old = std::mem::take(&mut self.pinned);
+        let ids = self.desire(request);
         let mut unknown = 0_usize;
-        for &id in ids {
-            if self.pinned.len() >= MAX_PINNED_PEERS {
-                break;
-            }
+        for id in ids {
             if self.slots.get(&id).is_some_and(|s| addressable(&s.info)) {
                 self.pinned.insert(id);
                 self.dequeue(id);
@@ -155,7 +211,9 @@ impl PeerMap {
                 unknown = unknown.saturating_add(1);
             }
         }
-        self.release_pinned();
+        self.release_where(|map, id| {
+            map.pinned.contains(&id) && map.desired.get(&id) == Some(&Want::Required)
+        });
         for id in old {
             if !self.protected(id) {
                 self.enqueue(id);
@@ -170,11 +228,39 @@ impl PeerMap {
     /// [`Self::set_pins`] after merging `info` (a peer resolved before the
     /// caller took its locks): an eviction in between cannot leave it
     /// unknown.
-    pub(crate) fn merge_and_pin(&mut self, info: Option<PeerInfo>, ids: &[PeerId]) -> Pinned {
+    pub(crate) fn merge_and_pin(
+        &mut self,
+        info: Option<PeerInfo>,
+        request: PinRequest<'_>,
+    ) -> Pinned {
         if let Some(info) = info {
             self.insert(info);
         }
-        self.set_pins(ids)
+        self.set_pins(request)
+    }
+
+    /// Replaces the desired set with `request`'s first [`MAX_PINNED_PEERS`]
+    /// distinct ids (required first). Returns them.
+    fn desire(&mut self, request: PinRequest<'_>) -> Vec<PeerId> {
+        self.desired.clear();
+        let cap = request
+            .required
+            .len()
+            .saturating_add(request.transient.len())
+            .min(MAX_PINNED_PEERS);
+        let mut ids = Vec::with_capacity(cap);
+        let required = request.required.iter().map(|&id| (id, Want::Required));
+        let transient = request.transient.iter().map(|&id| (id, Want::Transient));
+        for (id, want) in required.chain(transient) {
+            if ids.len() >= MAX_PINNED_PEERS {
+                break;
+            }
+            if let Entry::Vacant(slot) = self.desired.entry(id) {
+                slot.insert(want);
+                ids.push(id);
+            }
+        }
+        ids
     }
 
     /// The pinned peer ids, in no particular order.
@@ -244,21 +330,23 @@ impl PeerMap {
         }
     }
 
-    /// Pinned ids leave their handoffs: their hold has served its purpose.
-    fn release_pinned(&mut self) {
+    /// Held ids for which `ends` holds leave their handoffs: their hold has
+    /// served its purpose. Callers pass only pinned ids, so none needs
+    /// queueing.
+    fn release_where(&mut self, ends: impl Fn(&Self, PeerId) -> bool) {
         let mut handoffs = std::mem::take(&mut self.handoffs);
+        let mut ended = Vec::new();
         for page in &mut handoffs {
-            let mut ended = Vec::new();
-            page.retain(|id| {
-                let keep = !self.pinned.contains(id);
-                if !keep {
-                    ended.push(*id);
+            page.retain(|&id| {
+                let end = ends(self, id);
+                if end {
+                    ended.push(id);
                 }
-                keep
+                !end
             });
-            for id in ended {
-                self.unhold(id);
-            }
+        }
+        for id in ended {
+            self.unhold(id);
         }
         handoffs.retain(|page| !page.is_empty());
         self.handoffs = handoffs;

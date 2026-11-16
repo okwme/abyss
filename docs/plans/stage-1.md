@@ -869,6 +869,20 @@ Open items:
 - Held peers are not carried across a rebuild. A rebuild between a dialogs page and core's next `retain_peers` still loses that page's hashes until the dialogs reload, as before.
 - `retain_peers` cannot say which pages core has seen, so a reconciliation triggered by other inputs, between a page's arrival and its delivery to core, ends the hold only for the ids it pins; the rest stay held.
 
+**Task 11e status (2026-11-16): round 13 re-check fixes to the session peer map and the grammers pinning, offline.** Each regression test fails on the 11d code; this was checked by reverting each fix on its own. Session tests are in `session/peers/tests.rs`, grammers tests in `backend/grammers/tests/calls.rs`.
+1. **Transient pins consumed handoffs (MEDIUM).** The session now takes a `PinRequest { required, transient }` (`AbyssSession::retain_pinned_with(info, request)`; `retain_pinned(ids)` treats every id as required). Only an id pinned through `required` ends its hold. Transient ids are in-flight extras, plus the inherited base before core's first `retain_peers` (`Pins::split`, tracked by `Base::{Inherited, Core}`). They are pinned while they last but leave their handoffs alone, so a chat whose guard drops stays held until core's set pins it or safe rollover releases it. Tests: `a_transient_pin_does_not_end_a_hold` (hold, transient pin, release, 2,001-peer churn, then core's set pins both), `only_required_ids_end_holds`, and `a_call_on_a_handed_off_chat_keeps_its_hold` (dialogs page, guard acquired and dropped, churn, `retain`: both carried).
+2. **Update-stream hashes did not repair unknown required peers (MEDIUM).** The peer map keeps the last request as its *desired* set (`HashMap<PeerId, Want>`, at most 1,264 identities, known or not). `PeerMap::insert` promotes a desired peer to pinned when that insertion makes it addressable, whether it is new or a hash merged into a known hashless entry. The promotion runs under the peer-map lock, and the peer is never queued in between. This covers `cache_peer` (updates), `cache_response` (response auxiliaries) and `merge_and_pin`. A promoted required peer also leaves its handoffs. `Calls::repin` now applies while the last application left peers unknown, not only on a membership change, so an identical `retain` brings the count up to date. Tests: `a_required_peer_learned_later_is_pinned_on_insertion`, `a_hash_merged_into_a_known_required_peer_pins_it`, `promotion_of_a_required_held_peer_ends_its_hold`, `the_desired_set_is_bounded`, and `a_required_peer_learned_from_updates_is_pinned_and_carried` (unknown at `retain`, then `cache_peer`, churn, carried, then an identical `retain` reports 0 unknown and the rebuilt instance addresses it with its hash). The last assertion fails on its own when only the `repin` change is reverted.
+   - **Lock order:** the grammers pins mutex, then the session peer map, never the reverse. Promotion happens entirely inside the peer map and takes no other lock, and `cache_peer` never touches the pins mutex. The critical cell stays a leaf. No lock is held across an `.await`. This is documented on `Calls::pins` and `AbyssSession::peers`.
+3. **Test sensitivity.** (a) `a_full_size_response_keeps_its_handoff_until_core_pins_it` now runs with dialogs first (the order the old FIFO fails on), and with dialogs last. (b) `a_two_peer_page_over_a_full_fifo_keeps_both` names the oldest known peer by a "min" constructor (no hash, so the response cannot re-teach it). Only the hold keeps its earlier hash, so the test is deterministic whatever the directory's hash order. It also checks the rebuilt instance addresses that peer with its original hash.
+
+Bounds are unchanged: 1,264 pinned + 202 held + 2,000 queued, plus at most 1,264 desired ids (identities only). Session API change: `retain_pinned_with` takes a `PinRequest`; `PinRequest` is exported from `session`. `Pins::unresolved` is gone (`has_unknown` covers it).
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (324 core with 3 ignored, 124 app). The grammers module has 83 tests and the peer map 14.
+
+Open items:
+- `backend::grammers::tests::calls::logs_never_carry_text_phones_or_payloads` is flaky on main too (4 of 20 runs of the grammers tests at 11d's merge, 1 of 20 here). It captures nothing, which looks like `tracing`'s global callsite-interest cache racing with other test threads. Fix it with a process-global subscriber or a dedicated test binary.
+- A desired peer that stays unknown takes no slot; only its identity is kept, until the next `retain` replaces the set.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.
@@ -1010,6 +1024,11 @@ Open items:
   - Guard acquisition was not atomic with hash resolution: an eviction between `resolve()` and `repin()` left the guard's peer unknown and out of the snapshot. The resolved info is now merged and pinned under one peer-map lock.
   - Test gaps: the "repin before reconciliation" test changed no membership; reconciliation to a smaller inherited set and both orders of guard release versus reconciliation were untested.
   - **Low:** `Seed::peers` was unused; removed.
+
+- **Round 13 (re-check of task 11d, 2026-11-16).** All fixed in task 11e (section 13):
+  - **Medium:** a transient pin consumed a dialogs handoff. `set_pins` released the hold of every pinned id, including a chat pinned only because a call was in flight on it. After the guard dropped, the chat was queued, and a large response could evict it before core reconciled the page.
+  - **Medium:** an update-stream hash did not repair a previously unknown required peer. `store_peer` only cached it, `Calls::remember` (the only retry) is bypassed by `cache_peer`, and `repin` ignored an identical required set, so the peer could be evicted and was never carried.
+  - Test sensitivity: the full-size unit test put dialogs last, the order the old FIFO survives. The two-peer backend test depended on hash-ordered directory iteration, so it failed on the old code for only one order.
 
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 

@@ -356,6 +356,12 @@ fn dialogs_slice(ids: &[i64]) -> Vec<u8> {
 /// [`dialogs_slice`] whose users also list `extra` (auxiliary peers), after
 /// the dialogs' own users.
 fn dialogs_slice_with(ids: &[i64], extra: impl IntoIterator<Item = i64>) -> Vec<u8> {
+    let listed = ids.iter().copied().chain(extra);
+    dialogs_reply(ids, listed.map(|id| user(id, "U", "")).collect())
+}
+
+/// A full dialogs slice listing users `ids`, with `users` as its users.
+fn dialogs_reply(ids: &[i64], users_list: Vec<tl::types::User>) -> Vec<u8> {
     let top = |id: i64| i32::try_from(id).unwrap();
     tl::enums::messages::Dialogs::Slice(tl::types::messages::DialogsSlice {
         count: 1_000,
@@ -368,13 +374,7 @@ fn dialogs_slice_with(ids: &[i64], extra: impl IntoIterator<Item = i64>) -> Vec<
             .map(|&id| tl::enums::Message::Message(message(peer_user(id), top(id), "m")))
             .collect(),
         chats: vec![],
-        users: users(
-            ids.iter()
-                .copied()
-                .chain(extra)
-                .map(|id| user(id, "U", ""))
-                .collect(),
-        ),
+        users: users(users_list),
     })
     .to_bytes()
 }
@@ -770,16 +770,71 @@ async fn a_full_size_dialogs_response_keeps_its_dialogs_for_core() {
 
 /// Review round 10 (small variant): with a full FIFO, a two-peer page naming
 /// the oldest known peer and a newcomer lost the known one.
+///
+/// Review round 13: the directory caches in hash order, and with peer 1's
+/// hash in the response the old code failed only for one order (otherwise
+/// the response re-taught it). Here the page names peer 1 by a "min"
+/// constructor (no hash, so not cached from the response): only the hold
+/// keeps the hash learned before, whatever the order.
 #[tokio::test]
 async fn a_two_peer_page_over_a_full_fifo_keeps_both() {
-    let calls = knowing(1..=2000, vec![Ok(dialogs_slice(&[1, 5000]))]).await;
-    calls.dialogs(None, 2).await.unwrap();
+    let mut min = user(1, "U", "");
+    min.min = true;
+    let reply = dialogs_reply(&[1, 5000], vec![min, user(5000, "U", "")]);
+    let calls = knowing(1..=2000, vec![Ok(reply)]).await;
+    let page = calls.dialogs(None, 2).await.unwrap();
+    assert_eq!(page.chats.len(), 2);
     calls.retain(&uids([1, 5000]));
     assert_eq!(calls.pin_state().1, 0);
+    let snapshot = retire(calls.session());
+    assert_eq!(carried_users(&snapshot), HashSet::from([1, 5000]));
+    assert_eq!(rebuilt_peer(snapshot, uid(1)).await, Some(7));
+}
+
+/// Review round 13, finding 1: an in-flight call on a handed-off chat pinned
+/// it transiently, which ended its hold; after the guard dropped, a large
+/// response evicted it before core reconciled the page.
+#[tokio::test]
+async fn a_call_on_a_handed_off_chat_keeps_its_hold() {
+    let calls = knowing([], vec![Ok(dialogs_slice(&[1, 2]))]).await;
+    calls.dialogs(None, 2).await.unwrap();
+    let info = calls.lookup(uid(1)).await;
+    let guard = calls.track(uid(1), info);
+    assert_eq!(calls.pin_state().0, vec![PeerId::user(1).unwrap()]);
+    drop(guard);
+    calls
+        .session()
+        .cache_response(&[], (1000..3001).map(knowing_info))
+        .unwrap();
+    calls.retain(&uids([1, 2]));
+    assert_eq!(calls.pin_state().1, 0, "both still addressable");
     assert_eq!(
         carried_users(&retire(calls.session())),
-        HashSet::from([1, 5000])
+        HashSet::from([1, 2])
     );
+}
+
+/// Review round 13, finding 2: a required peer unknown at `retain_peers`
+/// and then learned from the update stream (`cache_peer`, which never
+/// reaches `Calls`) was only queued, so churn evicted it before any rebuild.
+/// It is now pinned on insertion; a repeated identical `retain` re-applies
+/// while anything is unknown, so the count catches up.
+#[tokio::test]
+async fn a_required_peer_learned_from_updates_is_pinned_and_carried() {
+    let calls = knowing([7], vec![]).await;
+    calls.retain(&uids([7, 8]));
+    assert_eq!(calls.pin_state().1, 1, "8 is unknown");
+    calls.session().cache_peer(knowing_info(8)).await.unwrap();
+    calls
+        .session()
+        .cache_response(&[], (1000..3001).map(knowing_info))
+        .unwrap();
+    let carried = carried_users(&calls.session().snapshot());
+    assert_eq!(carried, HashSet::from([7, 8]));
+    calls.retain(&uids([7, 8]));
+    assert_eq!(calls.pin_state().1, 0, "the identical set was re-applied");
+    let snapshot = retire(calls.session());
+    assert_eq!(rebuilt_peer(snapshot, uid(8)).await, Some(56));
 }
 
 /// Two pages, then a 4,096-peer history response, all before core

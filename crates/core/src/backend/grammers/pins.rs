@@ -13,9 +13,15 @@
 //! Deduplicated and cut at `MAX_PINNED_PEERS`, so it always fits the session
 //! cap; the base comes first because core already ranks sends and windows
 //! (the chats calls address) ahead of dialogs. The session is repinned
-//! whenever the selected set changes. A listed peer whose access hash the
-//! session lacks is not pinned, only counted (it cannot be addressed after a
-//! rebuild either way; core reloads it with the dialogs).
+//! whenever the selected set changes, and while any listed peer is unknown.
+//! A listed peer whose access hash the session lacks is not pinned, only
+//! counted; the session keeps the selection as its desired set and pins such
+//! a peer itself when any insertion (a response, an update) makes it
+//! addressable.
+//!
+//! The session is told which ids are core's (the base once core has set it)
+//! and which are transient (in-flight extras, or the inherited base): only
+//! core's ids end a dialogs handoff's hold.
 
 use std::collections::HashSet;
 
@@ -30,11 +36,20 @@ use crate::session::MAX_PINNED_PEERS;
 /// windows plus sends; beyond it a call is simply not tracked.
 pub(crate) const MAX_IN_FLIGHT: usize = MAX_CARRIED_PEERS;
 
+/// Where the base came from. Only core's own set ends a dialogs handoff's
+/// hold in the session (see `session::PinRequest`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Base {
+    Inherited,
+    Core,
+}
+
 /// The pins of one instance.
 #[derive(Debug)]
 pub(crate) struct Pins {
     /// Core's last required set, or the inherited pins before it.
     base: Vec<PeerId>,
+    origin: Base,
     /// Chats of calls in progress, with their call counts, oldest first.
     in_flight: Vec<(PeerId, u32)>,
     /// The set last handed to the session.
@@ -51,6 +66,7 @@ impl Pins {
         let applied = inherited.iter().copied().collect();
         Self {
             base: inherited,
+            origin: Base::Inherited,
             in_flight: Vec::with_capacity(MAX_IN_FLIGHT),
             applied,
             unknown: 0,
@@ -77,7 +93,21 @@ impl Pins {
             }
         }
         self.base = base;
+        self.origin = Base::Core;
         invalid
+    }
+
+    /// Splits `selected` (this tracker's [`Self::selected`]) into core's
+    /// required ids and the transient rest: the base leads the selection
+    /// (it is distinct and capped), and an inherited base is transient.
+    pub(crate) fn split<'a>(&self, selected: &'a [PeerId]) -> (&'a [PeerId], &'a [PeerId]) {
+        let required = match self.origin {
+            Base::Core => self.base.len(),
+            Base::Inherited => 0,
+        };
+        selected
+            .split_at_checked(required)
+            .unwrap_or((&[], selected))
     }
 
     /// A call addressing `id` started. Returns whether it is tracked (and so
@@ -136,12 +166,6 @@ impl Pins {
         let same = selected.len() == self.applied.len()
             && selected.iter().all(|id| self.applied.contains(id));
         (!same).then_some(selected)
-    }
-
-    /// The selected set when the last application left listed peers
-    /// unpinned (a later response may have taught the session their hashes).
-    pub(crate) fn unresolved(&self) -> Option<Vec<PeerId>> {
-        (self.unknown > 0).then(|| self.selected())
     }
 
     /// Records what was handed to the session and how many it could not pin.
