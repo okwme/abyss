@@ -10,6 +10,7 @@
 mod auth;
 mod lifecycle;
 mod logout;
+mod review4b;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -240,19 +241,39 @@ async fn refresh_merges_the_first_page_into_loaded_pages() {
         let (ev, _) = h.until(|e| matches!(e, Event::DialogsAppended(_))).await;
         assert_eq!(dialogs_len(&ev), expected);
     }
+    h.until(|e| matches!(e, Event::DialogsPaging { has_more: false }))
+        .await;
+    // While the app was away, a chat appeared below the first page.
+    let newcomer = chat(9999);
+    h.fake.edit_dialogs(|d| {
+        d.insert(150, crate::backend::fake::summary(newcomer, "new"));
+    });
     tokio::time::sleep(Duration::from_secs(16)).await;
     h.send(Command::Window(crate::api::WindowState::Active))
         .await;
     let (ev, _) = h.until(|e| matches!(e, Event::DialogsReset(_))).await;
     assert_eq!(dialogs_len(&ev), 250, "later pages survive a refresh");
+    // Pagination restarts from the fresh cursor instead of staying terminal.
+    h.until(|e| matches!(e, Event::DialogsPaging { has_more: true }))
+        .await;
+    let mut appended = Vec::new();
+    for _ in 0..2 {
+        h.send(Command::LoadDialogs).await;
+        let (ev, _) = h.until(|e| matches!(e, Event::DialogsAppended(_))).await;
+        if let Event::DialogsAppended(v) = ev {
+            appended.extend(v);
+        }
+    }
+    assert!(
+        appended.iter().any(|c| c.id == newcomer),
+        "the chat below the first page is found"
+    );
+    let (ev, _) = h.until(|e| matches!(e, Event::DialogsPaging { .. })).await;
+    assert!(matches!(ev, Event::DialogsPaging { has_more: false }));
     let calls = h.fake.calls(Op::Dialogs);
     h.send(Command::LoadDialogs).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        h.fake.calls(Op::Dialogs),
-        calls,
-        "the cursor still points past the last page"
-    );
+    assert_eq!(h.fake.calls(Op::Dialogs), calls, "every page is loaded");
     h.stop().await;
 }
 

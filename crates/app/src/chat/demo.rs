@@ -69,6 +69,7 @@ fn summary(n: i64, now: i64) -> ChatSummary {
         unread_mentions: 0,
         last: Some(last),
         last_date: now - n * 3_600,
+        last_id: None,
         can_send: !matches!(
             kind,
             ChatKind::Supergroup {

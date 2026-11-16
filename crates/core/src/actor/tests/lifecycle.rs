@@ -327,10 +327,14 @@ async fn stale_generation_completions_are_dropped() {
             cgen: stale,
             parked: None,
             outcome: Outcome::History {
-                chat: chat(1),
-                view,
+                load: crate::actor::jobs::Load {
+                    chat: chat(1),
+                    view,
+                    req: crate::actor::jobs::ReqId(1),
+                },
                 dir: HistoryDir::Tail,
                 query: HistoryQuery::Tail,
+                floor: None,
                 res: Ok(HistoryPage {
                     messages,
                     has_more: false,

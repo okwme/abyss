@@ -83,17 +83,16 @@ pub(crate) fn backend_error(kind: ErrorKind) -> BackendError {
 }
 
 /// How the update stream's error affects the instance: transient errors are
-/// retried on the same stream; fatal ones rebuild it.
+/// retried on the same stream; fatal ones rebuild it; auth loss and migration
+/// keep their cause so core runs the local logout or the migration policy.
 pub(crate) fn stream_error(kind: ErrorKind) -> StreamError {
     match kind {
         ErrorKind::Flood { .. } | ErrorKind::Io | ErrorKind::Server | ErrorKind::Rejected => {
             StreamError::Transient
         }
-        ErrorKind::Dropped
-        | ErrorKind::Migrated
-        | ErrorKind::Unauthorized
-        | ErrorKind::DuplicateRandomId
-        | ErrorKind::Local => StreamError::Fatal,
+        ErrorKind::Migrated => StreamError::Migrated,
+        ErrorKind::Unauthorized => StreamError::Unauthorized,
+        ErrorKind::Dropped | ErrorKind::DuplicateRandomId | ErrorKind::Local => StreamError::Fatal,
     }
 }
 

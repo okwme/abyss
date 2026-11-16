@@ -195,7 +195,13 @@ impl ChatShell {
                     self.after_echo_change();
                 }
             }
-            Event::Auth(_) | Event::Connection(_) | Event::Error(_) => {}
+            // Task 10b consumes `Reconciled` (echo reconciliation) and
+            // `DialogsPaging` (pagination state).
+            Event::Auth(_)
+            | Event::Connection(_)
+            | Event::Error(_)
+            | Event::Reconciled { .. }
+            | Event::DialogsPaging { .. } => {}
         }
     }
 

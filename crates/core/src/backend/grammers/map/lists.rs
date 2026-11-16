@@ -200,6 +200,9 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
         unread_mentions: count(d.unread_mentions_count),
         last: last_message.as_ref().map(Preview::of),
         last_date: last_message.as_ref().map_or(0, |m| m.date),
+        // The top message id is authoritative even when the message itself
+        // did not map (excluded or invalid).
+        last_id: (d.top_message > 0).then_some(MsgId(d.top_message)),
         can_send: entry.can_send,
     };
     if summary.is_valid() {
@@ -335,6 +338,11 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
         U::ReadChannelInbox(u) => Some(Update::ReadInbox {
             chat: channel_chat(u.channel_id)?,
             still_unread: count(u.still_unread_count),
+        }),
+        // Correlated with the pending-send table by core (plan section 9).
+        U::MessageId(u) if u.id > 0 && u.random_id != 0 => Some(Update::MessageId {
+            random_id: u.random_id,
+            id: MsgId(u.id),
         }),
         _ => None,
     }
