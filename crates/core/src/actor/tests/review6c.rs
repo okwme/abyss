@@ -319,6 +319,11 @@ async fn failed_logout_stays_incomplete_until_retry() {
     );
     h.auth(|s| matches!(s, AuthState::Phone { error: None }))
         .await;
+    // The next instance starts from the (fresh) account, never the old
+    // instance's snapshot: no pinned peers, desired set or holds carry over.
+    let seeds = h.fake.seeds();
+    assert_eq!(seeds.len(), builds + 1);
+    assert!(seeds.last().is_some_and(|s| s.session.is_stored()));
     let report = h.stop().await;
     assert_eq!(report.logout, None, "nothing left over");
 }

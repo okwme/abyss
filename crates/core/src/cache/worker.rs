@@ -69,6 +69,9 @@ pub(crate) enum CacheCmd {
         delete_key: DeleteKey,
         reply: oneshot::Sender<Result<(), EraseFailure>>,
     },
+    /// Closes the database after all queued commands, then stops the worker;
+    /// replies once the connection is closed.
+    Close(oneshot::Sender<()>),
 }
 
 /// Async handle to the worker. Cloneable; the worker exits when all handles drop
@@ -172,6 +175,15 @@ impl CacheHandle {
         rx.await.map_err(|_| WorkerError::Stopped)
     }
 
+    /// Processes every queued command, closes the database and stops the
+    /// worker. Shutdown awaits this, so no worker is still closing SQLCipher
+    /// while the process exits (its global teardown races a live close).
+    pub async fn close(&self) -> Result<(), WorkerError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(CacheCmd::Close(tx)).await?;
+        rx.await.map_err(|_| WorkerError::Stopped)
+    }
+
     /// Crypto-erases the cache after all queued commands, then stops the worker.
     pub async fn erase(&self, key: CacheKey, delete_key: DeleteKey) -> Result<(), EraseFailure> {
         let (reply, rx) = oneshot::channel();
@@ -188,6 +200,12 @@ impl CacheHandle {
 
 fn run(mut cache: Cache, dir: &Path, mut rx: mpsc::Receiver<CacheCmd>) {
     while let Some(cmd) = rx.blocking_recv() {
+        if let CacheCmd::Close(reply) = cmd {
+            rx.close();
+            drop(cache);
+            let _ = reply.send(());
+            return;
+        }
         if let CacheCmd::Erase {
             key,
             delete_key,
@@ -274,6 +292,8 @@ fn handle(cache: &mut Cache, cmd: CacheCmd) {
         CacheCmd::Bind { owner, reply } => drop(reply.send(cache.bind(owner))),
         // Unreachable: `run` intercepts Erase. Report "not performed" if it ever arrives.
         CacheCmd::Erase { reply, .. } => drop(reply.send(Err(EraseFailure::Stopped))),
+        // Unreachable: `run` intercepts Close. Dropping the reply says "stopped".
+        CacheCmd::Close(reply) => drop(reply),
     }
 }
 

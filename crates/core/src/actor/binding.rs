@@ -258,3 +258,28 @@ impl<B: Backend> Actor<B> {
         }
     }
 }
+
+impl<B: Backend> Actor<B> {
+    /// Shutdown: flushes and closes every cache core holds (served,
+    /// quarantined, or still re-binding), bounded by `CACHE_FLUSH`, so no
+    /// worker thread is closing SQLCipher while the process exits.
+    /// A cache handed in without parts (tests) is not core's: it is only
+    /// flushed, and its owner keeps using it.
+    pub(super) async fn close_caches(&mut self) {
+        let Some(parts) = self.cache_parts.as_mut() else {
+            if let Some(cache) = &self.cache {
+                let _ = tokio::time::timeout(super::CACHE_FLUSH, cache.barrier()).await;
+            }
+            return;
+        };
+        let (quarantined, rebinding) = (parts.quarantined.take(), parts.rebinding.take());
+        let served = self.cache.take();
+        let all = async move {
+            let rebound = finish_rebinding(rebinding).await.map(|(handle, _)| handle);
+            for handle in [served, quarantined, rebound].into_iter().flatten() {
+                let _ = handle.close().await;
+            }
+        };
+        let _ = tokio::time::timeout(super::CACHE_FLUSH, all).await;
+    }
+}

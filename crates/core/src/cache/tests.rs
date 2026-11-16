@@ -4,6 +4,22 @@ use crate::rich_text::RichText;
 
 const SECRET: &str = "very-secret-plaintext-marker";
 
+/// Task 6c: `close` processes queued writes, closes the database before it
+/// replies, and stops the worker; the data is on disk for the next open.
+#[tokio::test]
+async fn close_flushes_closes_and_stops_the_worker() {
+    let (_t, dir, key) = setup();
+    let c = user(1);
+    let handle = CacheHandle::spawn(dir.clone(), &key).unwrap();
+    handle
+        .write(worker::CacheCmd::PutMessages(c, vec![msg(c, 1, "a")]))
+        .await;
+    handle.close().await.unwrap();
+    assert!(matches!(handle.chats().await, Err(WorkerError::Stopped)));
+    let mut db = Cache::open(&dir, &key).unwrap();
+    assert_eq!(ids(&db.tail(c, 10).unwrap()), vec![1]);
+}
+
 fn user(id: i64) -> ChatId {
     ChatId {
         kind: PeerKind::User,

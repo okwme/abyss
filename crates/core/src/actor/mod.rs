@@ -272,9 +272,7 @@ impl<B: Backend> Actor<B> {
                 tokio::time::timeout_at(deadline, self.account.barrier()).await,
                 Ok(Ok(()))
             );
-        if let Some(cache) = &self.cache {
-            let _ = tokio::time::timeout(CACHE_FLUSH, cache.barrier()).await;
-        }
+        self.close_caches().await;
         let save = if life.retired && sealed {
             SaveStatus::Confirmed
         } else {

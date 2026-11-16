@@ -360,6 +360,9 @@ impl<B: Backend> Actor<B> {
     /// (`Command::Logout`) deletes them; shutdown reports it.
     async fn logout_unfinished(&mut self, remote: RemoteLogout, local: LocalDeletion) {
         tracing::warn!("logout incomplete: local data remains");
+        // The account is over either way: no later build may carry its
+        // session, pinned peers, desired set or holds (task 11e).
+        self.forget_instance_session();
         self.unfinished_logout = Some((remote, local));
         self.life.phase = Phase::LoggingOut(LogoutStage::Unfinished);
         self.auth.reset_signed_out();
