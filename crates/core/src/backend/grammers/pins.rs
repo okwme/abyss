@@ -150,6 +150,11 @@ impl Pins {
         self.unknown = unknown;
     }
 
+    /// Whether the last application left listed peers unpinned.
+    pub(crate) fn has_unknown(&self) -> bool {
+        self.unknown > 0
+    }
+
     #[cfg(test)]
     pub(crate) fn unknown(&self) -> usize {
         self.unknown

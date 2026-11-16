@@ -23,7 +23,7 @@ mod seed;
 use std::future::Future;
 use std::pin::Pin;
 
-pub use seed::{CarriedPeers, MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
+pub use seed::{MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 
 use crate::api::{CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
 pub use crate::credentials::CredentialSlot;

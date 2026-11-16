@@ -855,6 +855,20 @@ Open items:
 - A `SentUnconfirmed` echo can stay next to its server copy until the second reconcile (the next light refresh, activation or reopen). Rare (no `updateMessageID`), and never a lost message. Exact removal needs core to say which sends a reconciled tail covers.
 - An empty sidebar list asks for the next page from `DialogsPaging`; a non-empty one asks from rendering, so a filtered page that adds nothing visible is followed only when the sidebar next renders (every event batch renders).
 
+**Task 11d status (2026-11-16): round 10 re-check fixes to the grammers peer handling, offline.** Findings 1, 2 and 4 fail on the old code (checked by reverting each fix); finding 3 fills test gaps. Session tests are in `crates/core/src/session/peers/tests.rs`, grammers tests in `backend/grammers/tests/calls.rs`.
+1. **Dialog peers evicted before core retained them (HIGH).** The session peer map now has three states: pinned (core's set plus in-flight calls, carried, at most 1,264), held, and queued (the 2,000-entry FIFO). A dialogs response hands its returned chats plus its cursor's peer to core through a handoff: `AbyssSession::cache_response(handoff, infos)` holds those ids *before* caching the response's other peers, under one peer-map lock, so no auxiliary peer can evict them. A handoff holds at most `MAX_HANDOFF_PEERS` (101 = a full page plus its cursor), and at most `MAX_HANDOFFS` (2) are held; a third releases the oldest into the queue as its newest entries. A held id leaves its handoff when `retain_pinned` pins it; held peers are never carried, so the long-lived set stays capped at 1,264. Updating a queued peer now moves it to the back (per-slot stamps; stale queue positions are skipped and compacted past 4,000). The map is bounded by 1,264 + 202 + 2,000 peers. Tests: `a_full_size_dialogs_response_keeps_its_dialogs_for_core` (100 dialogs + 3,996 auxiliary users), `a_two_peer_page_over_a_full_fifo_keeps_both`, `responses_before_reconciliation_do_not_evict_handed_off_pages` (two pages then a 4,096-peer history response), and the unit tests `an_update_moves_a_queued_peer_to_the_back`, `a_two_peer_handoff_survives_a_full_queue_and_more`, `a_full_size_response_keeps_its_handoff_until_core_pins_it`, `concurrent_handoffs_survive_until_reconciled_and_stay_bounded`, `a_hold_ends_when_core_pins_the_peer`, `a_handoff_is_bounded`, `repeated_touches_keep_the_queue_bounded`.
+2. **Guard acquisition not atomic with resolution.** `resolve_used` looks the peer up, then `Calls::track` takes the pins mutex, begins the in-flight entry and, when the selection changed or has unknowns, applies it with `AbyssSession::retain_pinned_with(info, set)`: the resolved `PeerInfo` is merged and the set pinned under one peer-map lock, so an eviction between lookup and pin cannot leave the guard's peer unknown. When the selection is unchanged with nothing unknown, the chat (if selected) is already pinned and cannot have been evicted. Tests: `a_peer_evicted_between_lookup_and_pin_is_still_pinned` (lookup, eviction, pin: selected 1, unknown 0, carried), `merge_and_pin_restores_an_evicted_peer`.
+   - **Lock order:** the grammers pins mutex, then the session's peer map. Response caching takes and releases the peer map before `remember` takes the pins mutex, so nothing takes the pins mutex while holding the peer map. The critical cell is a leaf: `cache_response` routes the self user through it before taking the peer map. No lock is held across an `.await`.
+3. **Test gaps.** The comment in `consecutive_rebuilds_keep_more_than_1000_inherited_peers` no longer claims a repin. New: `a_call_before_reconciliation_repins_without_losing_inherited_peers` (1,263 inherited plus a call on a new chat: 1,264 carried, back to 1,263 on release), `reconciliation_to_a_smaller_set_unpins_the_rest` (1,264 inherited, core keeps 10; the rest stay cached), `guard_release_and_reconciliation_commute` (both orders end with core's set; the in-flight chat outlives a reconciliation that omits it).
+4. **`Seed::peers` removed.** `CarriedPeers`, its construction in `actor/lifecycle.rs` and its test are gone; `Seed` is `{ session }`. The carried peers are the snapshot's pins. `MAX_CARRIED_PEERS` stays (it bounds in-flight tracking). The lifecycle test `rebuild_carries_the_live_session_and_peers` now checks the peers core retains instead.
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (316 core with 3 ignored, 109 app). The grammers module has 81 tests (after merging main at 3e45058).
+
+Open items:
+- A held handoff whose chats core never pins (beyond its 1,000-dialog cap, or a page core discarded) stays held until a newer page displaces it: at most 202 extra cached peers, never carried.
+- Held peers are not carried across a rebuild. A rebuild between a dialogs page and core's next `retain_peers` still loses that page's hashes until the dialogs reload, as before.
+- `retain_peers` cannot say which pages core has seen, so a reconciliation triggered by other inputs, between a page's arrival and its delivery to core, ends the hold only for the ids it pins; the rest stay held.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.
@@ -990,6 +1004,12 @@ Open items:
   - Credential save and delete failures have no Retry UI, and Forget claims the pair is gone before the delete succeeds.
   - The FloodWait 10-minute deadline is not enforced at dispatch or on rebuild replay (`sends.rs`).
   - **Low:** `docs/connecting.md` overstates the flow and logout recovery.
+
+- **Round 10 (re-check of task 11c, 2026-11-16).** All fixed in task 11d (section 13):
+  - **High:** a dialogs response cached its whole directory (up to 4,096 peers, unordered) through the 2,000-entry FIFO before core retained its dialogs, so it could evict its own dialog peers; updates also did not refresh FIFO position. Dialogs pages now hand their chats and cursor peer to core through a bounded hold, and updates touch queued peers.
+  - Guard acquisition was not atomic with hash resolution: an eviction between `resolve()` and `repin()` left the guard's peer unknown and out of the snapshot. The resolved info is now merged and pinned under one peer-map lock.
+  - Test gaps: the "repin before reconciliation" test changed no membership; reconciliation to a smaller inherited set and both orders of guard release versus reconciliation were untested.
+  - **Low:** `Seed::peers` was unused; removed.
 
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 

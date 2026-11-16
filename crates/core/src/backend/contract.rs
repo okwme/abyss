@@ -12,8 +12,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use super::{
-    Backend, BackendError, CarriedPeers, Client, HistoryQuery, Instance, InstanceControl, Seed,
-    SessionSeed, SessionSnapshot, StreamError, StreamItem, Update, UpdateStream,
+    Backend, BackendError, Client, HistoryQuery, Instance, InstanceControl, Seed, SessionSeed,
+    SessionSnapshot, StreamError, StreamItem, Update, UpdateStream,
 };
 use crate::model::{ChatId, Message, MsgId};
 
@@ -154,7 +154,6 @@ async fn check_rebuild<B: Backend>(
 ) -> SessionSnapshot {
     let seed = Seed {
         session: SessionSeed::Live(snapshot),
-        peers: CarriedPeers::new([chat]),
     };
     let Instance {
         client,
@@ -220,7 +219,6 @@ async fn check_send(client: &impl Client, chat: ChatId) -> MsgId {
 pub(crate) async fn run<B: Backend>(backend: &B, target: Option<ChatId>, sends: Sends) {
     let seed = Seed {
         session: SessionSeed::Stored,
-        peers: CarriedPeers::default(),
     };
     let Instance {
         client,

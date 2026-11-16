@@ -26,7 +26,7 @@ use grammers_session::{BoxFuture, Session};
 use tokio::sync::watch;
 
 pub use cell::SessionSnapshot;
-pub use peers::{MAX_PINNED_PEERS, MAX_UNPINNED_PEERS, Pinned};
+pub use peers::{MAX_HANDOFF_PEERS, MAX_HANDOFFS, MAX_PINNED_PEERS, MAX_UNPINNED_PEERS, Pinned};
 pub use worker::{
     AccountGen, LoadStatus, LoadedSession, PERSIST_QUEUE, PersistError, PersistHandle,
 };
@@ -146,6 +146,39 @@ impl AbyssSession {
         self.peers().set_pins(ids)
     }
 
+    /// [`Self::retain_pinned`] after merging `info`, under the same peer-map
+    /// lock: a peer resolved before the caller took its own locks is pinned
+    /// with that info even if the map evicted it in between.
+    pub fn retain_pinned_with(&self, info: Option<PeerInfo>, ids: &[PeerId]) -> Pinned {
+        self.peers().merge_and_pin(info, ids)
+    }
+
+    /// Caches the peers of one response under one peer-map lock. `handoff`
+    /// (a dialogs page's chats and its cursor peer) stays held, safe from
+    /// eviction, until a [`Self::retain_pinned`] pins it or a newer handoff
+    /// displaces it (see the `peers` module). The self user goes to the
+    /// critical state, as with `cache_peer`.
+    pub fn cache_response(
+        &self,
+        handoff: &[PeerId],
+        infos: impl IntoIterator<Item = PeerInfo>,
+    ) -> Result<(), SessionError> {
+        let mut others = Vec::new();
+        for info in infos {
+            // The critical cell is a leaf lock: read without the peer map's.
+            if self.cell.read(|s| s.is_self(&info))? {
+                self.mutate(|s| {
+                    s.merge_self(&info);
+                    Ok(())
+                })?;
+            } else {
+                others.push(info);
+            }
+        }
+        self.peers().cache_response(handoff, others);
+        Ok(())
+    }
+
     /// The pinned peer ids, in no particular order.
     pub fn pinned_ids(&self) -> Vec<PeerId> {
         self.peers().pinned_ids()
@@ -179,6 +212,10 @@ impl AbyssSession {
 
     /// Peer and update maps hold no invariant a panic could break halfway, so
     /// a poisoned lock is recovered.
+    ///
+    /// Lock order: a caller's own lock (the grammers pin tracker) before the
+    /// peer map; the critical cell is a leaf, never held while taking another
+    /// lock and never taken under the peer map.
     fn peers(&self) -> MutexGuard<'_, PeerMap> {
         self.peers.lock().unwrap_or_else(PoisonError::into_inner)
     }
