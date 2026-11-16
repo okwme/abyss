@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::{Cache, CacheError, CacheKey, EraseError};
+use super::{Binding, Cache, CacheError, CacheKey, EraseError};
 use crate::model::{ChatId, ChatSummary, Message, MsgId};
 
 /// Commands queued to the worker.
@@ -59,6 +59,11 @@ pub(crate) enum CacheCmd {
     },
     /// Replies once every earlier command has been processed.
     Barrier(oneshot::Sender<()>),
+    /// See [`Cache::bind`].
+    Bind {
+        owner: Option<i64>,
+        reply: Reply<Binding>,
+    },
     Erase {
         key: CacheKey,
         delete_key: DeleteKey,
@@ -153,6 +158,11 @@ impl CacheHandle {
             reply,
         })
         .await
+    }
+
+    /// Binds the cache to a verified account (see [`Cache::bind`]).
+    pub async fn bind(&self, owner: Option<i64>) -> Result<Binding, WorkerError> {
+        self.ask(|reply| CacheCmd::Bind { owner, reply }).await
     }
 
     /// Waits until every command sent before this one has been processed.
@@ -261,6 +271,7 @@ fn handle(cache: &mut Cache, cmd: CacheCmd) {
             reply,
         } => drop(reply.send(cache.after(chat, id, limit))),
         CacheCmd::Barrier(reply) => drop(reply.send(())),
+        CacheCmd::Bind { owner, reply } => drop(reply.send(cache.bind(owner))),
         // Unreachable: `run` intercepts Erase. Report "not performed" if it ever arrives.
         CacheCmd::Erase { reply, .. } => drop(reply.send(Err(EraseFailure::Stopped))),
     }

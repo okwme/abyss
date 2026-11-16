@@ -21,6 +21,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::Actor;
+use super::binding::{Rebinding, finish_rebinding};
 use super::apply::user_error;
 use super::jobs::CallError;
 use super::lifecycle::{LogoutStage, Phase, REBUILD_CAPS, Retired, Step, retire};
@@ -35,10 +36,27 @@ use crate::session::{AccountGen, PersistHandle};
 /// Deadline for `auth.logOut`.
 pub(super) const SIGN_OUT_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Where the account's message cache lives, and its key while it is open.
+/// Where the account's message cache lives, its key while it is open, and
+/// the cache while it is quarantined (open, never read; see `binding`).
 pub(crate) struct CacheParts {
     pub(crate) dir: PathBuf,
     pub(crate) key: Option<CacheKey>,
+    /// Open but not bound to the signed-in account.
+    pub(crate) quarantined: Option<CacheHandle>,
+    /// A background erase-and-recreate for a login (see `binding`).
+    pub(crate) rebinding: Option<Rebinding>,
+}
+
+impl CacheParts {
+    /// No cache open yet.
+    pub(crate) fn closed(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            key: None,
+            quarantined: None,
+            rebinding: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for CacheParts {
@@ -91,8 +109,8 @@ async fn sign_out<C: Client>(client: Arc<C>, shutdown: &CancellationToken) -> Re
 async fn delete_local(
     persist: PersistHandle,
     account: Option<AccountGen>,
-    cache: Option<CacheHandle>,
-    parts: Option<(PathBuf, Option<CacheKey>)>,
+    open: Option<(CacheHandle, CacheKey)>,
+    parts: Option<(PathBuf, Option<Rebinding>)>,
 ) -> LocalDone {
     let session = match account {
         Some(account) => persist
@@ -102,7 +120,15 @@ async fn delete_local(
         None => Err(StorageError::Internal),
     };
     let (erased, reopened) = match parts {
-        Some((dir, key)) => erase_cache(&persist, cache, dir, key).await,
+        Some((dir, rebinding)) => {
+            // A login's re-binding owns the cache until it finishes.
+            let open = match finish_rebinding(rebinding).await {
+                Some(rebound) => Some(rebound),
+                None => open,
+            };
+            let (cache, key) = open.map_or((None, None), |(c, k)| (Some(c), Some(k)));
+            erase_cache(&persist, cache, dir, key).await
+        }
         None => (Ok(()), None),
     };
     let local = match (session, erased) {
@@ -116,7 +142,7 @@ async fn delete_local(
 }
 
 /// Crypto-erases the cache, then opens a fresh one for the next account.
-async fn erase_cache(
+pub(super) async fn erase_cache(
     persist: &PersistHandle,
     cache: Option<CacheHandle>,
     dir: PathBuf,

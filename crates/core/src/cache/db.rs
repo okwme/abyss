@@ -226,6 +226,60 @@ impl Cache {
     }
 }
 
+/// What [`Cache::bind`] found (plan section 16, account binding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// The cache belongs to the given account.
+    Same,
+    /// The cache was empty and unowned; it now belongs to the given account.
+    Claimed,
+    /// Empty and unowned, and no account was given: nothing to protect.
+    Blank,
+    /// Owned by another account, or holding rows of an unknown owner. The
+    /// caller must not serve it: crypto-erase and recreate.
+    Foreign,
+}
+
+// Account binding.
+impl Cache {
+    /// Binds the cache to `owner` (the verified self user id), or checks an
+    /// unbound cache when `owner` is `None`. Rows are served only after
+    /// `Same` or `Claimed`.
+    pub fn bind(&mut self, owner: Option<i64>) -> Result<Binding, CacheError> {
+        let stored: Option<i64> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'owner'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let (Some(stored), Some(owner)) = (stored, owner)
+            && stored == owner
+        {
+            return Ok(Binding::Same);
+        }
+        if stored.is_some() || !self.is_empty()? {
+            return Ok(Binding::Foreign);
+        }
+        let Some(owner) = owner else {
+            return Ok(Binding::Blank);
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('owner', ?1)",
+            params![owner],
+        )?;
+        Ok(Binding::Claimed)
+    }
+
+    fn is_empty(&self) -> Result<bool, CacheError> {
+        let any: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM chats) OR EXISTS (SELECT 1 FROM messages)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(!any)
+    }
+}
+
 #[derive(Debug)]
 pub enum EraseError<E> {
     Close(rusqlite::Error),

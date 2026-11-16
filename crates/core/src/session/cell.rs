@@ -181,6 +181,12 @@ impl SessionSnapshot {
         self.cell.read(|s| s.self_user.is_some())
     }
 
+    /// The self user's id: the account the auth keys belong to (plan
+    /// section 16 binds the message cache to it). `None` when signed out.
+    pub fn self_id(&self) -> Result<Option<i64>, SessionError> {
+        self.cell.read(|s| s.self_user.map(|u| u.id))
+    }
+
     /// Waits until the store holds the current revision and returns the
     /// storage result: `Ok` only if the newest write covering it succeeded.
     /// Resolves at once with the last outcome when nothing changed.
