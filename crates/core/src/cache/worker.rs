@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::{mpsc, oneshot};
 
+use super::census::{self, Open};
 use super::{Binding, Cache, CacheError, CacheKey, EraseError};
 use crate::model::{ChatId, ChatSummary, Message, MsgId};
 
@@ -129,12 +130,23 @@ pub enum WorkerError {
 
 impl CacheHandle {
     /// Opens the cache and starts the worker thread `abyss-cache`.
+    ///
+    /// The cache stays in the census (see `census`) from before it is
+    /// opened until its connection is closed, on whichever thread that
+    /// happens, so shutdown and process exit can wait for it. The worker
+    /// closes the database once every handle is dropped, after `close`, or
+    /// after `erase`.
     pub fn spawn(dir: PathBuf, key: &CacheKey) -> Result<CacheHandle, CacheError> {
+        let open = Open::enter(&dir);
         let cache = Cache::open(&dir, key)?;
+        // SQLCipher has initialized (and registered its exit handler), so
+        // ours runs before it.
+        census::guard_exit();
         let (tx, rx) = mpsc::channel(CACHE_QUEUE);
+        let owned = Owned { cache, open };
         std::thread::Builder::new()
             .name("abyss-cache".into())
-            .spawn(move || run(cache, &dir, rx))
+            .spawn(move || run(owned, &dir, rx))
             .map_err(CacheError::Io)?;
         Ok(CacheHandle {
             tx,
@@ -251,11 +263,23 @@ impl CacheHandle {
     }
 }
 
-fn run(mut cache: Cache, dir: &Path, mut rx: mpsc::Receiver<CacheCmd>) {
+/// The worker's database and its census entry. Fields drop in declaration
+/// order, so the entry outlives the connection on every path, including a
+/// failed thread spawn.
+struct Owned {
+    cache: Cache,
+    open: Open,
+}
+
+/// Every exit closes the database first, then leaves the census, then
+/// replies: a caller that saw the reply never races a close.
+fn run(owned: Owned, dir: &Path, mut rx: mpsc::Receiver<CacheCmd>) {
+    let Owned { mut cache, open } = owned;
     while let Some(cmd) = rx.blocking_recv() {
         if let CacheCmd::Close(reply) = cmd {
             rx.close();
             drop(cache);
+            drop(open);
             let _ = reply.send(());
             return;
         }
@@ -269,11 +293,15 @@ fn run(mut cache: Cache, dir: &Path, mut rx: mpsc::Receiver<CacheCmd>) {
             let result = cache
                 .erase(dir, key, delete_key)
                 .map_err(EraseFailure::from);
+            drop(open);
             let _ = reply.send(result);
             return;
         }
         handle(&mut cache, cmd);
     }
+    // Every handle is gone.
+    drop(cache);
+    drop(open);
 }
 
 /// Applies a server tail. If it overlaps the cached history (or reaches the

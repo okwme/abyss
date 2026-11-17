@@ -1009,6 +1009,30 @@ Open items:
 - The 10d/10e open item on `purge_queued` stands: a purged queued user load still ends without `LoadEnded`. The purge now also drops the load's owed answer and covering-fetch mark, so no bookkeeping is left behind. The behaviour towards the UI is unchanged.
 - `MAX_OLDER_RESTARTS` = 3 is a judgement call: enough to ride out a burst of live messages, small enough that a continuous trim reaches the UI's backoff within 4 requests.
 
+**Exit SIGSEGV fix (2026-11-17).** `review10f`, with `a_cached_older_page_cut_off_every_time_ends_with_an_error` run alone, exited with SIGSEGV after every test passed, in about 1 run in 3 (9 of 15 in a control run). The fault was there on db45d78 too.
+- **Cause, from the `.ips` crash reports in `~/Library/Logs/DiagnosticReports`.** Every report showed the same two threads:
+  - The main thread was in `exit` → `__cxa_finalize_ranges` → `sqlcipher_atexit` → `sqlcipher_extra_shutdown` → `sqlcipher_internal_free`, freeing SQLCipher's global state.
+  - The faulting thread was `abyss-cache`, in `cache::worker::run` → drop `Cache` → `sqlite3_close` → `sqlite3PagerClose` → `sqlite3FreeCodecArg`, with `KERN_INVALID_ADDRESS`.
+  - So a worker was closing its connection while SQLCipher's exit-time teardown ran. SQLCipher 4.x tears down in both an `atexit` handler and a `__mod_term_func`.
+  - In the test, the test's own `CacheHandle` is never closed: `close_caches` only flushes caches it does not own. When the last handle dropped at the end of the test, the worker closed the database asynchronously, and the libtest main thread could exit first.
+  - The read gate (`CacheHandle::before`) and OpenSSL/CommonCrypto were not involved.
+- **Production was exposed.** The normal quit path was safe, because shutdown awaits `close` before the ack. But any worker that core does not close can still be inside SQLCipher when the app exits:
+  - a handle dropped without `close`;
+  - a close that runs past `CACHE_FLUSH`;
+  - an `open_cache` left running on a blocking thread after `shutdown_timeout` abandoned it (a shutdown during startup provisioning or the reopen after a logout);
+  - every exit that core does not control: `on_app_quit` (an OS-initiated quit, which GPUI gives 200 ms) and the UI's 6 s timeout.
+- **Fix.**
+  - `cache::census` keeps a per-directory count of open SQLCipher databases. `CacheHandle::spawn` takes an entry before `Cache::open`. The worker gives it up only after its connection is closed, on every path (`close`, `erase`, all handles dropped, failed spawn), and before it replies.
+  - The core thread waits for its cache directory to drain (`CACHE_CLOSE_WAIT` = 2 s, with a warning if it does not) before it sends the shutdown ack.
+  - `census::guard_exit` registers an `atexit` hook after SQLCipher's own, so it runs first. The hook waits up to `EXIT_WAIT` (3 s) for every entry. This covers the exits that core does not control.
+  - Actor cache tests use `CacheDir`. Its drop waits for every worker on the directory and asserts that none outlived the test.
+  - There is no `process::exit` and no skipped destructor.
+  - Test: `a_worker_leaves_the_census_only_after_closing`.
+- **Verification.**
+  - With only the exit hook (the test on a plain tempdir), or only `CacheDir` (the hook disabled), the trigger test passed 30 of 30 runs. With both disabled it failed 9 of 15.
+  - With both in place, the trigger test and the whole `review10f` filter each passed 30 of 30 runs.
+- **Residual.** If a worker is still inside SQLCipher when `EXIT_WAIT` runs out (for example, on a wedged disk at an OS quit), the race remains. Shutdown order is unchanged: the caches still close after the lifecycle shutdown.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.

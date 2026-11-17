@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use super::{Harness, cache_at, chat, harness, history_ids, open_settled, session};
+use super::{CacheDir, Harness, cache_at, chat, harness, history_ids, open_settled, session};
 use crate::actor::loads::MAX_OLDER_RESTARTS;
 use crate::api::{Command, Event, HistoryDir, LoadTarget, SendState, UserError, WindowState};
 use crate::backend::fake::{FakeScript, Fault, Op, text_message};
@@ -114,7 +114,7 @@ async fn an_older_load_cut_off_every_time_ends_with_an_error() {
 /// same budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cached_older_page_cut_off_every_time_ends_with_an_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     session(FakeScript::demo(1, 200), cache_at(dir.path(), &key), 2).await;
     let mut cache = cache_at(dir.path(), &key);

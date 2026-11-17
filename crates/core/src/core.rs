@@ -34,6 +34,8 @@ const INTERNAL_CAPACITY: usize = 8;
 const WORKERS: usize = 2;
 /// How long shutdown waits for spawned tasks after the actor stops.
 const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(1);
+/// How long the core thread then waits for its cache workers to close.
+const CACHE_CLOSE_WAIT: Duration = Duration::from_secs(2);
 
 /// Where the encrypted message cache lives. Core provisions its key.
 #[derive(Debug)]
@@ -286,6 +288,20 @@ struct Boot<B> {
     cancel: CancellationToken,
 }
 
+/// Before the shutdown ack: waits for every cache worker on core's cache
+/// directory to close its database. The actor closes the caches it holds,
+/// but a worker can outlive it: a handle dropped without `close`, a close
+/// past `CACHE_FLUSH`, or an open still running on a blocking thread that
+/// `shutdown_timeout` abandoned. The UI quits on the ack, and SQLCipher's
+/// exit-time teardown must not race a close (exit SIGSEGV, section 13).
+fn wait_caches_closed(dir: Option<&std::path::Path>) {
+    if let Some(dir) = dir
+        && !crate::cache::wait_closed(Some(dir), CACHE_CLOSE_WAIT)
+    {
+        tracing::warn!("a cache worker was still open at shutdown");
+    }
+}
+
 /// Starts the persistence worker over `store`, builds the backend over it
 /// (`make`), and runs the actor on the core thread.
 fn start_with<B: Backend>(
@@ -319,6 +335,7 @@ fn start_with<B: Backend>(
     std::thread::Builder::new()
         .name("abyss-core".into())
         .spawn(move || {
+            let cache_dir = boot.cache.as_ref().map(|c| c.dir.clone());
             let report = runtime.block_on(async move {
                 // Shutdown during startup (a stalled Keychain read or
                 // prompt): nothing was confirmed. The persistence worker is
@@ -332,6 +349,7 @@ fn start_with<B: Backend>(
                     .unwrap_or(ShutdownReport::UNCONFIRMED)
             });
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
+            wait_caches_closed(cache_dir.as_deref());
             let _ = done_tx.send(report);
         })
         .map_err(StartError::Thread)?;

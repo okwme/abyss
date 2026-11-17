@@ -20,6 +20,49 @@ async fn close_flushes_closes_and_stops_the_worker() {
     assert_eq!(ids(&db.tail(c, 10).unwrap()), vec![1]);
 }
 
+/// Exit SIGSEGV fix: a worker is in the census from before its open until
+/// its connection is closed, whether it stops by `close`, `erase`, or by
+/// every handle being dropped (with no reply anyone could wait on).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_leaves_the_census_only_after_closing() {
+    let (_t, dir, key) = setup();
+    let none = std::time::Duration::ZERO;
+    let enough = std::time::Duration::from_secs(10);
+    let census =
+        |d: std::path::PathBuf, t| tokio::task::spawn_blocking(move || wait_closed(Some(&d), t));
+    assert!(census(dir.clone(), none).await.unwrap());
+
+    let handle = CacheHandle::spawn(dir.clone(), &key).unwrap();
+    assert!(
+        !census(dir.clone(), none).await.unwrap(),
+        "open while a handle lives"
+    );
+    handle.close().await.unwrap();
+    assert!(
+        census(dir.clone(), none).await.unwrap(),
+        "closed before `close` replies"
+    );
+
+    let handle = CacheHandle::spawn(dir.clone(), &key).unwrap();
+    let c = user(1);
+    handle
+        .write(worker::CacheCmd::PutMessages(c, vec![msg(c, 1, "a")]))
+        .await;
+    drop(handle);
+    assert!(
+        census(dir.clone(), enough).await.unwrap(),
+        "dropped handles close"
+    );
+
+    let handle = CacheHandle::spawn(dir.clone(), &key).unwrap();
+    let erased = handle.erase(key, Box::new(|| Ok(()))).await;
+    assert!(erased.is_ok());
+    assert!(
+        census(dir, none).await.unwrap(),
+        "closed before `erase` replies"
+    );
+}
+
 fn user(id: i64) -> ChatId {
     ChatId {
         kind: PeerKind::User,

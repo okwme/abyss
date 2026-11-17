@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{Harness, cache_at, chat, harness};
+use super::{CacheDir, Harness, cache_at, chat, harness};
 use crate::actor::boot::{Boot, BootKind};
 use crate::actor::jobs::{Done, Outcome};
 use crate::actor::sends::{MAX_FLOOD_WAITS, MIN_FLOOD_WAIT};
@@ -67,7 +67,7 @@ fn actor_with(cache: CacheHandle) -> (Actor<FakeBackend>, EventReceiver) {
 /// buffered before it arrived. Returns what the window and the cache hold
 /// afterwards.
 async fn emptied_tail(kind: BootKind) -> (Vec<i32>, Vec<i32>) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     let cache = cache_at(dir.path(), &key);
     let (mut actor, _events) = actor_with(cache.clone());

@@ -563,6 +563,33 @@ async fn mark_read_coalesces_per_flush() {
 
 // ---- disk cache (real time) ----
 
+/// A temporary cache directory. Declared before the handles, it drops after
+/// them, and its drop waits until every worker on it has closed its
+/// database: the test's own handles, which `close_caches` only flushes, the
+/// actor's, and any open still on a blocking thread. So no SQLCipher close
+/// outlives its test and races the harness's exit (plan section 13, exit
+/// SIGSEGV fix).
+struct CacheDir(tempfile::TempDir);
+
+impl CacheDir {
+    fn new() -> Self {
+        Self(tempfile::tempdir().unwrap())
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+impl Drop for CacheDir {
+    fn drop(&mut self) {
+        let closed = crate::cache::wait_closed(Some(self.path()), Duration::from_secs(10));
+        if !std::thread::panicking() {
+            assert!(closed, "a cache worker outlived its test");
+        }
+    }
+}
+
 fn cache_at(dir: &std::path::Path, key: &CacheKey) -> CacheHandle {
     CacheHandle::spawn(dir.to_path_buf(), key).unwrap()
 }
@@ -594,7 +621,7 @@ async fn session(script: FakeScript, cache: CacheHandle, older: usize) -> FakeHa
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_serves_history_offline_then_reconciles() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     session(FakeScript::demo(1, 200), cache_at(dir.path(), &key), 2).await;
 
@@ -641,7 +668,7 @@ async fn cache_serves_history_offline_then_reconciles() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contiguous_cache_serves_older_pages_without_the_server() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     session(FakeScript::demo(1, 300), cache_at(dir.path(), &key), 3).await;
 
@@ -662,7 +689,7 @@ async fn contiguous_cache_serves_older_pages_without_the_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gap_in_cache_is_replaced_by_server_tail() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     session(FakeScript::demo(1, 100), cache_at(dir.path(), &key), 1).await;
 
@@ -679,7 +706,7 @@ async fn gap_in_cache_is_replaced_by_server_tail() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn erase_runs_after_queued_writes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     let cache = cache_at(dir.path(), &key);
     for i in 1..=100 {
@@ -708,7 +735,7 @@ async fn erase_runs_after_queued_writes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_chat_list_keeps_every_loaded_page() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     let cache = cache_at(dir.path(), &key);
     let mut h = harness(FakeScript::demo(150, 1), Some(cache.clone())).await;

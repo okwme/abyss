@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{Harness, cache_at, chat, harness, history_ids, session};
+use super::{CacheDir, Harness, cache_at, chat, harness, history_ids, session};
 use crate::actor::jobs::{Done, Job, Outcome};
 use crate::actor::{Actor, ActorInit, Internal};
 use crate::api::WindowState;
@@ -111,7 +111,7 @@ async fn refresh_removes_a_deleted_newest_message_and_empty_history() {
 /// server tail, including the newest one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_newest_message_deleted_on_the_server_is_dropped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     session(FakeScript::demo(1, 60), cache_at(dir.path(), &key), 0).await;
     let mut script = FakeScript::demo(1, 60);
