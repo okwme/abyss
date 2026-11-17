@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="abyss is a macOS messaging client. Telegram first. Links are copied, media stays a labelled chip. Not yet available to download.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+  <link rel="icon" href="data:,">
+  <title>abyss, an unofficial Telegram client</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --surface: #DDEBEE;
+      --shallows: #93B1B9;
+      --mid-water: #517C87;
+      --deep: #244F59;
+      --trench: #032C34;
+      --floor: #001318;
+      /* Text only: Floor with lightness reduced to zero, for AA on Mid water. */
+      --mid-text: #000000;
+      --serif: "Charter", "Bitstream Charter", "Iowan Old Style", Georgia, serif;
+      --sans: "Avenir Next", Avenir, system-ui, sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-behavior: auto; }
+    body {
+      margin: 0;
+      background: var(--floor);
+      color: var(--surface);
+      font-family: var(--sans);
+      font-size: 1.0625rem;
+      line-height: 1.6;
+      overflow-wrap: break-word;
+    }
+    h1, h2, p { margin: 0; }
+    h1, h2, .tagline { font-family: var(--serif); font-weight: 400; }
+    a { color: inherit; text-underline-offset: 0.25em; }
+    :focus-visible { outline: 3px solid currentColor; outline-offset: 6px; }
+    .skip-link {
+      position: absolute;
+      top: 1rem;
+      left: 1rem;
+      z-index: 1;
+      padding: 0.5rem 0.75rem;
+      background: var(--surface);
+      color: var(--floor);
+      transform: translateY(-200%);
+    }
+    .skip-link:focus { transform: none; }
+    .band { padding-inline: clamp(1.25rem, 6vw, 7rem); }
+    .inner { max-width: 76rem; margin-inline: auto; }
+    .surface { background: var(--surface); color: var(--floor); }
+    .shallows { background: var(--shallows); color: var(--floor); }
+    .mid-water { background: var(--mid-water); color: var(--mid-text); }
+    .deep { background: var(--deep); color: var(--surface); }
+    .trench { background: var(--trench); color: var(--surface); }
+    .floor { background: var(--floor); color: var(--surface); }
+
+    .hero { padding-block: clamp(3rem, 8vw, 7rem) clamp(4rem, 10vw, 9rem); }
+    .identity { display: flex; align-items: center; gap: 1.25rem; }
+    .mark { display: block; width: clamp(3.5rem, 8vw, 6rem); height: auto; flex: none; }
+    h1 { font-size: clamp(3.5rem, 8vw, 6rem); line-height: 1; letter-spacing: -0.04em; }
+    .tagline {
+      max-width: 15ch;
+      margin-top: clamp(3.5rem, 8vw, 7rem);
+      font-size: clamp(2.5rem, 6.5vw, 5.75rem);
+      line-height: 1.08;
+      letter-spacing: -0.035em;
+      text-wrap: balance;
+    }
+    .intro { max-width: 36rem; margin-top: 2rem; font-size: clamp(1.125rem, 2vw, 1.375rem); }
+    .availability { margin-top: 2rem; font-size: 0.9375rem; }
+    .claim { padding-block: clamp(3.5rem, 8vw, 7rem); }
+    .claim:first-of-type { border-top: 1px solid currentColor; }
+    .claim-grid {
+      display: grid;
+      grid-template-columns: 5.5rem minmax(0, 1fr) minmax(0, 1fr);
+      gap: 2rem;
+      align-items: start;
+    }
+    /* The claims are not a sequence, so each band is labelled with its tone, not a number. */
+    .stratum { padding-top: 0.6rem; font-size: 0.875rem; }
+    h2 { max-width: 17ch; font-size: clamp(2rem, 3.5vw, 3.25rem); line-height: 1.15; letter-spacing: -0.025em; text-wrap: balance; }
+    .detail { max-width: 31rem; padding-top: 0.35rem; font-size: clamp(1.0625rem, 1.5vw, 1.25rem); }
+    .detail p + p { margin-top: 1rem; }
+    .limits { padding-block: clamp(3.5rem, 8vw, 7rem) 2rem; border-top: 1px solid currentColor; }
+    .limits-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3rem; }
+    .limits-copy { max-width: 35rem; }
+    .limits-copy p + p { margin-top: 1.25rem; }
+    .legal { margin-top: clamp(4rem, 10vw, 8rem); font-size: 0.9375rem; }
+
+    @media (max-width: 44rem) {
+      .claim-grid { grid-template-columns: minmax(0, 1fr); gap: 0.75rem; }
+      .stratum { padding-top: 0; }
+      .detail { padding-top: 0.5rem; }
+      .limits-grid { grid-template-columns: minmax(0, 1fr); gap: 2rem; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation: none !important;
+        transition: none !important;
+        scroll-behavior: auto !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="band surface hero">
+    <div class="inner">
+      <div class="identity">
+        <svg class="mark" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
+          <defs>
+            <clipPath id="tile"><rect width="100" height="100" rx="22.5"/></clipPath>
+          </defs>
+          <g clip-path="url(#tile)">
+            <rect width="100" height="100" fill="#DDEBEE"/>
+            <rect x="10" y="12" width="80" height="80" rx="18" fill="#93B1B9"/>
+            <rect x="19" y="23" width="62" height="62" rx="14" fill="#517C87"/>
+            <rect x="27" y="33" width="46" height="46" rx="10.5" fill="#244F59"/>
+            <rect x="34.5" y="42" width="31" height="31" rx="7" fill="#032C34"/>
+            <rect x="41" y="50" width="18" height="18" rx="4" fill="#001318"/>
+          </g>
+        </svg>
+        <h1>abyss</h1>
+      </div>
+      <p class="tagline">Look in. Nothing looks back.</p>
+      <p class="intro">A quiet, hardened window onto the networks you message on. Telegram first.</p>
+      <p class="availability">macOS only. Not yet available to download.</p>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <!-- Eight content bands, six descending strata. The end tones each span two bands. -->
+    <section class="band surface claim" aria-labelledby="links">
+      <div class="inner claim-grid">
+        <span class="stratum" aria-hidden="true">Surface</span>
+        <h2 id="links">Message links are copied.</h2>
+        <div class="detail"><p>Links in messages are copied, never opened.</p></div>
+      </div>
+    </section>
+    <section class="band shallows claim" aria-labelledby="media">
+      <div class="inner claim-grid">
+        <span class="stratum" aria-hidden="true">Shallows</span>
+        <h2 id="media">A label for media.</h2>
+        <div class="detail"><p>Media is shown as a labelled chip. Nothing is downloaded or decoded in this version.</p></div>
+      </div>
+    </section>
+    <section class="band mid-water claim" aria-labelledby="cache">
+      <div class="inner claim-grid">
+        <span class="stratum" aria-hidden="true">Mid water</span>
+        <h2 id="cache">The key stays on this Mac.</h2>
+        <div class="detail"><p>The message cache on disk is encrypted with a key that stays in this Mac’s Keychain. Signing out destroys the key first, then the files.</p></div>
+      </div>
+    </section>
+    <section class="band deep claim" aria-labelledby="sending">
+      <div class="inner claim-grid">
+        <span class="stratum" aria-hidden="true">Deep</span>
+        <h2 id="sending">“Not sure it was sent.”</h2>
+        <div class="detail"><p>abyss tells you when it is not sure a message was sent.</p></div>
+      </div>
+    </section>
+    <section class="band trench claim" aria-labelledby="colour">
+      <div class="inner claim-grid">
+        <span class="stratum" aria-hidden="true">Trench</span>
+        <h2 id="colour">You choose the colour.</h2>
+        <div class="detail"><p>Pick a hue and how much of it, separately for night and day. Lightness is fixed, so text stays readable.</p></div>
+      </div>
+    </section>
+    <section class="band floor claim" aria-labelledby="age">
+      <div class="inner claim-grid">
+        <span class="stratum" aria-hidden="true">Floor</span>
+        <h2 id="age">Old conversations sink.</h2>
+        <div class="detail"><p>The list darkens with age, so you can see what is stale without reading dates.</p></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="band floor limits" aria-labelledby="limits">
+    <div class="inner">
+      <div class="limits-grid">
+        <h2 id="limits">The limits, plainly.</h2>
+        <div class="limits-copy">
+          <p>Telegram’s servers can still read cloud chats.</p>
+          <p>There are no secret chats, calls, stickers, browser or Mini Apps in this version.</p>
+          <p>abyss is macOS only. It is not yet available to download.</p>
+        </div>
+      </div>
+      <p class="legal">abyss is an unofficial Telegram client. It uses the Telegram API.</p>
+    </div>
+  </footer>
+</body>
+</html>

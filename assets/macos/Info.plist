@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>abyss</string>
+	<key>CFBundleDisplayName</key>
+	<string>abyss</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.abyss</string>
+	<key>CFBundleExecutable</key>
+	<string>abyss</string>
+	<key>CFBundleIconFile</key>
+	<string>abyss</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>@MIN_MACOS@</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.social-networking</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright 2026 the abyss contributors. Licensed under the Apache License, Version 2.0.</string>
+</dict>
+</plist>
