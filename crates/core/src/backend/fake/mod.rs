@@ -267,6 +267,8 @@ struct State {
     dialogs: Vec<ChatSummary>,
     history: HashMap<ChatId, Vec<Message>>,
     faults: HashMap<Op, VecDeque<Fault>>,
+    /// Extra waits before the next calls' faults or answers (`lead`).
+    leads: HashMap<Op, VecDeque<Duration>>,
     build_faults: VecDeque<BuildFault>,
     calls: HashMap<Op, usize>,
     sent: Vec<(ChatId, i64)>,
@@ -405,6 +407,18 @@ impl FakeHandle {
             let q = s.faults.entry(op).or_default();
             if q.len() < MAX_FAULTS {
                 q.push_back(fault);
+            }
+        });
+    }
+
+    /// Queues a one-shot wait for the next data call of `op`, before its
+    /// fault (if any) applies: with `inject`, a failure or panic that comes
+    /// late.
+    pub fn lead(&self, op: Op, wait: Duration) {
+        self.shared.with(|s| {
+            let q = s.leads.entry(op).or_default();
+            if q.len() < MAX_FAULTS {
+                q.push_back(wait);
             }
         });
     }
@@ -741,6 +755,12 @@ impl FakeClient {
     /// session gets `Unauthorized`.
     async fn enter(&self, op: Op) -> Result<InFlight<'_>, BackendError> {
         let fault = self.take_fault(op);
+        let lead = self
+            .shared
+            .with(|s| s.leads.get_mut(&op).and_then(VecDeque::pop_front));
+        if let Some(wait) = lead {
+            tokio::time::sleep(wait).await;
+        }
         self.enter_with(fault).await
     }
 

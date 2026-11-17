@@ -36,7 +36,7 @@ use std::collections::HashMap;
 
 use super::Actor;
 use super::apply::MIN_ID;
-use super::jobs::{Load, ReqId};
+use super::jobs::ReqId;
 use crate::api::{Event, HistoryDir};
 use crate::backend::Backend;
 use crate::model::{ChatId, MsgId};
@@ -56,9 +56,6 @@ pub(super) struct Cover {
     /// The covering fetch last begun; it runs while it is the chat's
     /// single-flight load (`ReqId`s are never reused).
     fetching: Option<ReqId>,
-    /// A user's `LoadOlder` was absorbed by the running fetch, which must
-    /// answer it (task 10e).
-    user_waits: bool,
 }
 
 /// Covers of chats with a `SentUnconfirmed` send awaiting one; an entry
@@ -67,13 +64,17 @@ pub(super) struct Cover {
 pub(super) struct Covers(HashMap<ChatId, Cover>);
 
 impl Covers {
-    /// Load `req` of `chat` completed. `Some(user_waits)` when it was the
-    /// running covering fetch (whether it absorbed a user's `LoadOlder`),
-    /// `None` for any other load.
-    pub(super) fn fetch_ended(&mut self, chat: ChatId, req: ReqId) -> Option<bool> {
-        let c = self.0.get_mut(&chat).filter(|c| c.fetching == Some(req))?;
+    /// Load `req` of `chat` completed or was dropped, whatever its view:
+    /// whether it was the running covering fetch (its page is then applied
+    /// with [`crate::store::Windows::prepend_fitting`]). Whether it answers
+    /// a user's `LoadOlder` it absorbed is the owed load's business
+    /// (`loads.rs`), not the cover's.
+    pub(super) fn fetch_ended(&mut self, chat: ChatId, req: ReqId) -> bool {
+        let Some(c) = self.0.get_mut(&chat).filter(|c| c.fetching == Some(req)) else {
+            return false;
+        };
         c.fetching = None;
-        Some(std::mem::take(&mut c.user_waits))
+        true
     }
 }
 
@@ -119,7 +120,6 @@ impl<B: Backend> Actor<B> {
             req,
             fetches: 0,
             fetching: None,
-            user_waits: false,
         };
         self.covers.0.insert(chat, cover);
         self.settle_cover(chat).await;
@@ -183,7 +183,7 @@ impl<B: Backend> Actor<B> {
         };
         if cover.fetches >= MAX_COVER_FETCHES
             || self.history_busy.contains_key(&chat)
-            || self.deferred.iter().any(|(c, _)| *c == chat)
+            || self.deferred.iter().any(|d| d.chat == chat)
             || !self.sends.awaits_cover(chat)
         {
             return;
@@ -203,38 +203,33 @@ impl<B: Backend> Actor<B> {
         if let Some(c) = self.covers.0.get_mut(&chat) {
             c.fetches = c.fetches.saturating_add(1);
             c.fetching = Some(load.req);
-            c.user_waits = false;
         }
         self.fetch_more(load, HistoryDir::Older, edge).await;
     }
 
-    /// Whether a `LoadOlder` of `chat` is answered by the covering fetch
-    /// running now: its page is what the user asked for, so the load is not
-    /// queued behind it (which would fetch the same page twice). The fetch
-    /// then owes the user an answer: its page, a restart when the page no
-    /// longer continues the window, or `LoadEnded` when it fails.
-    pub(super) fn absorb_older(&mut self, chat: ChatId) -> bool {
+    /// Whether a `LoadOlder` of `chat` (that already started over
+    /// `restarts` times) is answered by the covering fetch running now: its
+    /// page is what the user asked for, so the load is not queued behind it
+    /// (which would fetch the same page twice). The fetch then owes the
+    /// user an answer (`loads::Owed`): its page, a bounded restart when the
+    /// page no longer continues the window, or `LoadEnded` when it fails.
+    pub(super) fn absorb_older(&mut self, chat: ChatId, restarts: u8) -> bool {
         let Some(load) = self.history_busy.get(&chat).copied() else {
             return false;
         };
-        match self.covers.0.get_mut(&chat) {
-            Some(c) if c.fetching == Some(load.req) => {
-                c.user_waits = true;
-                true
-            }
-            _ => false,
+        let current = self
+            .windows
+            .get(chat)
+            .is_some_and(|w| w.view_gen() == load.view);
+        let fetching = self
+            .covers
+            .0
+            .get(&chat)
+            .is_some_and(|c| c.fetching == Some(load.req));
+        if !(current && fetching) {
+            return false;
         }
-    }
-
-    /// History load `load` in `dir` ended without its page (failed or
-    /// panicked): whether a load the UI asked for ends with it. A tail
-    /// answers none (a load deferred behind it still runs), and a covering
-    /// fetch only one it absorbed.
-    pub(super) fn answers_user(&mut self, load: Load, dir: HistoryDir) -> bool {
-        match dir {
-            HistoryDir::Tail => false,
-            HistoryDir::Newer => true,
-            HistoryDir::Older => self.covers.fetch_ended(load.chat, load.req).unwrap_or(true),
-        }
+        self.owe(load, restarts);
+        true
     }
 }

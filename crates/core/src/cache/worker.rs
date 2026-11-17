@@ -79,6 +79,39 @@ pub(crate) enum CacheCmd {
 #[derive(Clone, Debug)]
 pub struct CacheHandle {
     tx: mpsc::Sender<CacheCmd>,
+    /// Tests: older-history reads wait here for a permit.
+    #[cfg(all(test, feature = "fake"))]
+    gate: Option<std::sync::Arc<ReadGate>>,
+}
+
+/// Holds older-history reads (`CacheHandle::before`) until a test lets
+/// each one through, so a test can change the window while one is out.
+#[cfg(all(test, feature = "fake"))]
+#[derive(Debug)]
+pub(crate) struct ReadGate {
+    permits: tokio::sync::Semaphore,
+    entered: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(test, feature = "fake"))]
+impl ReadGate {
+    /// Lets one waiting (or the next) read through.
+    pub(crate) fn release(&self) {
+        self.permits.add_permits(1);
+    }
+
+    /// Reads that reached the gate so far.
+    pub(crate) fn entered(&self) -> usize {
+        self.entered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn pass(&self) {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(permit) = self.permits.acquire().await {
+            permit.forget();
+        }
+    }
 }
 
 impl std::fmt::Debug for CacheCmd {
@@ -103,7 +136,23 @@ impl CacheHandle {
             .name("abyss-cache".into())
             .spawn(move || run(cache, &dir, rx))
             .map_err(CacheError::Io)?;
-        Ok(CacheHandle { tx })
+        Ok(CacheHandle {
+            tx,
+            #[cfg(all(test, feature = "fake"))]
+            gate: None,
+        })
+    }
+
+    /// Tests: holds this handle's (and its later clones') older-history
+    /// reads at the returned gate.
+    #[cfg(all(test, feature = "fake"))]
+    pub(crate) fn gate_older_reads(&mut self) -> std::sync::Arc<ReadGate> {
+        let gate = std::sync::Arc::new(ReadGate {
+            permits: tokio::sync::Semaphore::new(0),
+            entered: std::sync::atomic::AtomicUsize::new(0),
+        });
+        self.gate = Some(std::sync::Arc::clone(&gate));
+        gate
     }
 
     async fn send(&self, cmd: CacheCmd) -> Result<(), WorkerError> {
@@ -139,6 +188,10 @@ impl CacheHandle {
         id: MsgId,
         limit: u32,
     ) -> Result<Vec<Message>, WorkerError> {
+        #[cfg(all(test, feature = "fake"))]
+        if let Some(gate) = &self.gate {
+            gate.pass().await;
+        }
         self.ask(|reply| CacheCmd::Before {
             chat,
             id,

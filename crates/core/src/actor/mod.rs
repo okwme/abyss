@@ -37,6 +37,7 @@ pub(crate) use binding::{Identity, provision_cache};
 use boot::Boot;
 use jobs::{CallCtx, Done, Job, Load, ReqId, TaskKind};
 use lifecycle::{Lifecycle, Live, LiveEvent, Phase, Reason};
+use loads::Deferred;
 pub(crate) use logout::CacheParts;
 pub(crate) use marker::{PendingLogout, read_pending_logout};
 
@@ -127,7 +128,9 @@ pub(crate) struct Actor<B: Backend> {
     history_busy: HashMap<ChatId, Load>,
     /// `LoadOlder`/`LoadNewer` asked while their chat's load ran; started
     /// when it ends (at most [`loads::MAX_DEFERRED`]).
-    deferred: Vec<(ChatId, HistoryDir)>,
+    deferred: Vec<loads::Deferred>,
+    /// The history load in flight that owes the UI its answer (task 10f).
+    owed: Option<loads::Owed>,
     /// Server history known to cover chats with `SentUnconfirmed` sends.
     covers: covered::Covers,
     /// Source of [`jobs::ReqId`]s.
@@ -216,6 +219,7 @@ impl<B: Backend> Actor<B> {
             last_refresh: Instant::now(),
             history_busy: HashMap::new(),
             deferred: Vec::with_capacity(loads::MAX_DEFERRED),
+            owed: None,
             covers: covered::Covers::default(),
             next_req: 0,
             dialogs_busy: false,
@@ -285,6 +289,7 @@ impl<B: Backend> Actor<B> {
             // User loads first; background coverage only when idle.
             self.run_deferred_loads().await;
             self.run_cover_fetch().await;
+            debug_assert!(self.owed_is_current(), "owed load of an old view");
             self.pump();
             self.sync_peers();
         }
@@ -419,7 +424,11 @@ impl<B: Backend> Actor<B> {
         for job in purged {
             match job {
                 Job::Dialogs { .. } => self.dialogs_busy = false,
-                Job::History { load, .. } => self.release_history(load),
+                Job::History { load, .. } => {
+                    self.release_history(load);
+                    self.covers.fetch_ended(load.chat, load.req);
+                    self.take_owed(load);
+                }
                 Job::Send { .. } | Job::Read { .. } => {}
             }
         }
@@ -476,9 +485,11 @@ impl<B: Backend> Actor<B> {
             }
             Some(TaskKind::History(load, dir)) => {
                 self.release_history(load);
-                // Only the failed load ends: a load deferred behind it still
-                // runs (and answers), so ending it too would answer it twice.
-                if self.answers_user(load, dir) {
+                // Only the load the UI waits on ends: a load deferred behind
+                // it still runs (and answers), and a load of an old view or a
+                // background load answers nothing (task 10f).
+                self.covers.fetch_ended(load.chat, load.req);
+                if self.take_owed(load).is_some() {
                     self.history_ended(load.chat, dir, Some(UserError::Internal))
                         .await;
                 }
@@ -530,8 +541,14 @@ impl<B: Backend> Actor<B> {
             Command::LoadDialogs => self.load_dialogs().await,
             Command::OpenChat(chat) => self.open_chat(chat).await,
             Command::CloseChat(chat) => self.close_chat(chat),
-            Command::LoadOlder(chat) => self.load_more(chat, HistoryDir::Older).await,
-            Command::LoadNewer(chat) => self.load_more(chat, HistoryDir::Newer).await,
+            Command::LoadOlder(chat) => {
+                self.load_more(Deferred::fresh(chat, HistoryDir::Older))
+                    .await;
+            }
+            Command::LoadNewer(chat) => {
+                self.load_more(Deferred::fresh(chat, HistoryDir::Newer))
+                    .await;
+            }
             Command::SendText {
                 chat,
                 text,
@@ -590,7 +607,9 @@ impl<B: Backend> Actor<B> {
     async fn open_chat(&mut self, chat: ChatId) {
         if let Some(prev) = self.open.filter(|p| *p != chat) {
             self.windows.close(prev);
+            self.forget_owed(prev);
         }
+        self.forget_owed(chat);
         // A detached window is not what the user asked for: start from the tail.
         if self.windows.get(chat).is_some_and(Window::has_newer) {
             self.windows.invalidate(chat);
@@ -660,6 +679,7 @@ impl<B: Backend> Actor<B> {
 
     fn close_chat(&mut self, chat: ChatId) {
         self.windows.close(chat);
+        self.forget_owed(chat);
         if self.open == Some(chat) {
             self.open = None;
         }
@@ -670,15 +690,20 @@ impl<B: Backend> Actor<B> {
     /// a load runs, it waits for that one, except that a covering fetch
     /// (`covered.rs`) already loads the older page. Answered by `History` in
     /// `dir`, or by `LoadEnded` (see `loads.rs`).
-    async fn load_more(&mut self, chat: ChatId, dir: HistoryDir) {
+    async fn load_more(&mut self, asked: Deferred) {
+        let Deferred {
+            chat,
+            dir,
+            restarts,
+        } = asked;
         if self.open != Some(chat) {
             return self.history_ended(chat, dir, None).await;
         }
-        if dir == HistoryDir::Older && self.absorb_older(chat) {
+        if dir == HistoryDir::Older && self.absorb_older(chat, restarts) {
             return; // the covering fetch running answers it
         }
         if self.history_busy.contains_key(&chat) {
-            return self.defer_load(chat, dir);
+            return self.defer_load(asked);
         }
         let Some(w) = self.windows.get(chat) else {
             return self.history_ended(chat, dir, None).await;
@@ -692,6 +717,7 @@ impl<B: Backend> Actor<B> {
             return self.history_ended(chat, dir, None).await;
         };
         let load = self.begin_load(chat, view);
+        self.owe(load, restarts);
         if let Some(cache) = self
             .cache
             .clone()
@@ -721,8 +747,12 @@ impl<B: Backend> Actor<B> {
         };
         if !self.enqueue(job).await {
             self.release_history(load);
-            self.history_ended(load.chat, dir, Some(UserError::Busy))
-                .await;
+            // A covering fetch that cannot be queued answers nobody.
+            self.covers.fetch_ended(load.chat, load.req);
+            if self.take_owed(load).is_some() {
+                self.history_ended(load.chat, dir, Some(UserError::Busy))
+                    .await;
+            }
         }
     }
 

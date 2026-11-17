@@ -80,6 +80,9 @@ pub(crate) struct ChatShell {
     /// When window activation last restarted retries that gave up
     /// (at most once per [`retry::AUTO_RESTART_GAP`]).
     auto_restart: Option<Instant>,
+    /// When a recovery the gap held back may run (the gap's end); the
+    /// retry wake-up runs it then (task 10f).
+    held_recovery: Option<Instant>,
     /// The one pending wake-up for retries, if one is scheduled.
     retry_timer: Option<RetryTimer>,
     /// Names wake-ups, so a stale one (replaced since) is ignored.
@@ -127,6 +130,7 @@ impl Default for ChatShell {
             focus_retry: Backoff::default(),
             frame_retry: Backoff::default(),
             auto_restart: None,
+            held_recovery: None,
             retry_timer: None,
             timer_gen: 0,
             conn: None,
@@ -354,9 +358,15 @@ impl ChatShell {
             .then(|| self.focus_retry.due(now))
             .flatten();
         let window = self.window.as_ref().and_then(|w| w.retry_due(now));
-        [self.list.retry_due(now), window, self.frame_retry.due(now)]
-            .into_iter()
-            .fold(focus, earliest)
+        let recovery = self.held_recovery.map(|at| at.max(now));
+        [
+            self.list.retry_due(now),
+            window,
+            self.frame_retry.due(now),
+            recovery,
+        ]
+        .into_iter()
+        .fold(focus, earliest)
     }
 
     /// A wake-up for `due` is to be scheduled unless one is already due no

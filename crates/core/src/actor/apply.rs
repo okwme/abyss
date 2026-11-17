@@ -6,6 +6,7 @@ use super::jobs::{
     CallError, CallResult, DialogsStep, Done, Load, Outcome, PAGE, ReqId, StreamEnd,
 };
 use super::lifecycle::Reason;
+use super::loads::Owed;
 use crate::api::{Event, HistoryDir, LoadTarget, UserError, WindowState};
 use crate::backend::{
     Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, StreamError, Update,
@@ -65,6 +66,16 @@ pub(super) struct HistoryReply {
     pub(super) covered: Option<Coverage>,
     pub(super) page: HistoryPage,
     pub(super) mode: TailMode,
+}
+
+/// What a completed history load was, taken from the actor's bookkeeping
+/// as it completes.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LoadEnd {
+    /// It was a covering fetch (`covered.rs`).
+    cover_fetch: bool,
+    /// It owed the UI its answer (`loads.rs`).
+    owed: Option<Owed>,
 }
 
 /// The ids a server page covered: its oldest and newest message as the
@@ -187,6 +198,13 @@ impl<B: Backend> Actor<B> {
             .filter(|b| req.dir == HistoryDir::Tail && b.awaits_tail(load))
             .map(|b| b.kind);
         self.release_history(load);
+        // Whatever the outcome or the view, the load's metadata goes now: a
+        // stale reply must not leave a covering fetch or an owed answer
+        // behind (task 10f).
+        let ended = LoadEnd {
+            cover_fetch: self.covers.fetch_ended(load.chat, load.req),
+            owed: self.take_owed(load),
+        };
         match res {
             Ok(page) => {
                 let mode = if boot == Some(BootKind::Refresh) {
@@ -205,11 +223,14 @@ impl<B: Backend> Actor<B> {
                     page,
                     mode,
                 };
-                self.on_history(reply).await;
+                self.on_history(reply, ended).await;
             }
             Err(e) => {
                 self.error(user_error(e)).await;
-                if self.answers_user(load, req.dir) {
+                // Only the load the UI waits on ends: never a tail (a load
+                // deferred behind it still runs), a background fetch, or a
+                // load of a view the UI no longer shows.
+                if ended.owed.is_some() {
                     self.history_ended(load.chat, req.dir, Some(user_error(e)))
                         .await;
                 }
@@ -355,6 +376,7 @@ impl<B: Backend> Actor<B> {
             return self.on_cache_tail(load, messages).await;
         }
         self.release_history(load);
+        let owed = self.take_owed(load);
         let Load { chat, view, .. } = load;
         let Some(anchor) = anchor else { return };
         if !self.is_current(chat, view) {
@@ -364,7 +386,9 @@ impl<B: Backend> Actor<B> {
         // `on_older`); a newer read needs no such check, since nothing but a
         // deletion changes a detached window's newest end.
         if dir == HistoryDir::Older && !self.starts_at(chat, anchor) {
-            self.defer_load(chat, dir);
+            if let Some(owed) = owed {
+                self.restart_older(owed).await;
+            }
             return;
         }
         // Only the server establishes either end of history: the cache never
@@ -384,21 +408,27 @@ impl<B: Backend> Actor<B> {
             HistoryDir::Older => self.windows.prepend(chat, view, page),
             _ => self.windows.append_newer(chat, view, page),
         };
+        let mut owed = owed;
         if let Ok(change) = res
             && !(short && change.inserted.is_empty())
         {
             self.emit_history(chat, view, dir, change).await;
+            owed = None; // answered
         }
         if !short {
             return;
         }
-        // The cache ran out; continue from the server at the new edge.
+        // The cache ran out; continue from the server at the new edge. The
+        // continuation answers the UI only if the cache page did not.
         let edge = self.windows.get(chat).and_then(|w| match dir {
             HistoryDir::Older => w.messages().front(),
             _ => w.messages().back(),
         });
         let edge = edge.map_or(anchor, |m| m.id);
         let load = self.begin_load(chat, view);
+        if let Some(owed) = owed {
+            self.owe(load, owed.restarts);
+        }
         self.fetch_more(load, dir, edge).await;
     }
 
@@ -428,7 +458,9 @@ impl<B: Backend> Actor<B> {
         self.start_tail(load, TailVia::Server).await;
     }
 
-    async fn on_history(&mut self, mut p: HistoryReply) {
+    /// A server page; `ended` says what its load was (its bookkeeping is
+    /// already cleared, so a stale page leaves nothing behind).
+    async fn on_history(&mut self, mut p: HistoryReply, ended: LoadEnd) {
         if self
             .windows
             .get(p.chat)
@@ -443,7 +475,7 @@ impl<B: Backend> Actor<B> {
         match p.dir {
             HistoryDir::Tail if p.mode == TailMode::Merge => self.merge_tail(p).await,
             HistoryDir::Tail => self.on_tail(p).await,
-            HistoryDir::Older => self.on_older(p).await,
+            HistoryDir::Older => self.on_older(p, ended).await,
             HistoryDir::Newer => {
                 let lo = match p.query {
                     HistoryQuery::After(id) => MsgId(id.0.saturating_add(1)),
@@ -470,8 +502,9 @@ impl<B: Backend> Actor<B> {
     /// then leave a hole above it that coverage could span (task 10e). A
     /// page that no longer continues the window is dropped; the user's load
     /// it answered (its own, or one a covering fetch absorbed) starts over
-    /// from the window's current edge.
-    async fn on_older(&mut self, p: HistoryReply) {
+    /// from the window's current edge, a bounded number of times
+    /// (`loads::restart_older`).
+    async fn on_older(&mut self, p: HistoryReply, ended: LoadEnd) {
         let hi = match p.query {
             HistoryQuery::Before(id) => MsgId(id.0.saturating_sub(1)),
             _ => MAX_ID,
@@ -485,21 +518,19 @@ impl<B: Backend> Actor<B> {
         if let Some(lo) = lo {
             self.reconcile(p.chat, lo, hi, &p.page.messages).await;
         }
-        // `Some(user_waits)` for a covering fetch.
-        let fetch = self.covers.fetch_ended(p.chat, p.req);
         let edge = match p.query {
             HistoryQuery::Before(edge) => Some(edge),
             _ => None,
         };
         if edge.is_some_and(|edge| !self.starts_at(p.chat, edge)) {
             tracing::debug!("older page no longer continues the window");
-            if fetch != Some(false) {
-                self.defer_load(p.chat, HistoryDir::Older);
+            if let Some(owed) = ended.owed {
+                self.restart_older(owed).await;
             }
             return;
         }
         // A page core fetched on its own never drops a message.
-        let applied = if fetch.is_some() {
+        let applied = if ended.cover_fetch {
             self.windows.prepend_fitting(p.chat, p.view, p.page)
         } else {
             self.windows.prepend(p.chat, p.view, p.page)
@@ -589,7 +620,8 @@ impl<B: Backend> Actor<B> {
         };
         // Loads deferred for the replaced view are over with it: the UI
         // forgets them on the new view's `Tail` and asks again if needed.
-        self.deferred.retain(|(c, _)| *c != chat);
+        self.deferred.retain(|d| d.chat != chat);
+        self.forget_owed(chat);
         if self.cache.is_some() && from.is_some() {
             self.windows.set_cache_contiguous(chat);
         }

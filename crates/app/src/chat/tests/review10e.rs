@@ -46,10 +46,35 @@ fn a_replaced_view_keeps_the_message_being_read(cx: &mut TestAppContext) {
     assert!(shell.rows().is_following_tail());
 }
 
+/// Attempts of each kind a refusing core saw.
+#[derive(Default)]
+struct Attempts {
+    window: std::cell::Cell<usize>,
+    viewing: std::cell::Cell<usize>,
+    older: std::cell::Cell<usize>,
+}
+
+impl Attempts {
+    fn count(&self, cmd: &Command) {
+        let counter = match cmd {
+            Command::Window(_) => &self.window,
+            Command::ViewingTail(_) => &self.viewing,
+            Command::LoadOlder(_) => &self.older,
+            _ => return,
+        };
+        counter.set(counter.get() + 1);
+    }
+}
+
 /// Finding 6: window activation used to reset every backoff, so toggling
 /// focus against a full queue asked again on every activation. Now an
 /// activation keeps a waiting retry's deadline, and restarts retries that
-/// gave up at most once per `AUTO_RESTART_GAP`.
+/// gave up at most once per `AUTO_RESTART_GAP`. Task 10f (round 18,
+/// finding 3): a toggle reset the focus backoff whenever no deadline was
+/// pending (also after it expired or gave up), so focus retries ran at
+/// `FIRST_DELAY` forever. Every kind of attempt is now bounded, and
+/// recovery still happens (a lower bound: on the 10e code `Window` was
+/// asked about 200 times, and without recovery each kind stops at 5).
 #[test]
 fn rapid_activation_keeps_retries_bounded() {
     let mut core = Core::default();
@@ -58,11 +83,18 @@ fn rapid_activation_keeps_retries_bounded() {
         first_row: 0,
         last_message: Some(49),
     });
-    let loads = std::cell::Cell::new(0usize);
+    // The live tail is on screen (admitted) before the queue fills, so
+    // each deactivation also asks for `ViewingTail(None)`.
+    let middle = Some(Seen {
+        first_row: 20,
+        last_message: Some(49),
+    });
+    shell.frame_seen(middle, now(), &mut core.admit()).unwrap();
+    assert!(viewing(&core.take()).contains(&Some(CHAT)));
+    let attempts = Attempts::default();
+    let loads = &attempts.older;
     let mut refuse = |cmd: Command| {
-        if matches!(cmd, Command::LoadOlder(_)) {
-            loads.set(loads.get() + 1);
-        }
+        attempts.count(&cmd);
         Err(Refused::Busy)
     };
     let step = Duration::from_millis(100);
@@ -82,11 +114,20 @@ fn rapid_activation_keeps_retries_bounded() {
     }
     let windows = span.as_secs().div_ceil(AUTO_RESTART_GAP.as_secs()) + 1;
     let bound = usize::from(MAX_FAILURES) * usize::try_from(windows).unwrap();
+    // At least two recoveries in 100 s: 3 runs of `MAX_FAILURES`.
+    let floor = 3 * usize::from(MAX_FAILURES);
+    for (kind, counter) in [
+        ("Window", &attempts.window),
+        ("ViewingTail", &attempts.viewing),
+        ("LoadOlder", &attempts.older),
+    ] {
+        let n = counter.get();
+        assert!(
+            (floor..=bound).contains(&n),
+            "{n} {kind} attempts in 100 s (between {floor} and {bound})"
+        );
+    }
     let asked = loads.get();
-    assert!(
-        asked <= bound,
-        "{asked} attempts in 100 s (at most {bound})"
-    );
     // The user's Retry is not limited: it asks at once.
     shell.retry_loads();
     let _ = shell.frame_seen(top, t, &mut refuse);

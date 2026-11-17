@@ -232,6 +232,7 @@ impl<B: Backend> Actor<B> {
             self.purge_queued();
             // Deferred loads were for windows that are invalidated now.
             self.deferred.clear();
+            self.owed = None;
             for (chat, _) in self.windows.invalidate_all() {
                 self.emit(Event::ChatInvalidated(chat)).await;
             }

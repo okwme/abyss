@@ -237,9 +237,12 @@ impl ChatShell {
     /// The window gained or lost focus. The shell follows at once (no read
     /// mark and no live tail while inactive); core is told now, or, if it
     /// refuses, after a backoff ([`Self::retry_due`]): a backoff that still
-    /// runs keeps its deadline and then sends the latest state. Activation
-    /// is an automatic recovery ([`Self::auto_recover`]), not the user's
-    /// Retry: it never brings a waiting retry forward.
+    /// runs keeps its deadline and then sends the latest state. A toggle
+    /// never resets the focus backoff either: its failures keep counting
+    /// after a deadline passed, and once it gave up only a recovery restarts
+    /// it (task 10f). Activation is an automatic recovery
+    /// ([`Self::auto_recover`]), not the user's Retry: it never brings a
+    /// waiting retry forward.
     pub(crate) fn set_focus(
         &mut self,
         state: WindowState,
@@ -248,10 +251,6 @@ impl ChatShell {
     ) -> Result<(), Refused> {
         if self.active != state {
             self.active = state;
-            // A new state for core: start afresh unless a backoff runs.
-            if self.focus_retry.due(now).is_none() {
-                self.focus_retry.reset();
-            }
             if state == WindowState::Active {
                 self.auto_recover(now);
             }
@@ -266,17 +265,26 @@ impl ChatShell {
     /// Automatic recovery (window activation): retries that gave up start
     /// over, at most once per [`AUTO_RESTART_GAP`]; retries that wait keep
     /// their deadline. Rapid activation therefore cannot multiply attempts.
+    /// A recovery the gap holds back is not lost: it runs from the retry
+    /// wake-up once the gap ends ([`Self::retry_due`], task 10f), so chat B
+    /// still recovers after chat A used the allowance.
     fn auto_recover(&mut self, now: Instant) {
-        let exhausted = self.frame_retry.gave_up()
+        let exhausted = self.focus_retry.gave_up()
+            || self.frame_retry.gave_up()
             || self.list.exhausted()
             || self.window.as_ref().is_some_and(MessageWindow::exhausted);
-        let recent = self
-            .auto_restart
-            .is_some_and(|at| now.saturating_duration_since(at) < AUTO_RESTART_GAP);
-        if !exhausted || recent {
+        if !exhausted {
+            return;
+        }
+        if let Some(at) = self.auto_restart
+            && now.saturating_duration_since(at) < AUTO_RESTART_GAP
+        {
+            self.held_recovery = at.checked_add(AUTO_RESTART_GAP);
             return;
         }
         self.auto_restart = Some(now);
+        self.held_recovery = None;
+        self.focus_retry.restart_if_exhausted();
         self.frame_retry.restart_if_exhausted();
         self.list.recover();
         if let Some(w) = self.window.as_mut() {
@@ -289,6 +297,7 @@ impl ChatShell {
     /// called from rendering, nor on activation (see [`Self::set_focus`]).
     /// Reconnection is paced by core's own rebuild backoff.
     pub(crate) fn fresh_trigger(&mut self) {
+        self.held_recovery = None;
         self.focus_retry.reset();
         self.frame_retry.reset();
         self.list.retry_now();
@@ -315,10 +324,18 @@ impl ChatShell {
         self.fresh_trigger();
     }
 
-    /// The current retry wake-up fired ([`Self::retry_fired`]): resends what
-    /// is due now, focus if its backoff allows and a dialogs page; the caller
-    /// then redraws, so the frame check retries the rest.
+    /// The current retry wake-up fired ([`Self::retry_fired`]): runs a
+    /// recovery the gap held back once it is due (while the window is still
+    /// active), then resends what is due now, focus if its backoff allows
+    /// and a dialogs page; the caller then redraws, so the frame check
+    /// retries the rest.
     pub(crate) fn retry_wakeup(&mut self, now: Instant, admit: Admit<'_>) -> Result<(), Refused> {
+        if self.held_recovery.is_some_and(|at| at <= now) {
+            self.held_recovery = None;
+            if self.active == WindowState::Active {
+                self.auto_recover(now);
+            }
+        }
         let focus = if self.focus_out_of_sync() && self.focus_retry.ready(now) {
             self.sync_focus(now, admit)
         } else {
