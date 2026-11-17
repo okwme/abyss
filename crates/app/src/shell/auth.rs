@@ -383,6 +383,15 @@ impl AuthView {
         )
     }
 
+    /// A logout overlay hides the account's UI, which is kept: its live
+    /// tail is not on screen (review round 28).
+    pub(crate) fn hides_account(&self) -> bool {
+        matches!(
+            self,
+            AuthView::LogoutStarting | AuthView::LogoutNotStarted { .. }
+        )
+    }
+
     /// A countdown is running on this screen (flood wait, code resend).
     pub(crate) fn ticking_until(&self) -> Option<Instant> {
         match self {
@@ -551,6 +560,8 @@ mod tests {
         let starting = at(AuthState::LogoutStarting);
         assert_eq!(starting, AuthView::LogoutStarting);
         assert!(!starting.tears_down());
+        assert!(starting.hides_account() && user.hides_account());
+        assert!(!AuthView::SignedIn.hides_account());
         assert_eq!(back(&starting, None), Back::None);
         let server = AuthView::LogoutNotStarted {
             trigger: LogoutTrigger::Server,

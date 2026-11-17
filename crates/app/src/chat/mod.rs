@@ -168,6 +168,14 @@ impl ChatShell {
         };
         *self = fresh;
     }
+
+    /// The account went behind a logout overlay ("Logging out", "Couldn't
+    /// start logout"): its tail is no longer on screen. Core forgot it too
+    /// (review round 28), so no command is needed; the next frame that
+    /// paints the chat again reports it.
+    pub(crate) fn hidden(&mut self) {
+        self.viewing = None;
+    }
 }
 
 #[cfg(test)]

@@ -824,6 +824,43 @@ mod fake {
         sent.iter().filter(|c| c.starts_with(prefix)).count()
     }
 
+    /// Review round 28, finding 4: a logout overlay hides the chat, so its
+    /// tail is no longer viewed (core forgot it too); after "Stay signed
+    /// in" the tail is reported again once the chat is painted.
+    #[gpui::test]
+    fn a_logout_overlay_withdraws_the_viewed_tail(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        open_chat(&root, cx, &harness, 1..=30, More::Start);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(read(&root, cx, |s| s.shell.viewing()), Some(CHAT));
+        core_says(&harness, cx, AuthState::LogoutStarting);
+        assert_eq!(read(&root, cx, |s| s.shell.viewing()), None, "hidden");
+        core_says(
+            &harness,
+            cx,
+            AuthState::LogoutNotStarted {
+                error: abyss_core::api::StorageError::Keychain,
+                trigger: abyss_core::api::LogoutTrigger::User,
+            },
+        );
+        assert_eq!(read(&root, cx, |s| s.shell.viewing()), None);
+        let from = harness.sent.borrow().commands.len();
+        core_says(
+            &harness,
+            cx,
+            AuthState::SignedIn {
+                display_name: "A".into(),
+                new_login: None,
+            },
+        );
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let sent = commands_since(&harness, from);
+        assert_eq!(count(&sent, "ViewingTail(Some"), 1, "{sent:?}");
+        assert_eq!(read(&root, cx, |s| s.shell.viewing()), Some(CHAT));
+    }
+
     /// Task 10c, finding 1 (HIGH), through the real window: a deactivation
     /// core refuses still stops read marks and the live tail, and core is
     /// told once the backoff ends.

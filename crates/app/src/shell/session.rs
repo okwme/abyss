@@ -267,6 +267,8 @@ impl Session {
         let ticking = next.ticking_until().is_some() && self.auth.ticking_until().is_none();
         if next.tears_down() {
             self.reset_account(window, cx);
+        } else if next.hides_account() {
+            self.shell.hidden();
         }
         if let AuthView::Code { sent, .. } = &next {
             let max = sent.as_ref().map_or(MAX_CODE_DIGITS, |s| s.max_digits);

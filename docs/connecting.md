@@ -133,12 +133,15 @@ until Retry succeeds.
 
 abyss records in the Keychain that a logout is in progress, and does nothing
 else until that record is saved. Meanwhile it shows **Logging out**: your
-chats stay, but nothing new is sent (a message you discard is still
-cancelled). If it cannot be saved (for example, the
+chats stay, but nothing new is sent. A message you write then is kept as
+failed, and automatic resends (after a Telegram flood wait, say) wait.
+A message already handed to Telegram before you logged out cannot be
+taken back. If the record cannot be saved (for example, the
 Keychain is locked), abyss shows **Couldn't start logout**: nothing was
 ended or deleted, you are still signed in on this Mac, and you can **Retry**
-or **Stay signed in**. A logout Telegram started (it ended the session)
-offers only Retry.
+or **Stay signed in**, which resumes the waiting resends; a message kept
+as failed is sent with its **Retry**. A logout Telegram started (it ended
+the session) offers only Retry.
 
 Once the record is saved, a logout that is interrupted (abyss quits or
 crashes before the deletion finishes) or whose deletion failed is finished

@@ -117,6 +117,15 @@ impl PendingSends {
         self.map.get(&id).map(|p| p.state)
     }
 
+    /// A send job taken back from the queue before it ran: not in flight,
+    /// and its attempt not made. It stays `Sending`, for a replay.
+    pub(super) fn unqueue(&mut self, id: LocalId) {
+        if let Some(p) = self.map.get_mut(&id) {
+            p.in_flight = false;
+            p.attempts = p.attempts.saturating_sub(1);
+        }
+    }
+
     fn insert(&mut self, id: LocalId, p: Pending) {
         self.map.insert(id, p);
         self.rev = self.rev.wrapping_add(1);
@@ -268,21 +277,45 @@ impl<B: Backend> Actor<B> {
     }
 
     pub(super) async fn send_text(&mut self, chat: ChatId, text: String, local_id: LocalId) {
-        if self.sends.map.contains_key(&local_id) {
-            self.error(UserError::Busy).await;
+        if self.admit_send(chat, text, local_id).await {
+            self.dispatch_send(local_id).await;
+        }
+    }
+
+    /// A new send refused while a logout hides the account (review round
+    /// 28): validated and kept `Failed`, never dispatched, so Retry sends
+    /// it after "Stay signed in".
+    pub(super) async fn hold_send(&mut self, chat: ChatId, text: String, local_id: LocalId) {
+        if !self.admit_send(chat, text, local_id).await {
             return;
         }
-        if self.sends.map.len() >= MAX_PENDING_SENDS {
+        if let Some(p) = self.sends.map.get_mut(&local_id) {
+            p.state = SendState::Failed;
+        }
+        self.send_state(local_id, SendState::Failed).await;
+    }
+
+    /// Validates a new send and enters it in the (bounded) table as
+    /// `Sending`, undispatched. `false`: refused, and answered.
+    async fn admit_send(&mut self, chat: ChatId, text: String, local_id: LocalId) -> bool {
+        if self.sends.map.contains_key(&local_id) {
             self.error(UserError::Busy).await;
-            return self.send_state(local_id, SendState::Failed).await;
+            return false;
         }
-        if !sendable(&text) {
-            self.error(UserError::Rejected).await;
-            return self.send_state(local_id, SendState::Failed).await;
-        }
-        let Some(random_id) = random_id() else {
-            self.error(UserError::Internal).await;
-            return self.send_state(local_id, SendState::Failed).await;
+        let refused = if self.sends.map.len() >= MAX_PENDING_SENDS {
+            Some(UserError::Busy)
+        } else if !sendable(&text) {
+            Some(UserError::Rejected)
+        } else {
+            None
+        };
+        let random_id = match (refused, random_id()) {
+            (None, Some(id)) => id,
+            (refused, _) => {
+                self.error(refused.unwrap_or(UserError::Internal)).await;
+                self.send_state(local_id, SendState::Failed).await;
+                return false;
+            }
         };
         // `None` sorts below every id: the newest of what is known.
         let floor = self
@@ -302,16 +335,22 @@ impl<B: Backend> Actor<B> {
             floor,
         };
         self.sends.insert(local_id, pending);
-        self.dispatch_send(local_id).await;
+        true
     }
 
     /// Retries a failed or unknown send with its original `random_id`.
+    /// Every retry is answered with a state, as the UI shows "Sending"
+    /// once it was queued: an unknown send is `Failed` (Discard removes
+    /// it), a busy one keeps its state.
     pub(super) async fn retry_send(&mut self, local_id: LocalId) {
         let Some(p) = self.sends.map.get_mut(&local_id) else {
-            return self.error(UserError::NotFound).await;
+            self.error(UserError::NotFound).await;
+            return self.send_state(local_id, SendState::Failed).await;
         };
         if !matches!(p.state, SendState::Failed | SendState::Unknown { .. }) {
-            return self.error(UserError::Busy).await;
+            let state = p.state;
+            self.error(UserError::Busy).await;
+            return self.send_state(local_id, state).await;
         }
         p.attempts = 0;
         p.flood_waits = 0;
@@ -377,6 +416,10 @@ impl<B: Backend> Actor<B> {
     /// Resends the sends whose flood wait has ended (or keeps them `Sending`
     /// for the next `Online`).
     pub(super) async fn resume_flooded_sends(&mut self) {
+        if self.logout_gate.hides_account() {
+            // Their deadlines stay; the timer is paused too.
+            return;
+        }
         for local_id in self.sends.take_due(Instant::now()) {
             self.dispatch_auto(local_id).await;
         }
@@ -389,6 +432,10 @@ impl<B: Backend> Actor<B> {
     /// replay it past the window. Past it the send is `Failed`, after
     /// `Error(FloodWait)`, as when the wait itself is too long.
     async fn dispatch_auto(&mut self, local_id: LocalId) {
+        if self.logout_gate.hides_account() {
+            // Left as it is: replayed (or resumed) after "Stay signed in".
+            return;
+        }
         let Some(p) = self.sends.map.get_mut(&local_id) else {
             return;
         };

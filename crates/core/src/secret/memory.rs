@@ -85,6 +85,8 @@ struct Faults {
     /// Reads and writes of these items fail (one bit per item).
     failing_gets: AtomicU8,
     failing_sets: AtomicU8,
+    /// Operations on these items block until released (one bit per item).
+    held_items: AtomicU8,
     calls: AtomicU64,
     held: Mutex<bool>,
     released: Condvar,
@@ -163,11 +165,27 @@ impl FaultControl {
         }
     }
 
+    /// Blocks every subsequent operation on `item` until [`Self::release`]
+    /// (at most 10 s): a Keychain prompt for one item nobody answers.
+    pub fn hold_item(&self, item: SecretItem) {
+        self.0.held_items.fetch_or(item_bit(item), Ordering::SeqCst);
+    }
+
+    /// Ends [`Self::hold`] and every [`Self::hold_item`].
     pub fn release(&self) {
         if let Ok(mut held) = self.0.held.lock() {
             *held = false;
+            self.0.held_items.store(0, Ordering::SeqCst);
         }
         self.0.released.notify_all();
+    }
+
+    /// Waits while `item` is held (bounded like [`Self::hold`]).
+    fn wait_item(&self, item: SecretItem) {
+        let held = |_: &mut bool| self.0.held_items.load(Ordering::SeqCst) & item_bit(item) != 0;
+        if let Ok(guard) = self.0.held.lock() {
+            let _ = self.0.released.wait_timeout_while(guard, MAX_HOLD, held);
+        }
     }
 
     /// Number of operations started so far.
@@ -221,6 +239,7 @@ impl<S: SecretStore> FaultyStore<S> {
 impl<S: SecretStore> SecretStore for FaultyStore<S> {
     fn get(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
         self.control.before(StoreOp::Get)?;
+        self.control.wait_item(item);
         if FaultControl::item_fails(&self.control.0.failing_gets, item) {
             return Err(StoreError::Injected);
         }
@@ -229,6 +248,7 @@ impl<S: SecretStore> SecretStore for FaultyStore<S> {
 
     fn set(&self, item: SecretItem, secret: &[u8]) -> Result<(), StoreError> {
         self.control.before(StoreOp::Set)?;
+        self.control.wait_item(item);
         if FaultControl::item_fails(&self.control.0.failing_sets, item) {
             return Err(StoreError::Injected);
         }
@@ -237,6 +257,7 @@ impl<S: SecretStore> SecretStore for FaultyStore<S> {
 
     fn delete(&self, item: SecretItem) -> Result<(), StoreError> {
         self.control.before(StoreOp::Delete)?;
+        self.control.wait_item(item);
         if self.control.delete_fails(item) {
             return Err(StoreError::Injected);
         }

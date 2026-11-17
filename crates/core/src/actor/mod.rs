@@ -16,6 +16,7 @@ mod logout;
 mod marker;
 mod merge;
 mod onboarding;
+mod paused;
 mod peers;
 mod sends;
 #[cfg(all(test, feature = "fake"))]
@@ -263,7 +264,11 @@ impl<B: Backend> Actor<B> {
             let baseline_by = self.boot.as_ref().and_then(Boot::baseline_deadline);
             let refresh_at = self.refresh_due();
             let flood_over = self.auth.flood_deadline();
-            let send_due = self.sends.next_due();
+            // Paused while a logout hides the account (`paused`).
+            let send_due = self
+                .sends
+                .next_due()
+                .filter(|_| !self.logout_gate.hides_account());
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
@@ -550,7 +555,10 @@ impl<B: Backend> Actor<B> {
         }
         let current = epoch == self.events.epoch();
         let signed_in = self.auth.signed_in && !matches!(self.life.phase, Phase::LoggingOut(_));
-        if current && signed_in && !self.logout_gate.refuses(&cmd) {
+        if current && signed_in {
+            if self.logout_gate.refuses(&cmd) {
+                return self.refused_behind_logout(cmd).await;
+            }
             return self.on_command(cmd).await;
         }
         tracing::debug!(current, signed_in, "account command refused");

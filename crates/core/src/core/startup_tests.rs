@@ -199,3 +199,43 @@ async fn unreadable_marker_opens_no_cache_until_the_retry() {
         Duration::from_secs(10)
     ));
 }
+
+/// Review round 28, finding 1: `RetryStartup` finds the marker absent and
+/// provisions the cache, whose key read stalls (a Keychain prompt nobody
+/// answers). Shutdown is still acknowledged by its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_during_a_stalled_deferred_cache_provisioning_acks_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = MemoryStore::new();
+    let session = crate::session::signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH);
+    inner.set(SecretItem::Session, &session).unwrap();
+    let (store, control) = FaultyStore::new(inner);
+    control.fail_get_of(SecretItem::LogoutPending);
+    let config = CoreConfig {
+        cache: Some(CacheConfig {
+            dir: dir.path().to_path_buf(),
+        }),
+        ..CoreConfig::default()
+    };
+    let (fake, _h) = FakeBackend::new(FakeScript::demo(1, 1));
+    let mut core = start_with(config, move |_| fake, store, || {}).unwrap();
+    next_matching(&mut core, |e| {
+        matches!(e, Event::Auth(AuthState::StartupBlocked { .. }))
+    })
+    .await;
+    control.hold_item(SecretItem::CacheKey);
+    control.heal_item(SecretItem::LogoutPending);
+    core.send(Command::RetryStartup).unwrap();
+    // Until the provisioning is stalled on the key.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = Instant::now();
+    let done = core.begin_shutdown().unwrap();
+    let acked = tokio::time::timeout(SHUTDOWN_DEADLINE + Duration::from_secs(2), done).await;
+    let elapsed = started.elapsed();
+    control.release();
+    assert!(acked.is_ok(), "no shutdown ack after {elapsed:?}");
+    assert!(crate::cache::wait_closed(
+        Some(dir.path()),
+        Duration::from_secs(15)
+    ));
+}

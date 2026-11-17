@@ -23,6 +23,7 @@ mod review6c;
 mod review6d;
 mod review6e;
 mod review6f;
+mod review6g;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -294,9 +295,17 @@ impl Harness {
         std::iter::from_fn(|| self.events.try_recv()).collect()
     }
 
-    async fn stop(self) -> ShutdownReport {
+    /// Shuts the actor down; fails after [`REAL_WAIT`] of wall time rather
+    /// than hang (review round 28).
+    async fn stop(mut self) -> ShutdownReport {
         self.cancel.cancel();
-        self.join.await.unwrap()
+        let started = std::time::Instant::now();
+        loop {
+            assert!(started.elapsed() < REAL_WAIT, "the actor did not shut down");
+            if let Ok(report) = tokio::time::timeout(WAIT_SLICE, &mut self.join).await {
+                return report.unwrap();
+            }
+        }
     }
 
     /// Waits for an auth state matching `pred`.

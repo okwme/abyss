@@ -32,10 +32,7 @@ use super::Actor;
 use super::auth::AuthMsg;
 use super::lifecycle::{LogoutStage, Phase, Step};
 use super::logout::RemotePlan;
-use crate::api::{
-    AuthState, Command, Event, HistoryDir, LoadTarget, LogoutTrigger, RemoteLogout, SendState,
-    StorageError, UserError,
-};
+use crate::api::{AuthState, Command, LogoutTrigger, RemoteLogout, StorageError, UserError};
 use crate::backend::Backend;
 use crate::secret::StoreError;
 use crate::session::PersistHandle;
@@ -162,15 +159,26 @@ impl LogoutGate {
         self.marking.is_some()
     }
 
-    /// While the marker is written, the logout counts as begun for what
-    /// would act for the account: a send or a retry the UI queued behind
-    /// it is refused, as during the teardown (review rounds 19 and 25). The
-    /// rest acts as if it had come before the Logout (the account is
-    /// unchanged until the marker is durable, and the teardown ends what is
-    /// in flight then): reads and loads are answered as usual, and a
-    /// discard still cancels its send, automatic retries included.
+    /// The account is hidden behind "Logging out" or "Couldn't start
+    /// logout": nothing new is sent for it, automatic retries included,
+    /// and its live tail counts as unseen (`actor::paused`).
+    pub(super) fn hides_account(&self) -> bool {
+        self.marking.is_some() || self.blocked.is_some()
+    }
+
+    /// While the account is hidden, the logout counts as begun for what
+    /// would act for the account: a send, a retry, or a report that its
+    /// tail is on screen, as during the teardown (review rounds 19, 25 and
+    /// 28). The rest acts as if it had come before the Logout (the account
+    /// is unchanged until the marker is durable, and the teardown ends what
+    /// is in flight then): reads and loads are answered as usual, and a
+    /// discard still cancels its send.
     pub(super) fn refuses(&self, cmd: &Command) -> bool {
-        self.is_marking() && matches!(cmd, Command::SendText { .. } | Command::RetrySend(_))
+        self.hides_account()
+            && matches!(
+                cmd,
+                Command::SendText { .. } | Command::RetrySend(_) | Command::ViewingTail(Some(_))
+            )
     }
 
     pub(super) fn take_blocked(&mut self) -> Option<(Marking, StorageError)> {
@@ -215,6 +223,7 @@ impl<B: Backend> Actor<B> {
     /// logout starts only when the write succeeded (`on_logout_marked`).
     pub(super) async fn begin_marking(&mut self, marking: Marking) {
         self.logout_gate.marking = Some(marking);
+        self.hide_account();
         self.emit_auth().await;
         let persist = self.persist.clone();
         let tx = self.auth.sender();
@@ -244,40 +253,6 @@ impl<B: Backend> Actor<B> {
                 self.logout_gate.put_blocked(marking, error);
                 self.emit_auth().await;
             }
-        }
-    }
-
-    /// Answers an account command refused in the UI's epoch, so no UI state
-    /// waits on it (review round 25, finding 1): a send ends `Failed`, a
-    /// retry goes back to its send's state, a load ends `Busy`.
-    pub(super) async fn acknowledge_refused(&mut self, cmd: Command) {
-        match cmd {
-            Command::SendText { local_id, .. } => {
-                self.emit(Event::SendState {
-                    local_id,
-                    state: SendState::Failed,
-                })
-                .await;
-            }
-            Command::RetrySend(local_id) => {
-                if let Some(state) = self.sends.state_of(local_id) {
-                    self.emit(Event::SendState { local_id, state }).await;
-                }
-            }
-            Command::LoadDialogs => {
-                self.load_ended(LoadTarget::Dialogs, Some(UserError::Busy))
-                    .await;
-            }
-            Command::LoadOlder(chat) => {
-                self.history_ended(chat, HistoryDir::Older, Some(UserError::Busy))
-                    .await;
-            }
-            Command::LoadNewer(chat) => {
-                self.history_ended(chat, HistoryDir::Newer, Some(UserError::Busy))
-                    .await;
-            }
-            // Nothing waits on these.
-            _ => {}
         }
     }
 
@@ -335,7 +310,16 @@ impl<B: Backend> Actor<B> {
         self.backend.use_account(self.account.clone());
         self.forget_instance_session();
         self.auth.signed_in = self.account.is_signed_in().unwrap_or(false);
-        self.reprovision_cache(identity).await;
+        // The cache key may prompt (or stall): shutdown must not wait on it
+        // (review round 28). A blocking open already scheduled stays in the
+        // cache census (`cache::open_blocking`), so the exit still waits for
+        // it to close.
+        let cancel = self.cancel.clone();
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = self.reprovision_cache(identity) => {}
+        }
         // Out of the blocked startup before the credentials resolve: a
         // credential error is shown, not taken for a logout's (review round
         // 25, finding 2). `start_build` below sets the same phase.

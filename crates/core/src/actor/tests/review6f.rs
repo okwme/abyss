@@ -14,15 +14,24 @@ use crate::credentials::EnvResolution;
 use crate::model::LocalId;
 use crate::secret::{MemoryStore, SecretItem, SecretStore};
 
-/// Online, with `LocalId(1)` flood-waited for 599 s (its automatic window
-/// is 600 s).
-async fn flooded() -> Harness {
-    let mut h = super::harness(FakeScript::demo(1, 1), None).await;
+/// Online with chat 1 open (older history exists), and `LocalId(1)`
+/// flood-waited for `seconds` (its automatic window is 600 s).
+pub(super) async fn flooded(seconds: u32) -> Harness {
+    let mut h = super::harness(FakeScript::demo(1, 120), None).await;
     h.online().await;
-    h.fake.inject(
-        Op::Send,
-        Fault::Error(BackendError::FloodWait { seconds: 599 }),
-    );
+    h.send(Command::OpenChat(chat(1))).await;
+    h.until(|e| {
+        matches!(
+            e,
+            Event::History {
+                dir: HistoryDir::Tail,
+                ..
+            }
+        )
+    })
+    .await;
+    h.fake
+        .inject(Op::Send, Fault::Error(BackendError::FloodWait { seconds }));
     h.send(Command::SendText {
         chat: chat(1),
         text: "hi".into(),
@@ -42,16 +51,35 @@ async fn flooded() -> Harness {
     h
 }
 
+/// An answer to a `LoadOlder` of chat 1: its page, or its end.
+fn older_answer(e: &Event) -> bool {
+    matches!(
+        e,
+        Event::History {
+            dir: HistoryDir::Older,
+            ..
+        } | Event::LoadEnded {
+            target: LoadTarget::History {
+                dir: HistoryDir::Older,
+                ..
+            },
+            ..
+        }
+    )
+}
+
 /// Finding 1 (high): while the logout's marker is written, the UI is shown
 /// `LogoutStarting`, and every command it queued is answered or honoured:
-/// a refused retry goes back to its send's state, a load is answered, and
-/// a discard cancels the flood-waited send, so its automatic retry never
-/// sends the message the UI already hid.
+/// a refused retry goes back to its send's state, two overlapping older
+/// loads of the open chat are both answered, and a discard cancels the
+/// flood-waited send. After the marker fails and "Stay signed in", the
+/// flood wait ends with nothing to resend.
 #[tokio::test(start_paused = true)]
 async fn discard_while_the_marker_is_written_stops_the_automatic_retry() {
-    let mut h = flooded().await;
+    let mut h = flooded(599).await;
     assert_eq!(h.fake.calls(Op::Send), 1);
-    // The marker write stalls (a Keychain prompt nobody answers).
+    // The marker write stalls (a Keychain prompt nobody answers), then fails.
+    h.faults.fail_set_of(SecretItem::LogoutPending);
     h.faults.hold();
     h.send(Command::Logout).await;
     h.auth(|s| *s == AuthState::LogoutStarting).await;
@@ -66,21 +94,19 @@ async fn discard_while_the_marker_is_written_stops_the_automatic_retry() {
         )
     })
     .await;
+    // The first load is in flight when the second arrives (deferred).
+    h.fake
+        .inject(Op::History, Fault::Delay(Duration::from_secs(2)));
     h.send(Command::LoadOlder(chat(1))).await;
-    h.until(|e| {
-        matches!(
-            e,
-            Event::LoadEnded {
-                target: LoadTarget::History {
-                    dir: HistoryDir::Older,
-                    ..
-                },
-                ..
-            }
-        )
-    })
-    .await;
+    h.send(Command::LoadOlder(chat(1))).await;
+    h.until(older_answer).await;
+    h.until(older_answer).await;
     h.send(Command::DiscardSend(LocalId(1))).await;
+    h.faults.release();
+    h.auth(|s| matches!(s, AuthState::LogoutNotStarted { .. }))
+        .await;
+    h.send(Command::Back).await;
+    h.auth(AuthState::is_signed_in).await;
     // Past the flood wait (599 s) and the automatic window (600 s).
     tokio::time::sleep(Duration::from_secs(700)).await;
     let seen = h.drain();
@@ -95,7 +121,6 @@ async fn discard_while_the_marker_is_written_stops_the_automatic_retry() {
         )),
         "{seen:?}"
     );
-    h.faults.release();
     h.stop().await;
 }
 
@@ -166,18 +191,20 @@ async fn revocation_after_a_failed_marker_takes_stay_signed_in_away() {
     .await;
     h.fake.revoke_session();
     h.send(Command::OpenChat(chat(1))).await;
-    let (ev, _) = h.until(|e| matches!(e, Event::Auth(_))).await;
-    assert!(
+    let server = |s: &AuthState| {
         matches!(
-            ev,
-            Event::Auth(AuthState::LogoutNotStarted {
+            s,
+            AuthState::LogoutNotStarted {
                 trigger: LogoutTrigger::Server,
                 ..
-            })
-        ),
-        "{ev:?}"
-    );
+            }
+        )
+    };
+    h.auth(server).await;
+    // Back cannot lift it: it answers with the same screen.
     h.send(Command::Back).await;
+    let (ev, _) = h.until(|e| matches!(e, Event::Auth(_))).await;
+    assert!(matches!(&ev, Event::Auth(s) if server(s)), "{ev:?}");
     h.send(Command::LoadDialogs).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let seen = h.drain();

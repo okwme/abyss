@@ -207,7 +207,13 @@ async fn remote_timeout_still_deletes_local_data() {
 
 /// Shutdown during the remote step: the remote call is cut short, the local
 /// deletion still runs, and the report says so.
-#[tokio::test(start_paused = true)]
+///
+/// Real time (review round 28): the local deletion waits on the persistence
+/// worker, an OS thread the test clock cannot see. On a paused clock the
+/// idle runtime jumped straight to the shutdown deadline whenever that
+/// thread was slow to answer (a loaded machine), and the report read
+/// `Incomplete`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_during_remote_logout_still_deletes_local_data() {
     let mut h = harness(FakeScript::demo(2, 5), None).await;
     h.online().await;
