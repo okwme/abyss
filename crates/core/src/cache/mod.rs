@@ -23,10 +23,11 @@ use zeroize::Zeroizing;
 
 mod census;
 mod worker;
-pub use census::{EXIT_WAIT, wait_closed};
+pub use census::{EXIT_CACHE_BUSY, EXIT_WAIT, InitError, Refused, begin_exit, init, wait_closed};
+pub(crate) use census::{close_admission, hold};
 pub use db::{Binding, Cache, EraseError};
-pub(crate) use worker::CacheCmd;
 pub use worker::{CACHE_QUEUE, CacheHandle, DeleteKey, EraseFailure, KeyError, WorkerError};
+pub(crate) use worker::{CacheCmd, open_blocking};
 
 /// Maximum logical bytes of cached message bodies.
 pub const MAX_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -97,6 +98,10 @@ pub enum CacheError {
     /// Eviction could not bring the cache under its byte budget.
     OverBudget,
     Random,
+    /// SQLCipher could not be readied for safe use (see `census::init`).
+    Init(InitError),
+    /// Admission is closed (core shutdown, process exit) or full.
+    Refused(Refused),
     Io(std::io::Error),
     Sql(rusqlite::Error),
     Encode(postcard::Error),
@@ -110,6 +115,9 @@ impl std::fmt::Display for CacheError {
             Self::WrongProvider(p) => write!(f, "unexpected crypto provider {p:?}"),
             Self::OverBudget => f.write_str("cache is over its byte budget"),
             Self::Random => f.write_str("system random number generator failed"),
+            Self::Init(e) => write!(f, "cache unavailable: {e}"),
+            Self::Refused(Refused::Closing) => f.write_str("cache closed for shutdown"),
+            Self::Refused(Refused::Full) => f.write_str("too many open cache directories"),
             Self::Io(e) => write!(f, "cache io: {e}"),
             Self::Sql(e) => write!(f, "cache sql: {e}"),
             Self::Encode(e) => write!(f, "cache encode: {e}"),

@@ -2,11 +2,14 @@
 //! in order, so a read observes every write sent before it, and `Erase` runs
 //! only after everything queued ahead of it.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::census::{self, Open};
+use super::census::Open;
 use super::{Binding, Cache, CacheError, CacheKey, EraseError};
 use crate::model::{ChatId, ChatSummary, Message, MsgId};
 
@@ -73,6 +76,9 @@ pub(crate) enum CacheCmd {
     /// Closes the database after all queued commands, then stops the worker;
     /// replies once the connection is closed.
     Close(oneshot::Sender<()>),
+    /// Tests: installs the probe on the cache, then panics on the worker.
+    #[cfg(test)]
+    Panic(super::db::DropProbe),
 }
 
 /// Async handle to the worker. Cloneable; the worker exits when all handles drop
@@ -80,6 +86,9 @@ pub(crate) enum CacheCmd {
 #[derive(Clone, Debug)]
 pub struct CacheHandle {
     tx: mpsc::Sender<CacheCmd>,
+    /// The worker thread, joined by `close` and `erase` once it has
+    /// replied, so the thread has ended before shutdown carries on.
+    worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Tests: older-history reads wait here for a permit.
     #[cfg(all(test, feature = "fake"))]
     gate: Option<std::sync::Arc<ReadGate>>,
@@ -131,25 +140,21 @@ pub enum WorkerError {
 impl CacheHandle {
     /// Opens the cache and starts the worker thread `abyss-cache`.
     ///
-    /// The cache stays in the census (see `census`) from before it is
-    /// opened until its connection is closed, on whichever thread that
-    /// happens, so shutdown and process exit can wait for it. The worker
-    /// closes the database once every handle is dropped, after `close`, or
-    /// after `erase`.
+    /// The worker closes the database once every handle is dropped, after
+    /// `close`, or after `erase`. The cache's census entry lives inside
+    /// [`Cache`], so it is released only after the connection is closed,
+    /// on whichever thread and path that happens (a failed spawn and a
+    /// panic included). Shutdown and process exit wait for it.
     pub fn spawn(dir: PathBuf, key: &CacheKey) -> Result<CacheHandle, CacheError> {
-        let open = Open::enter(&dir);
         let cache = Cache::open(&dir, key)?;
-        // SQLCipher has initialized (and registered its exit handler), so
-        // ours runs before it.
-        census::guard_exit();
         let (tx, rx) = mpsc::channel(CACHE_QUEUE);
-        let owned = Owned { cache, open };
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("abyss-cache".into())
-            .spawn(move || run(owned, &dir, rx))
+            .spawn(move || run(cache, &dir, rx))
             .map_err(CacheError::Io)?;
         Ok(CacheHandle {
             tx,
+            worker: Arc::new(Mutex::new(Some(worker))),
             #[cfg(all(test, feature = "fake"))]
             gate: None,
         })
@@ -246,7 +251,29 @@ impl CacheHandle {
     pub async fn close(&self) -> Result<(), WorkerError> {
         let (tx, rx) = oneshot::channel();
         self.send(CacheCmd::Close(tx)).await?;
-        rx.await.map_err(|_| WorkerError::Stopped)
+        let closed = rx.await.map_err(|_| WorkerError::Stopped);
+        self.join().await;
+        closed
+    }
+
+    /// Waits for the worker thread to end, after it replied to `close` or
+    /// `erase`. Only the first caller joins; later ones return at once.
+    async fn join(&self) {
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            // A worker that panicked has nothing left to report.
+            let _ = tokio::task::spawn_blocking(move || worker.join()).await;
+        }
+    }
+
+    /// Tests: makes the worker panic while it handles a command.
+    #[cfg(test)]
+    pub(crate) async fn panic_worker(&self, probe: super::db::DropProbe) {
+        let _ = self.send(CacheCmd::Panic(probe)).await;
     }
 
     /// Crypto-erases the cache after all queued commands, then stops the worker.
@@ -259,27 +286,54 @@ impl CacheHandle {
         })
         .await
         .map_err(|_| EraseFailure::Stopped)?;
-        rx.await.map_err(|_| EraseFailure::Stopped)?
+        let erased = rx.await.map_err(|_| EraseFailure::Stopped);
+        self.join().await;
+        erased?
     }
 }
 
-/// The worker's database and its census entry. Fields drop in declaration
-/// order, so the entry outlives the connection on every path, including a
-/// failed thread spawn.
-struct Owned {
-    cache: Cache,
-    open: Open,
+/// Opens the cache in `dir` on a blocking thread; a cache the key cannot
+/// open (or of an unknown schema) is destroyed and recreated. `None`: no
+/// cache this run, including when admission is closed.
+///
+/// The census entry is taken now, before the open is scheduled, and held
+/// until the blocking task ends, retry included: a queued open is counted
+/// before it starts, so a drain cannot finish ahead of it. Must be called
+/// on a tokio runtime (otherwise `None`).
+pub(crate) fn open_blocking(
+    dir: PathBuf,
+    key: CacheKey,
+) -> impl Future<Output = Option<(CacheHandle, CacheKey)>> + Send {
+    let task = match (Open::enter(&dir), tokio::runtime::Handle::try_current()) {
+        (Ok(ticket), Ok(runtime)) => Some(runtime.spawn_blocking(move || {
+            let opened = open_or_recreate(&dir, key);
+            drop(ticket);
+            opened
+        })),
+        _ => None,
+    };
+    async move { task?.await.ok().flatten() }
 }
 
-/// Every exit closes the database first, then leaves the census, then
-/// replies: a caller that saw the reply never races a close.
-fn run(owned: Owned, dir: &Path, mut rx: mpsc::Receiver<CacheCmd>) {
-    let Owned { mut cache, open } = owned;
+fn open_or_recreate(dir: &Path, key: CacheKey) -> Option<(CacheHandle, CacheKey)> {
+    let handle = match CacheHandle::spawn(dir.to_path_buf(), &key) {
+        Err(CacheError::WrongKey | CacheError::UnknownSchema(_)) => {
+            super::destroy_unopened(dir).ok()?;
+            CacheHandle::spawn(dir.to_path_buf(), &key).ok()?
+        }
+        other => other.ok()?,
+    };
+    Some((handle, key))
+}
+
+/// Every exit closes the database (its census entry is released after the
+/// connection), then replies: a caller that saw the reply never races a
+/// close.
+fn run(mut cache: Cache, dir: &Path, mut rx: mpsc::Receiver<CacheCmd>) {
     while let Some(cmd) = rx.blocking_recv() {
         if let CacheCmd::Close(reply) = cmd {
             rx.close();
             drop(cache);
-            drop(open);
             let _ = reply.send(());
             return;
         }
@@ -293,15 +347,12 @@ fn run(owned: Owned, dir: &Path, mut rx: mpsc::Receiver<CacheCmd>) {
             let result = cache
                 .erase(dir, key, delete_key)
                 .map_err(EraseFailure::from);
-            drop(open);
             let _ = reply.send(result);
             return;
         }
         handle(&mut cache, cmd);
     }
-    // Every handle is gone.
-    drop(cache);
-    drop(open);
+    // Every handle is gone; the cache closes as it drops.
 }
 
 /// Applies a server tail. If it overlaps the cached history (or reaches the
@@ -375,6 +426,11 @@ fn handle(cache: &mut Cache, cmd: CacheCmd) {
         CacheCmd::Erase { reply, .. } => drop(reply.send(Err(EraseFailure::Stopped))),
         // Unreachable: `run` intercepts Close. Dropping the reply says "stopped".
         CacheCmd::Close(reply) => drop(reply),
+        #[cfg(test)]
+        CacheCmd::Panic(probe) => {
+            cache.set_drop_probe(probe);
+            panic!("injected cache worker panic");
+        }
     }
 }
 

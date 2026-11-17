@@ -35,7 +35,7 @@ use crate::api::{
     UserError,
 };
 use crate::backend::{Backend, BackendError, Client};
-use crate::cache::{self, CacheError, CacheHandle, CacheKey};
+use crate::cache::{self, CacheHandle, CacheKey};
 use crate::secret::CacheKeyError;
 use crate::session::{AccountGen, PersistHandle};
 
@@ -174,6 +174,8 @@ pub(super) async fn erase_cache(
     dir: PathBuf,
     key: Option<CacheKey>,
 ) -> (Result<(), StorageError>, Option<(CacheHandle, CacheKey)>) {
+    // Keeps the census from draining between the erase's close and the reopen.
+    let _hold = cache::hold(&dir);
     let erased = match (cache, key) {
         (Some(handle), Some(key)) => handle
             .erase(key, persist.cache_key_deleter())
@@ -222,19 +224,7 @@ pub(crate) async fn open_cache(
         // A Keychain failure: the key may still exist, so destroy nothing.
         Err(CacheKeyError::Store(_) | CacheKeyError::Random) => return None,
     };
-    tokio::task::spawn_blocking(move || {
-        let handle = match CacheHandle::spawn(dir.clone(), &key) {
-            Err(CacheError::WrongKey | CacheError::UnknownSchema(_)) => {
-                cache::destroy_unopened(&dir).ok()?;
-                CacheHandle::spawn(dir, &key).ok()?
-            }
-            other => other.ok()?,
-        };
-        Some((handle, key))
-    })
-    .await
-    .ok()
-    .flatten()
+    cache::open_blocking(dir, key).await
 }
 
 /// The remote step's inputs, detached from the actor.

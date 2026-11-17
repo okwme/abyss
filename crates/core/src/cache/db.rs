@@ -9,6 +9,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, ffi, params};
 
+use super::census::{self, Open};
 use super::{CacheError, CacheKey, MAX_CACHE_BYTES, MAX_CACHED_PER_CHAT, MAX_ROW_BYTES};
 use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerKind, group_by_chat};
 use crate::store::MAX_DIALOGS;
@@ -52,12 +53,48 @@ fn bounded_body(param: u8) -> String {
     format!("CASE WHEN typeof(body) = 'blob' AND length(body) <= ?{param} THEN body END")
 }
 
+/// An open cache database. Fields drop in declaration order: the connection
+/// closes first and the census entry is released last, on every path,
+/// unwinding included, so nothing waiting on the census (shutdown, process
+/// exit) ever sees the cache gone while its connection is still closing.
 #[derive(Debug)]
 pub struct Cache {
     conn: Connection,
     /// Sum of `messages.size`, as committed.
     bytes: u64,
     budget: u64,
+    /// Tests: runs between the connection's close and the entry's release.
+    #[cfg(test)]
+    probe: Option<DropProbe>,
+    /// Census entry (see `census`). Must stay the last field.
+    _entry: Open,
+}
+
+/// Tests: a callback run when it is dropped.
+#[cfg(test)]
+pub(crate) struct DropProbe(Option<Box<dyn FnOnce() + Send>>);
+
+#[cfg(test)]
+impl DropProbe {
+    pub(crate) fn new(f: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(f)))
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for DropProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DropProbe")
+    }
+}
+
+#[cfg(test)]
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
 }
 
 fn kind_code(kind: PeerKind) -> i64 {
@@ -111,7 +148,15 @@ fn decode_chat(kind: i64, id: i64, body: Option<Vec<u8>>) -> Option<ChatSummary>
 
 impl Cache {
     /// Opens or creates the cache in `dir`.
+    ///
+    /// Refused before SQLCipher or the disk is touched until SQLCipher is
+    /// initialized with the exit hook in place (`census::init`), and once
+    /// admission to `dir` is closed (core shutdown, process exit). The
+    /// census entry is taken before the connection opens; on an error the
+    /// connection, declared after it, closes first.
     pub fn open(dir: &Path, key: &CacheKey) -> Result<Self, CacheError> {
+        census::init().map_err(CacheError::Init)?;
+        let entry = Open::enter(dir).map_err(CacheError::Refused)?;
         super::prepare_dir(dir)?;
         let conn = Connection::open(super::db_path(dir))?;
         Self::unlock(&conn, key)?;
@@ -124,6 +169,9 @@ impl Cache {
             conn,
             bytes: to_u64(bytes),
             budget: MAX_CACHE_BYTES,
+            #[cfg(test)]
+            probe: None,
+            _entry: entry,
         })
     }
 
@@ -213,6 +261,13 @@ impl Cache {
         drop(key);
         delete_key().map_err(EraseError::DeleteKey)?;
         super::remove_files(dir).map_err(EraseError::Files)
+    }
+
+    /// Tests: runs `probe` after the connection closes, before the census
+    /// entry is released.
+    #[cfg(test)]
+    pub(crate) fn set_drop_probe(&mut self, probe: DropProbe) {
+        self.probe = Some(probe);
     }
 
     #[cfg(test)]

@@ -305,17 +305,33 @@ impl<B: Backend> Actor<B> {
     /// a barrier on the current revision. Never claims a save it did not see.
     async fn shut_down(&mut self) -> ShutdownReport {
         let deadline = Instant::now() + SHUTDOWN_DEADLINE;
+        // Nothing opens core's cache from here on; what is open drains
+        // (round 23). Reopened when the actor is done, for a later core.
+        let _admission = self
+            .cache_parts
+            .as_ref()
+            .map(|parts| crate::cache::close_admission(&parts.dir));
         self.auth.abort_task();
         self.auth.creds.abort();
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
-        let life = self.shut_down_lifecycle(deadline).await;
+        // The producers are stopped: close the caches alongside retirement,
+        // not after it. A logout owns its cache until its local step has
+        // erased it, so then they close afterwards.
+        let early = (!matches!(self.life.phase, Phase::LoggingOut(_))).then(|| self.close_caches());
+        let closing = async move {
+            if let Some(closing) = early {
+                closing.await;
+            }
+        };
+        let (life, ()) = tokio::join!(self.shut_down_lifecycle(deadline), closing);
         // After a logout there is nothing to save; its status says the rest.
         let sealed = life.logout.is_some()
             || matches!(
                 tokio::time::timeout_at(deadline, self.account.barrier()).await,
                 Ok(Ok(()))
             );
+        // Whatever is left: a logout's caches, or a test's (flushed only).
         self.close_caches().await;
         let save = if life.retired && sealed {
             SaveStatus::Confirmed

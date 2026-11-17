@@ -292,8 +292,10 @@ struct Boot<B> {
 /// directory to close its database. The actor closes the caches it holds,
 /// but a worker can outlive it: a handle dropped without `close`, a close
 /// past `CACHE_FLUSH`, or an open still running on a blocking thread that
-/// `shutdown_timeout` abandoned. The UI quits on the ack, and SQLCipher's
-/// exit-time teardown must not race a close (exit SIGSEGV, section 13).
+/// `shutdown_timeout` abandoned (it took its census entry before it was
+/// scheduled). The UI quits on the ack, and SQLCipher's exit-time teardown
+/// must not race a close (exit SIGSEGV, section 13). This wait is best
+/// effort; the exit hook is the hard bound (`cache::census`).
 fn wait_caches_closed(dir: Option<&std::path::Path>) {
     if let Some(dir) = dir
         && !crate::cache::wait_closed(Some(dir), CACHE_CLOSE_WAIT)
@@ -316,6 +318,13 @@ fn start_with<B: Backend>(
         .enable_all()
         .build()
         .map_err(StartError::Runtime)?;
+    if config.cache.is_some() {
+        // Before anything can open a cache, and on the caller's thread, so
+        // no quit can race it: SQLCipher's exit handler, then ours (round 23,
+        // finding 1). A failure is logged by `init`; the run continues
+        // without a cache, since every open is then refused.
+        let _ = crate::cache::init();
+    }
     let persist = PersistHandle::spawn(store).map_err(StartError::Persist)?;
     let backend = make(persist.clone());
     let (cmd_tx, commands) = mpsc::channel(COMMAND_CAPACITY);

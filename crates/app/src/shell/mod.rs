@@ -89,7 +89,12 @@ impl Root {
             this.update(cx, |root, cx| root.request_close(window, cx))
                 .unwrap_or(true)
         });
+        // Every quit passes here: after core's ack, the UI's timeout, and an
+        // OS-initiated quit. No cache opens from now on; the exit hook then
+        // drains what is open, or ends the process with `_exit` rather than
+        // let SQLCipher tear down under a live connection (plan section 13).
         let on_app_quit = cx.on_app_quit(|root: &mut Root, _| {
+            abyss_core::cache::begin_exit();
             if let State::Running(session) = &root.state {
                 session.cancel_core();
             }

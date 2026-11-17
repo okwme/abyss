@@ -295,26 +295,33 @@ impl<B: Backend> Actor<B> {
 }
 
 impl<B: Backend> Actor<B> {
-    /// Shutdown: flushes and closes every cache core holds (served,
-    /// quarantined, or still re-binding), bounded by `CACHE_FLUSH`, so no
-    /// worker thread is closing SQLCipher while the process exits.
-    /// A cache handed in without parts (tests) is not core's: it is only
-    /// flushed, and its owner keeps using it.
-    pub(super) async fn close_caches(&mut self) {
-        let Some(parts) = self.cache_parts.as_mut() else {
-            if let Some(cache) = &self.cache {
-                let _ = tokio::time::timeout(super::CACHE_FLUSH, cache.barrier()).await;
-            }
-            return;
+    /// Shutdown: takes every cache core holds (served, quarantined, or
+    /// still re-binding) and returns their flush and close, bounded by
+    /// `CACHE_FLUSH`, so no worker thread is closing SQLCipher while the
+    /// process exits. The future owns what it closes, so it can run
+    /// alongside retirement. A cache handed in without parts (tests) is not
+    /// core's: it is only flushed, and its owner keeps using it.
+    pub(super) fn close_caches(&mut self) -> impl Future<Output = ()> + Send + 'static {
+        let (flush_only, served, quarantined, rebinding) = match self.cache_parts.as_mut() {
+            None => (self.cache.clone(), None, None, None),
+            Some(parts) => (
+                None,
+                self.cache.take(),
+                parts.quarantined.take(),
+                parts.rebinding.take(),
+            ),
         };
-        let (quarantined, rebinding) = (parts.quarantined.take(), parts.rebinding.take());
-        let served = self.cache.take();
         let all = async move {
+            if let Some(cache) = flush_only {
+                let _ = cache.barrier().await;
+            }
             let rebound = finish_rebinding(rebinding).await.map(|(handle, _)| handle);
             for handle in [served, quarantined, rebound].into_iter().flatten() {
                 let _ = handle.close().await;
             }
         };
-        let _ = tokio::time::timeout(super::CACHE_FLUSH, all).await;
+        async move {
+            let _ = tokio::time::timeout(super::CACHE_FLUSH, all).await;
+        }
     }
 }

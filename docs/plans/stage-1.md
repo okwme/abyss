@@ -318,7 +318,7 @@ Core shutdown runs on the control plane, so a full command queue can't block it:
 - Critical state is written when it changes, so a normal shutdown has nothing extra to save.
 - A `spawn_blocking` Keychain call that outlives the deadline isn't aborted. The process exits around it, and the Keychain update is either applied or not.
 - The UI enforces its own 6 s timeout, then calls `cx.quit()`.
-- `cx.on_app_quit` (`Z/src/app.rs:2950`) only cancels the token, as a backstop for OS-initiated termination.
+- `cx.on_app_quit` (`Z/src/app.rs:2950`) closes cache admission (`cache::begin_exit`) and cancels the token, as a backstop for OS-initiated termination. It does not wait; the exit hook drains open caches or ends the process with `_exit` (section 13, exit SIGSEGV fix).
 
 **Tests:**
 - Shutdown with a full command queue.
@@ -1043,17 +1043,29 @@ Open items:
   - a close that runs past `CACHE_FLUSH`;
   - an `open_cache` left running on a blocking thread after `shutdown_timeout` abandoned it (a shutdown during startup provisioning or the reopen after a logout);
   - every exit that core does not control: `on_app_quit` (an OS-initiated quit, which GPUI gives 200 ms) and the UI's 6 s timeout.
-- **Fix.**
-  - `cache::census` keeps a per-directory count of open SQLCipher databases. `CacheHandle::spawn` takes an entry before `Cache::open`. The worker gives it up only after its connection is closed, on every path (`close`, `erase`, all handles dropped, failed spawn), and before it replies.
-  - The core thread waits for its cache directory to drain (`CACHE_CLOSE_WAIT` = 2 s, with a warning if it does not) before it sends the shutdown ack.
-  - `census::guard_exit` registers an `atexit` hook after SQLCipher's own, so it runs first. The hook waits up to `EXIT_WAIT` (3 s) for every entry. This covers the exits that core does not control.
-  - Actor cache tests use `CacheDir`. Its drop waits for every worker on the directory and asserts that none outlived the test.
-  - There is no `process::exit` and no skipped destructor.
-  - Test: `a_worker_leaves_the_census_only_after_closing`.
+- **Fix (first version, 04299ff).** A per-directory census of open databases, an `atexit` hook registered after the first open that waited up to 3 s for the census, and a 2 s drain on the core thread before the shutdown ack. Round 23 (section 15) found it was only a mitigation. The current design replaces it.
+- **Fix (current, round 23).** `cache::census`:
+  - **Early initialization.** `census::init` calls `sqlite3_initialize`, then registers our `atexit` hook. In SQLCipher 4.20.0 (`sqlcipher-src` 420.0.0, `sqlcipher.c`), `sqlite3_initialize` runs `sqlcipher_extra_init` (built with `SQLITE_EXTRA_INIT`). Its first run calls `atexit(sqlcipher_atexit)` before anything else, under SQLite's static master mutex, once per process. So SQLCipher's handler is always registered before ours, and ours runs first. `core::start` calls `init` on the caller's thread, before the core thread exists, whenever a cache is configured. `Cache::open` calls it too (a `OnceLock`, so a concurrent first open waits for it), and refuses to open if it failed: a failed `sqlite3_initialize` or a failed `atexit` registration is logged at error, and the run continues without a cache.
+  - **Census entries.** A `Cache` holds its entry as its last field, so the connection closes before the entry is released on every path: `close`, `erase`, all handles dropped, a failed spawn, a panic while unwinding, and direct `Cache::open` callers. `Cache::open` takes the entry before it opens the connection, so a failed open closes the connection first.
+  - **Tickets.** A caller that schedules an open on another thread takes an entry first and holds it until the task ends. `open_blocking` does this for `open_cache`, including the destroy-and-recreate retry, so a queued `spawn_blocking` is counted before it starts. `erase_cache` holds an entry from before the erase until the reopen returns, so a drain cannot finish in the gap between the old cache's close and the new one's open.
+  - **Admission.** `Open::enter` returns a `Result`. It refuses an entry once admission is closed, atomically under the census lock, so an empty census stays empty. Opens then fail cleanly with `CacheError::Refused` before SQLCipher or the disk is touched, and `open_cache` returns "no cache this run". There are two closers:
+    - `close_admission(dir)`, held by `Actor::shut_down` from its start until it returns. It is reference-counted and reopens on drop, so a later core can use the directory.
+    - `begin_exit()`, global and never reset. It is called by the exit hook and by the app's `on_app_quit`, which runs on every quit: after the ack, after the UI's 6 s timeout, and on an OS-initiated quit.
+    - The census is bounded at 256 directories; beyond that, opens are refused.
+  - **Earlier close.** `Actor::shut_down` aborts its tasks (the cache's producers), then closes every cache core holds in parallel with network retirement, rather than after it. A logout keeps exclusive ownership of the erase: while the phase is `LoggingOut`, the caches are left to the logout's local step and closed after it, as before. `close` and `erase` join the worker thread after it replies. The core thread still drains its directory (2 s) before the ack.
+  - **Exit hook.** It closes admission, then waits for every entry, bounded by `EXIT_WAIT` (3 s). Acquiring the census lock is bounded too: it uses `try_lock` with 1 ms retries until the deadline. The body runs under `catch_unwind`, so the hook never unwinds into C. A caught panic counts as not drained.
+  - **Last resort.** If anything is still open at the deadline, the hook logs an error and calls `libc::_exit(EXIT_CACHE_BUSY)` (75, `EX_TEMPFAIL`), never returning into SQLCipher's teardown. Tradeoffs: the remaining `atexit` handlers, `__mod_term_func` destructors and C stdio flushing are skipped (our logs go unbuffered to stderr). SQLite durability is unaffected: committed transactions are durable, and the WAL is recovered on the next open. An uncommitted write is lost either way.
+  - **Hazards documented in the hook.**
+    - `exit` runs on the main thread (GPUI's `terminate:`, or libtest's `main`), which never holds the census lock or an entry. Caches are opened and closed on core's runtime, blocking and `abyss-cache` threads, and no cache code calls `exit`.
+    - Were a thread holding an entry to call `exit` anyway, the wait would time out on its own entry and end in `_exit`: a 3 s delay, not a crash or a hang.
+  - Actor cache tests still use `CacheDir`.
 - **Verification.**
-  - With only the exit hook (the test on a plain tempdir), or only `CacheDir` (the hook disabled), the trigger test passed 30 of 30 runs. With both disabled it failed 9 of 15.
-  - With both in place, the trigger test and the whole `review10f` filter each passed 30 of 30 runs.
-- **Residual.** If a worker is still inside SQLCipher when `EXIT_WAIT` runs out (for example, on a wedged disk at an OS quit), the race remains. Shutdown order is unchanged: the caches still close after the lifecycle shutdown.
+  - First version: with only the exit hook (the test on a plain tempdir), or only `CacheDir` (the hook disabled), the trigger test passed 30 of 30 runs. With both disabled it failed 9 of 15.
+  - Round 23: the trigger test and the whole `review10f` filter each passed 30 of 30 runs (every run exited 0). Each new test fails with its fix disabled in place (see the round 23 entry).
+- **Residual.**
+  - A worker that is still inside SQLCipher after 3 s (for example, on a wedged disk) no longer crashes the process. Exit becomes `_exit(75)` after the logged error.
+  - SQLCipher's teardown could still race a thread that uses SQLite without going through `Cache::open`. No such code exists outside one cache test: `cargo tree -i libsqlite3-sys` shows only `abyss-core`, which uses SQLite only in `cache`.
+  - The production app does not configure a cache yet (`CoreConfig::default()` in `shell/session.rs`), so today none of this runs outside tests. It is in place for when the cache is wired.
 
 **Task 10g status (2026-11-17): round 21 re-check fixes (open window kept under the byte budget, abandoned running load answered on rebuild), done against the fake.** Each regression test fails with its fix disabled in place. Tests: `crates/core/src/actor/tests/review10g.rs` and the end of `crates/core/src/store/windows/tests.rs`. No auth, onboarding, logout, credential, marker or cache-worker code was touched.
 1. **The byte budget could evict the open chat's window.** Option chosen: protect the open window, not propagate evictions to the actor.
@@ -1271,6 +1283,34 @@ Open items:
 - **Round 22 (re-check of task 10g, 2026-11-17).** Fixed by the coordinator:
   - **Low:** a `LoadOlder` deferred behind a running tail stayed pending through failed rebuilds. `begin_retire` took `owed` but left `deferred`, which `run_deferred_loads` then promoted to a queued load for an instance that never arrived. Fix: `begin_retire` drains the deferred loads along with `owed` and returns the distinct targets (at most `1 + MAX_DEFERRED`), and a rebuild answers each with `LoadEnded { error: Busy }`. Drained loads never start. Test: `review10g.rs::a_deferred_older_load_is_answered_by_a_stalled_rebuild`, which fails without the fix.
   - Confirmed clean: the shown-window protection and its bound (an oversized message or tail is trimmed, possibly to an empty retained window), `shown`/`open` sync on every path, and owed loads at retirement, queued or running.
+
+- **Round 23 (review of the exit SIGSEGV fix, 2026-11-17).** GPT-6 Astra reviewed 04299ff and found it was only a mitigation. All four findings are fixed (section 13, "Exit SIGSEGV fix", has the design):
+  - **P1: the first open ran before the guard existed.** `guard_exit` was registered after `Cache::open` succeeded, but SQLCipher registers its own handler during the first open, so an OS quit during that open could tear SQLCipher down under it. Fix: `census::init` (`sqlite3_initialize`, then our `atexit`) runs in `core::start` before the core thread exists, and `Cache::open` refuses to open until it has succeeded. Verified in the SQLCipher 4.20.0 source: `sqlcipher_extra_init` calls `atexit(sqlcipher_atexit)` on its first run. Test: `cache::census::tests::the_exit_hook_runs_before_sqlcipher_teardown`. A child process arms a probe and calls `exit`, and the hook reports whether SQLCipher's provider still exists. It reports 42 (hook first). With the registration moved before `sqlite3_initialize`, it reports 43.
+  - **P1: an empty census did not stop later opens.** A drain could finish in the gap of a close and reopen (logout, re-binding), or ahead of a queued `spawn_blocking` open that had not taken its entry yet. Fix:
+    - Closed admission (`close_admission` per directory during `Actor::shut_down`; `begin_exit` for the process), atomic with entry. `Open::enter` returns a `Result`, and refused opens fail with `CacheError::Refused` without touching SQLCipher.
+    - `open_blocking` takes its entry before scheduling.
+    - `erase_cache` holds an entry across the erase and the reopen.
+    - Tests:
+      - `admission_is_closed_after_begin_exit` (child process; fails with exit 101 if `enter` ignores `exiting`).
+      - `closed_admission_refuses_new_entries_until_reopened`.
+      - `a_queued_blocking_open_is_counted_before_it_starts` (one blocking thread, held, so the open queues). With the entry taken inside the task, the census reads empty while the open is queued.
+    - The erase-to-reopen hold has no dedicated test: the gap can't be reproduced deterministically without new hooks in the logout path, which task 6e owns.
+  - **P1: a timeout still allowed the crash.** The hook ignored a failed wait, an OS quit does not await core, and the caches closed only after about 3 s of network retirement. Fix:
+    - `Actor::shut_down` closes the caches in parallel with retirement, except while a logout owns them.
+    - `close` and `erase` join the worker thread.
+    - The hook's lock acquisition is bounded, its body runs under `catch_unwind`, and on a timeout it logs and calls `_exit(75)` instead of returning into SQLCipher's teardown.
+    - `on_app_quit` calls `begin_exit`, which covers the UI's 6 s timeout (it quits through `on_app_quit` too) and OS-initiated quits.
+    - Tests:
+      - `review23::shutdown_closes_the_cache_while_retirement_still_runs` (a runner that ignores quit holds retirement at its 2 s cap; the census drains within 1 s and a new open is refused meanwhile). Without the earlier close the census is still open at 1 s, and without the closed admission the open is admitted.
+      - `exit_with_a_cache_still_open_skips_sqlcipher_teardown` (a child process exits while another thread holds an entry: status 75). Without the `_exit` it is 0.
+  - **P2: drop order under unwinding.** The worker destructured `Owned { cache, open }` into locals, which drop in reverse on a panic, so the entry went first. Fix: the entry is the last field of `Cache` itself. Test: `a_worker_panic_closes_the_connection_before_leaving_the_census`. A test-only `Panic` command panics on the worker, and a drop probe declared between the connection and the entry sees that the WAL is gone (closed) and the census still lists the cache. With the entry declared first, the census reads empty.
+  - Also: the hook's SAFETY comment now covers never unwinding, the bounded lock, and why exiting while holding the lock or an entry does not happen (and what would follow if it did). A failed `atexit` registration is logged at error, and opens are then refused.
+  - Edits outside the cache and shutdown code: two call sites in `actor/logout.rs` (task 6e is changing that file). `erase_cache` takes `cache::hold(&dir)`, and `open_cache`'s inline `spawn_blocking` became `cache::open_blocking(dir, key)` (same retry logic, moved to `cache/worker.rs`). `marker.rs` and the auth and onboarding files are untouched.
+  - Verified:
+    - fmt; clippy (`-D warnings`) with and without `--features fake`.
+    - `cargo test --workspace --features fake` exits 0: 390 core tests pass (3 ignored), plus 153 app tests.
+    - `cargo tree -p abyss-core | grep -ci gpui` prints 0.
+    - The trigger test and the `review10f` filter each passed 30 of 30 runs; the new tests passed 10 of 10.
 - **Round 15 (re-check of task 6c, 2026-11-17).** All fixed in task 6d (section 13):
   - The incomplete-logout state was not durable: after a failed remote logout and a failed session delete, a restart signed the old account back in. A logout-pending marker must be recorded before any side effect, checked before the session, cache or client, fail closed when unreadable, and be cleared only after both deletions.
   - **High:** the UI kept account A's messages and draft after logout, so account B could see them under a shared peer id.
