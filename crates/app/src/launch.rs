@@ -9,6 +9,8 @@ use std::ffi::{OsStr, OsString};
 
 use abyss_core::credentials::{EnvResolution, from_env};
 
+use crate::storage::{self, CacheLocation, StorageError};
+
 pub(crate) const FAKE_FLAG: &str = "--fake";
 /// With `--fake`: start from `NeedCredentials`, as on a first run.
 #[cfg(feature = "fake")]
@@ -32,8 +34,14 @@ pub(crate) enum Launch {
     Fake {
         faults: abyss_core::FakeFaults,
         start: FakeStart,
+        /// `None` (the default) runs without a disk cache; see `storage`.
+        cache: Option<CacheLocation>,
     },
-    Telegram(EnvResolution),
+    Telegram {
+        env: EnvResolution,
+        /// The real cache's location (task 9b); an error runs without one.
+        cache: Result<CacheLocation, StorageError>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,14 +84,22 @@ pub(crate) fn resolve(
             } else {
                 FakeStart::Demo
             },
+            cache: CacheLocation::fake(
+                var(storage::FAKE_CACHE_VAR).as_deref(),
+                var(storage::TMPDIR_VAR),
+            ),
         });
         #[cfg(not(feature = "fake"))]
         return Err(LaunchError::FakeNotBuilt);
     }
     // A non-UTF-8 value counts as malformed: it is set, but unusable.
-    Ok(Launch::Telegram(from_env(|name| {
+    let env = from_env(|name| {
         var(name).map(|v| v.into_string().unwrap_or_else(|_| "\u{fffd}".to_owned()))
-    })))
+    });
+    Ok(Launch::Telegram {
+        env,
+        cache: CacheLocation::real(var(storage::HOME_VAR)),
+    })
 }
 
 #[cfg(test)]
@@ -113,7 +129,7 @@ mod tests {
 
     fn telegram(launch: Result<Launch, LaunchError>) -> EnvResolution {
         match launch.unwrap() {
-            Launch::Telegram(env) => env,
+            Launch::Telegram { env, .. } => env,
             #[cfg(feature = "fake")]
             Launch::Fake { .. } => panic!("expected the real backend"),
         }
@@ -184,7 +200,7 @@ mod tests {
         #[cfg(feature = "fake")]
         assert!(matches!(
             launch,
-            Ok(Launch::Fake { faults, start: FakeStart::Demo })
+            Ok(Launch::Fake { faults, start: FakeStart::Demo, cache: None })
                 if faults == abyss_core::FakeFaults::default()
         ));
         #[cfg(not(feature = "fake"))]
@@ -215,5 +231,46 @@ mod tests {
             panic!("expected the fake");
         };
         assert!(faults.store_stall);
+    }
+
+    /// Task 9b: the real backend gets the Application Support cache.
+    #[test]
+    fn the_real_backend_gets_the_real_cache() {
+        let launch = resolve(args(&[]), env(&[("HOME", "/Users/someone")]));
+        let Ok(Launch::Telegram { cache, .. }) = launch else {
+            panic!("expected the real backend");
+        };
+        assert_eq!(
+            cache.unwrap().dir(),
+            std::path::Path::new("/Users/someone/Library/Application Support/dev.abyss/cache")
+        );
+        let Ok(Launch::Telegram { cache, .. }) = resolve(args(&[]), env(&[])) else {
+            panic!("expected the real backend");
+        };
+        assert!(cache.is_err(), "no HOME, no cache");
+    }
+
+    /// Task 9b: `--fake` never gets the real cache, and a cache only when
+    /// asked for.
+    #[cfg(feature = "fake")]
+    #[test]
+    fn the_fake_gets_a_cache_only_when_asked() {
+        let vars = [("HOME", "/Users/someone"), ("TMPDIR", "/var/folders/t/")];
+        let Ok(Launch::Fake { cache, .. }) = resolve(args(&[FAKE_FLAG]), env(&vars)) else {
+            panic!("expected the fake");
+        };
+        assert_eq!(cache, None);
+        let asked = [
+            ("HOME", "/Users/someone"),
+            ("TMPDIR", "/var/folders/t/"),
+            (crate::storage::FAKE_CACHE_VAR, "1"),
+        ];
+        let Ok(Launch::Fake { cache, .. }) = resolve(args(&[FAKE_FLAG]), env(&asked)) else {
+            panic!("expected the fake");
+        };
+        assert_eq!(
+            cache.unwrap().dir(),
+            std::path::Path::new("/var/folders/t/dev.abyss.fake/cache")
+        );
     }
 }

@@ -178,13 +178,21 @@ fn remove_files(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Creates the cache directory (0700) and excludes it from backups.
+/// Creates the cache directory (0700) and excludes it from backups. A
+/// symlink in its place is refused (task 9b): the mode and the xattr would
+/// otherwise land on the link's target.
 fn prepare_dir(dir: &Path) -> Result<(), CacheError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
+    if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        return Err(CacheError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the cache directory is a symlink",
+        )));
+    }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     backup::exclude_from_backup(dir)?;
     Ok(())

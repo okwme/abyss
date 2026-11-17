@@ -49,7 +49,11 @@ impl Started {
 pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
     match launch {
         #[cfg(feature = "fake")]
-        Launch::Fake { faults, start } => {
+        Launch::Fake {
+            faults,
+            start,
+            cache,
+        } => {
             use abyss_core::backend::fake::{FakeBackend, FakeScript};
             let mut script = crate::chat::demo::script(crate::chat::format::now());
             if start == crate::launch::FakeStart::Onboarding {
@@ -59,9 +63,10 @@ pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
             // The demo account's login: code `FAKE_CODE`, 2FA password with a hint.
             script.login = FakeScript::demo(0, 0).login;
             let (backend, handle) = FakeBackend::new(script);
+            // Opt-in only (`ABYSS_FAKE_CACHE=1`), never the real cache.
             let config = CoreConfig {
                 fake_faults: faults,
-                ..CoreConfig::default()
+                cache: cache.and_then(|location| crate::storage::config(Ok(location))),
             };
             let core = abyss_core::start(config, BackendChoice::Fake(backend))?;
             Ok(Started {
@@ -69,8 +74,18 @@ pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
                 ..Started::new(core)
             })
         }
-        Launch::Telegram(env) => {
-            let core = abyss_core::start(CoreConfig::default(), BackendChoice::Grammers(env))?;
+        Launch::Telegram { env, cache } => {
+            // `core::start` initializes SQLCipher and the exit hook before
+            // anything opens; a failed directory runs without a cache.
+            #[cfg_attr(
+                not(feature = "fake"),
+                expect(clippy::needless_update, reason = "fake builds add `fake_faults`")
+            )]
+            let config = CoreConfig {
+                cache: crate::storage::config(cache),
+                ..CoreConfig::default()
+            };
+            let core = abyss_core::start(config, BackendChoice::Grammers(env))?;
             Ok(Started::new(core))
         }
     }

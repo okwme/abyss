@@ -262,6 +262,22 @@ fn directory_is_private_and_excluded_from_backup() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("[Excluded]"));
 }
 
+/// Task 9b: a symlinked cache directory is refused before anything is
+/// created or changed through it.
+#[test]
+fn a_symlinked_directory_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let (t, dir, key) = setup();
+    let target = t.path().join("elsewhere");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&target, &dir).unwrap();
+    assert!(matches!(Cache::open(&dir, &key), Err(CacheError::Io(_))));
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+    assert!(!target.join(DB_FILE).exists());
+}
+
 #[test]
 fn reconcile_removes_messages_deleted_on_server() {
     let (_t, dir, key) = setup();

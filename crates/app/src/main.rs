@@ -4,6 +4,7 @@ mod chat;
 mod launch;
 mod logging;
 mod shell;
+mod storage;
 mod ui;
 
 use gpui::App;
