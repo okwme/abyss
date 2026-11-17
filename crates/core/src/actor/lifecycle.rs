@@ -523,7 +523,9 @@ impl<B: Backend> Actor<B> {
 
     /// Rebuild step 1: stop admission and make every completion of the old
     /// instance stale. Parked permits stay parked until retirement completes.
-    /// Returns the queued load the UI waits on that was dropped, if any.
+    /// Returns the load the UI waits on, which retirement abandons whether
+    /// it was queued or running (its late result is stale), if any. It is
+    /// taken here, so nothing answers it again (task 10g).
     #[must_use]
     pub(super) fn begin_retire(&mut self) -> Option<(ChatId, HistoryDir)> {
         self.cgen = ClientGen(self.cgen.0 + 1);
@@ -532,7 +534,8 @@ impl<B: Backend> Actor<B> {
         self.history_busy.clear();
         self.dialogs_busy = false;
         self.dialogs_queued = false;
-        self.purge_queued()
+        self.purge_queued();
+        self.owed.take().map(|o| (o.load.chat, o.dir))
     }
 
     async fn finish_retire(&mut self, retired: Retired, after: After) {

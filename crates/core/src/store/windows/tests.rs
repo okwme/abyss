@@ -339,3 +339,62 @@ fn cache_contiguity_is_bounded_by_the_windows() {
     w.set_cache_contiguous(user(1));
     assert!(!w.is_cache_contiguous(user(1)), "no window, no flag");
 }
+
+/// A message retaining more than the whole byte budget: its sender name's
+/// capacity is charged, though it holds one byte.
+fn huge(c: ChatId, id: i32) -> Message {
+    let mut name = String::with_capacity(MAX_STORE_BYTES + 1);
+    name.push('x');
+    Message {
+        sender: Some(crate::model::Sender { id: c, name }),
+        ..msg(c, id, "big")
+    }
+}
+
+/// Task 10g (round 21, finding 1): a background chat's growth never evicts
+/// the open chat's window, whose loads and owed answers rely on it. The
+/// background windows go first, then the growing chat trims itself.
+#[test]
+fn byte_budget_never_evicts_the_open_window() {
+    let mut w = Windows::default();
+    let (a, b, c) = (user(1), user(2), user(3));
+    w.open(c);
+    w.upsert(msg(c, 1, "c"));
+    w.close(c);
+    w.open(b);
+    w.upsert(msg(b, 1, "b"));
+    w.close(b);
+    let view = w.open(a);
+    w.upsert(msg(a, 1, "a"));
+    assert_eq!(w.shown(), Some(a));
+    // Least recently used first: c, b, a. The new message is b's.
+    w.upsert(huge(b, 2));
+    assert!(w.get(c).is_none(), "background window evicted");
+    assert_eq!(ids(&w, a), vec![1], "the open window stays whole");
+    assert_eq!(w.get(a).map(Window::view_gen), Some(view));
+    assert!(ids(&w, b).is_empty(), "the growing chat trimmed itself");
+    assert!(w.total_bytes() <= MAX_STORE_BYTES);
+    // An edit of a retained chat's message is held to the same rule.
+    w.upsert(msg(b, 3, "b"));
+    assert!(w.replace(huge(b, 3)));
+    assert_eq!(ids(&w, a), vec![1]);
+    assert!(w.total_bytes() <= MAX_STORE_BYTES);
+    // Once closed, it is a background window like any other.
+    w.close(a);
+    assert_eq!(w.shown(), None);
+    w.upsert(huge(b, 4));
+    assert!(w.get(a).is_none());
+}
+
+/// The open window's own growth trims it within itself: it is never
+/// evicted, even when it alone would exceed the budget.
+#[test]
+fn the_open_window_alone_over_budget_trims_itself() {
+    let mut w = Windows::default();
+    let a = user(1);
+    w.open(a);
+    w.upsert(msg(a, 1, "a"));
+    w.upsert(huge(a, 2));
+    assert!(w.get(a).is_some(), "trimmed, not evicted");
+    assert!(w.total_bytes() <= MAX_STORE_BYTES);
+}

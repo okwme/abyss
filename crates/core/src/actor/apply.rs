@@ -427,7 +427,7 @@ impl<B: Backend> Actor<B> {
         let edge = edge.map_or(anchor, |m| m.id);
         let load = self.begin_load(chat, view);
         if let Some(owed) = owed {
-            self.owe(load, owed.restarts);
+            self.owe(load, dir, owed.restarts);
         }
         self.fetch_more(load, dir, edge).await;
     }

@@ -290,6 +290,7 @@ impl<B: Backend> Actor<B> {
             self.run_deferred_loads().await;
             self.run_cover_fetch().await;
             debug_assert!(self.owed_is_current(), "owed load of an old view");
+            debug_assert!(self.open_is_retained(), "open chat without its window");
             self.pump();
             self.sync_peers();
         }
@@ -416,10 +417,9 @@ impl<B: Backend> Actor<B> {
 
     /// Drops queued snapshot and history loads (their views are going away) and
     /// dialogs loads; sends and read marks stay queued for the next instance.
-    /// Returns the purged load the UI still waits on, if any: the caller
-    /// answers it unless the view is invalidated right after (round 20).
-    fn purge_queued(&mut self) -> Option<(ChatId, HistoryDir)> {
-        let mut owed = None;
+    /// What a purged load owed the UI is left to the caller: retirement
+    /// answers it, and a full bootstrap invalidates its view (task 10g).
+    fn purge_queued(&mut self) {
         let keep = |job: &Job| matches!(job, Job::Send { .. } | Job::Read { .. });
         let (kept, purged): (Vec<Job>, Vec<Job>) = self.queue.drain(..).partition(keep);
         self.queue = kept.into();
@@ -427,17 +427,13 @@ impl<B: Backend> Actor<B> {
         for job in purged {
             match job {
                 Job::Dialogs { .. } => self.dialogs_busy = false,
-                Job::History { load, dir, .. } => {
+                Job::History { load, .. } => {
                     self.release_history(load);
                     self.covers.fetch_ended(load.chat, load.req);
-                    if self.take_owed(load).is_some() {
-                        owed = Some((load.chat, dir));
-                    }
                 }
                 Job::Send { .. } | Job::Read { .. } => {}
             }
         }
-        owed
     }
 
     async fn on_internal(&mut self, msg: Internal) {
@@ -723,7 +719,7 @@ impl<B: Backend> Actor<B> {
             return self.history_ended(chat, dir, None).await;
         };
         let load = self.begin_load(chat, view);
-        self.owe(load, restarts);
+        self.owe(load, dir, restarts);
         if let Some(cache) = self
             .cache
             .clone()

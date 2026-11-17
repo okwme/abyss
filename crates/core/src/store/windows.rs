@@ -139,6 +139,12 @@ pub struct Windows {
     account_index: HashMap<MsgId, ChatId>,
     /// Bumped whenever the set or recency order of windowed chats changes.
     rev: u64,
+    /// The chat whose view is open (set by [`Windows::open`], cleared by
+    /// [`Windows::close`]). The byte budget never evicts its window: the
+    /// actor's open view, its loads and what they owe the UI all rely on
+    /// it being retained (task 10g). Only its own growth trims it, within
+    /// itself.
+    shown: Option<ChatId>,
 }
 
 impl Windows {
@@ -171,6 +177,7 @@ impl Windows {
         w.view_gen = view_gen;
         // Re-established by the tail this opening fetches.
         w.cache_contiguous = false;
+        self.shown = Some(chat);
         self.lru.retain(|c| *c != chat);
         self.lru.push(chat);
         self.rev = self.rev.wrapping_add(1);
@@ -189,6 +196,14 @@ impl Windows {
             w.view_gen = view_gen;
             w.cache_contiguous = false;
         }
+        if self.shown == Some(chat) {
+            self.shown = None;
+        }
+    }
+
+    /// The chat whose view is open, if any (see [`Windows::open`]).
+    pub fn shown(&self) -> Option<ChatId> {
+        self.shown
     }
 
     /// Marks `chat`'s disk cache as contiguous with the live tail (see
@@ -235,6 +250,7 @@ impl Windows {
     }
 
     fn drop_window(&mut self, chat: ChatId) {
+        debug_assert_ne!(self.shown, Some(chat), "the open window is never dropped");
         self.rev = self.rev.wrapping_add(1);
         if let Some(w) = self.by_chat.remove(&chat) {
             self.bytes = self.bytes.saturating_sub(w.bytes);
@@ -456,18 +472,27 @@ impl Windows {
             .collect()
     }
 
-    /// Evicts least recently used windows other than `keep`; if `keep` alone is
-    /// over budget, trims it from `end` (the side the user is not looking at).
+    /// Evicts least recently used windows other than `keep` (the chat just
+    /// mutated) and the open one, then trims `keep` from `end` (the side the
+    /// user is not looking at). The open window is never evicted for another
+    /// chat's growth (task 10g). When it is `keep`, it is trimmed within
+    /// itself. Otherwise trimming `keep` always suffices: only `keep` grew,
+    /// and the budget held before, so the open window alone fits.
     fn enforce_byte_budget(&mut self, keep: ChatId, end: End, change: &mut Change) {
+        let shown = self.shown;
         while self.bytes > MAX_STORE_BYTES {
-            if let Some(victim) = self.lru.iter().copied().find(|c| *c != keep) {
+            let background = self
+                .lru
+                .iter()
+                .copied()
+                .find(|c| *c != keep && Some(*c) != shown);
+            if let Some(victim) = background {
                 self.drop_window(victim);
-                continue;
-            }
-            if !self.pop_one(keep, end, change) {
-                return;
+            } else if !self.pop_one(keep, end, change) {
+                break;
             }
         }
+        debug_assert!(self.bytes <= MAX_STORE_BYTES, "open window over budget");
     }
 }
 

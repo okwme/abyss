@@ -229,7 +229,7 @@ impl<B: Backend> Actor<B> {
         if !(current && fetching) {
             return false;
         }
-        self.owe(load, restarts);
+        self.owe(load, HistoryDir::Older, restarts);
         true
     }
 }

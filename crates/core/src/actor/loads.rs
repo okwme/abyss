@@ -51,6 +51,8 @@ impl Deferred {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Owed {
     pub(super) load: Load,
+    /// The direction the UI asked for (`Older` or `Newer`).
+    pub(super) dir: HistoryDir,
     /// How often the UI's request already started over.
     pub(super) restarts: u8,
 }
@@ -103,11 +105,16 @@ impl<B: Backend> Actor<B> {
         }
     }
 
-    /// `load` now owes the UI the answer to a request that already started
-    /// over `restarts` times.
-    pub(super) fn owe(&mut self, load: Load, restarts: u8) {
+    /// `load` now owes the UI the answer to its request in `dir`, which
+    /// already started over `restarts` times.
+    pub(super) fn owe(&mut self, load: Load, dir: HistoryDir, restarts: u8) {
         debug_assert_eq!(Some(load.chat), self.open, "only the open chat loads more");
-        self.owed = Some(Owed { load, restarts });
+        debug_assert_ne!(dir, HistoryDir::Tail, "a tail answers no request");
+        self.owed = Some(Owed {
+            load,
+            dir,
+            restarts,
+        });
     }
 
     /// `load` completed or was dropped: takes what it owed the UI, if it is
@@ -134,6 +141,15 @@ impl<B: Backend> Actor<B> {
                     .get(o.load.chat)
                     .is_some_and(|w| w.view_gen() == o.load.view)
         })
+    }
+
+    /// Invariant, checked once per actor loop turn: the open chat is the
+    /// store's shown chat, and its window is retained. The byte budget
+    /// never evicts it (task 10g), so the open view, its loads and the
+    /// full bootstrap's `ChatInvalidated` (which visits retained windows)
+    /// always find it.
+    pub(super) fn open_is_retained(&self) -> bool {
+        self.windows.shown() == self.open && self.open.is_none_or(|c| self.windows.get(c).is_some())
     }
 
     /// The owed `LoadOlder` `owed` got a page that no longer continues the
