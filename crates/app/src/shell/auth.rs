@@ -9,8 +9,8 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use abyss_core::api::{
-    AuthState, CodeDelivery, CredentialError, CredentialSource, LocalDeletion, NewLogin,
-    NextDelivery, RemoteLogout, SentCodeInfo, UserError,
+    AuthState, CodeDelivery, CredentialError, CredentialSource, LocalDeletion, LogoutTrigger,
+    NewLogin, NextDelivery, RemoteLogout, SentCodeInfo, UserError,
 };
 use gpui::SharedString;
 
@@ -90,6 +90,14 @@ pub(crate) enum AuthView {
     LogoutIncomplete {
         remote: RemoteLogout,
     },
+    /// The logout could not start (its marker was not written), so nothing
+    /// changed: Retry, or, for the user's own logout, stay signed in.
+    LogoutNotStarted {
+        trigger: LogoutTrigger,
+    },
+    /// Startup couldn't read the logout marker: Retry reads it again. Never
+    /// "Logout incomplete": nothing is pending as far as anyone knows.
+    StartupBlocked,
     /// A login finished in this run: tips, then the chats.
     Done {
         has_password: Option<bool>,
@@ -255,6 +263,10 @@ pub(crate) fn project(state: AuthState, prev: &AuthView, now: Instant) -> Projec
         AuthState::LoggedOut { remote, local } => {
             Projection::with_notice(AuthView::Connecting, copy::logged_out(remote, local))
         }
+        AuthState::LogoutNotStarted { trigger, .. } => {
+            Projection::view(AuthView::LogoutNotStarted { trigger })
+        }
+        AuthState::StartupBlocked { .. } => Projection::view(AuthView::StartupBlocked),
     }
 }
 
@@ -292,7 +304,11 @@ pub(crate) fn back(view: &AuthView, source: Option<CredentialSource>) -> Back {
         | AuthView::Password { .. }
         | AuthView::FloodWait { .. }
         | AuthView::SignUpRequired
-        | AuthView::OfficialAppRequired { .. } => Back::Core,
+        | AuthView::OfficialAppRequired { .. }
+        // "Stay signed in" (core's Back).
+        | AuthView::LogoutNotStarted {
+            trigger: LogoutTrigger::User,
+        } => Back::Core,
         AuthView::Onboarding(
             Onboarding::Welcome | Onboarding::Env { .. } | Onboarding::Keychain,
         )
@@ -300,6 +316,10 @@ pub(crate) fn back(view: &AuthView, source: Option<CredentialSource>) -> Back {
         | AuthView::Verifying { .. }
         | AuthView::LoggingOut
         | AuthView::LogoutIncomplete { .. }
+        | AuthView::LogoutNotStarted {
+            trigger: LogoutTrigger::Server,
+        }
+        | AuthView::StartupBlocked
         | AuthView::Done { .. }
         | AuthView::SignedIn => Back::None,
     }
@@ -347,11 +367,13 @@ impl AuthView {
     }
 
     /// The account is being torn down (a logout began, or one is stuck):
-    /// the UI forgets everything of it (review round 15, B).
+    /// the UI forgets everything of it (review round 15, B). A logout that
+    /// could not start changed nothing, so it keeps the account's UI; a
+    /// blocked startup has loaded nothing, so it has nothing to keep.
     pub(crate) fn tears_down(&self) -> bool {
         matches!(
             self,
-            AuthView::LoggingOut | AuthView::LogoutIncomplete { .. }
+            AuthView::LoggingOut | AuthView::LogoutIncomplete { .. } | AuthView::StartupBlocked
         )
     }
 
@@ -472,6 +494,74 @@ mod tests {
             local: LocalDeletion::Deleted,
         };
         assert!(project(gone, &AuthView::LoggingOut, now).notice.is_some());
+    }
+
+    /// Round 19, 3: the projection gives a lone `*` flash call the full
+    /// code-field allowance, not one digit.
+    #[test]
+    fn lone_wildcard_flash_call_projects_the_full_bound() {
+        let state = AuthState::Code {
+            phone_hint: "x".into(),
+            sent: Some(SentCodeInfo {
+                delivery: CodeDelivery::FlashCall {
+                    pattern: "*".into(),
+                },
+                length: None,
+                next: None,
+                resend_at: None,
+            }),
+            error: None,
+        };
+        match project(state, &AuthView::Phone { error: None }, Instant::now()).view {
+            AuthView::Code {
+                sent: Some(sent), ..
+            } => assert_eq!(sent.max_digits, abyss_core::api::MAX_CODE_DIGITS),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Round 19, 1 and 2: a logout that could not start keeps the account
+    /// (and offers to stay signed in only for the user's own logout); an
+    /// unreadable marker at startup is its own screen, never "Logout
+    /// incomplete".
+    #[test]
+    fn unstarted_logout_and_blocked_startup_have_their_own_screens() {
+        use abyss_core::api::StorageError;
+        let now = Instant::now();
+        let at = |s: AuthState| project(s, &AuthView::SignedIn, now).view;
+        let user = at(AuthState::LogoutNotStarted {
+            error: StorageError::Keychain,
+            trigger: LogoutTrigger::User,
+        });
+        assert_eq!(
+            user,
+            AuthView::LogoutNotStarted {
+                trigger: LogoutTrigger::User
+            }
+        );
+        assert!(!user.tears_down(), "nothing changed: the account stays");
+        assert_eq!(back(&user, None), Back::Core, "stay signed in");
+        let server = AuthView::LogoutNotStarted {
+            trigger: LogoutTrigger::Server,
+        };
+        assert_eq!(back(&server, None), Back::None);
+        let blocked = at(AuthState::StartupBlocked {
+            error: StorageError::Keychain,
+        });
+        assert_eq!(blocked, AuthView::StartupBlocked);
+        assert_eq!(back(&blocked, None), Back::None);
+        assert!(copy::STARTUP_BLOCKED_TITLE.contains("Keychain"));
+        for text in [copy::STARTUP_BLOCKED_TITLE, copy::STARTUP_BLOCKED_DETAIL] {
+            assert!(!text.contains("Logout incomplete"), "{text}");
+        }
+        // Finding 8: the guide names both screens as they are shown.
+        let doc = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/connecting.md"
+        ));
+        for title in [copy::LOGOUT_NOT_STARTED_TITLE, copy::STARTUP_BLOCKED_TITLE] {
+            assert!(doc.contains(title), "{title}");
+        }
     }
 
     /// Task 6c: a failed local deletion is never shown as "Signed out".

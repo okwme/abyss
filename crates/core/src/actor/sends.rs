@@ -152,6 +152,7 @@ impl PendingSends {
             chat: p.chat,
             text: p.text.clone(),
             random_id: p.random_id,
+            expires: (p.flood_waits > 0).then_some(p.auto_until),
         })
     }
 
@@ -387,12 +388,22 @@ impl<B: Backend> Actor<B> {
             return;
         };
         if p.flood_waits > 0 && Instant::now() >= p.auto_until {
-            let seconds = p.last_flood;
-            p.retry_at = None;
-            self.error(UserError::FloodWait { seconds }).await;
-            return self.finish_send(local_id, SendState::Failed).await;
+            return self.send_window_closed(local_id).await;
         }
         self.dispatch_send(local_id).await;
+    }
+
+    /// A flood-waited send's automatic window closed before it went again
+    /// (at dispatch, or at admission for a queued job: `Job::Send::expires`):
+    /// `Error(FloodWait)`, then `Failed`.
+    pub(super) async fn send_window_closed(&mut self, local_id: LocalId) {
+        let Some(p) = self.sends.map.get_mut(&local_id) else {
+            return;
+        };
+        let seconds = p.last_flood;
+        p.retry_at = None;
+        self.error(UserError::FloodWait { seconds }).await;
+        self.finish_send(local_id, SendState::Failed).await;
     }
 
     /// A stream `updateMessageID`: the send carrying `random_id` has server

@@ -65,6 +65,9 @@ pub(super) enum Job {
         chat: ChatId,
         text: String,
         random_id: i64,
+        /// A flood-waited send's automatic-retry window: past it, the send
+        /// is not made (checked right before the call; review round 19).
+        expires: Option<tokio::time::Instant>,
     },
     Read {
         chat: ChatId,
@@ -117,6 +120,11 @@ pub(super) enum Outcome {
         local_id: LocalId,
         res: CallResult<MsgId>,
     },
+    /// An automatic send reached its call after its window closed: it was
+    /// not made.
+    SendExpired {
+        local_id: LocalId,
+    },
     Read(CallResult<()>),
     CacheChats(Option<Vec<ChatSummary>>),
     CacheHistory {
@@ -164,6 +172,15 @@ struct Admitted {
 }
 
 impl Admitted {
+    /// Reports `outcome` without a call; the permit is released.
+    fn skip(self, outcome: Outcome) -> Done {
+        Done {
+            cgen: self.cgen,
+            parked: None,
+            outcome,
+        }
+    }
+
     /// Runs `call` under the deadline and reports `outcome(result)`. On time-out
     /// the permit is handed back for parking; otherwise it is released here.
     async fn run<T>(
@@ -249,9 +266,19 @@ pub(super) fn job_future<C: Client>(
             chat,
             text,
             random_id,
+            expires,
         } => {
             let call = async move { client.send_text(chat, text, random_id).await };
-            let fut = admitted.run(call, move |res| Outcome::Send { local_id, res });
+            let fut = async move {
+                // Admission includes the window: a queued (or preserved)
+                // automatic send never reaches the server after it closed.
+                if expires.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                    return admitted.skip(Outcome::SendExpired { local_id });
+                }
+                admitted
+                    .run(call, move |res| Outcome::Send { local_id, res })
+                    .await
+            };
             (TaskKind::Send(local_id), Box::pin(fut))
         }
         Job::Read { chat, max_id } => {

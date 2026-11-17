@@ -187,6 +187,57 @@ fn logout_incomplete_screen(
         .into_any_element()
 }
 
+/// "Couldn't start logout": nothing changed. Retry writes the marker again;
+/// the user's own logout may stay signed in instead (core's Back).
+fn logout_not_started_screen(
+    session: &Session,
+    trigger: abyss_core::api::LogoutTrigger,
+    cx: &mut Context<'_, Root>,
+) -> AnyElement {
+    use abyss_core::api::LogoutTrigger;
+    let detail = match trigger {
+        LogoutTrigger::User => copy::LOGOUT_NOT_STARTED_USER,
+        LogoutTrigger::Server => copy::LOGOUT_NOT_STARTED_SERVER,
+    };
+    let stay = (back(&session.auth, session.source) == Back::Core).then(|| {
+        on(
+            secondary("stay-signed-in", copy::STAY_SIGNED_IN),
+            Session::back,
+            cx,
+        )
+    });
+    let retry = on(
+        button("retry-logout", copy::onboarding::RETRY),
+        Session::retry_logout,
+        cx,
+    );
+    centered()
+        .child(
+            card()
+                .child(title(copy::LOGOUT_NOT_STARTED_TITLE))
+                .child(error_line(detail))
+                .child(footer(stay, vec![retry])),
+        )
+        .into_any_element()
+}
+
+/// "Couldn't read Keychain" at startup: Retry reads the marker again.
+fn startup_blocked_screen(cx: &mut Context<'_, Root>) -> AnyElement {
+    let retry = on(
+        button("retry-startup", copy::onboarding::RETRY),
+        Session::retry_startup,
+        cx,
+    );
+    centered()
+        .child(
+            card()
+                .child(title(copy::STARTUP_BLOCKED_TITLE))
+                .child(error_line(copy::STARTUP_BLOCKED_DETAIL))
+                .child(footer(None, vec![retry])),
+        )
+        .into_any_element()
+}
+
 /// The auth router: one arm per state, each delegating to its own screen
 /// function. The onboarding screens live in [`onboarding`].
 fn auth_screen(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
@@ -220,6 +271,8 @@ fn auth_screen(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
 
         AuthView::LoggingOut => onboarding::logging_out_screen(),
         AuthView::LogoutIncomplete { remote } => logout_incomplete_screen(*remote, cx),
+        AuthView::LogoutNotStarted { trigger } => logout_not_started_screen(session, *trigger, cx),
+        AuthView::StartupBlocked => startup_blocked_screen(cx),
         AuthView::Done {
             has_password,
             saved,

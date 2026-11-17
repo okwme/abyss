@@ -131,9 +131,22 @@ device. If the local deletion fails (for example, the Keychain refuses),
 abyss shows **Logout incomplete** with **Retry**, and accepts no new login
 until Retry succeeds.
 
-abyss records that a logout is in progress before it starts. If abyss quits
-or crashes before the deletion finishes, or the deletion failed, the next
-start finishes the deletion first: it never signs the old account back in.
-If that record cannot be read, abyss starts in **Logout incomplete** and
-waits for Retry.
+abyss records in the Keychain that a logout is in progress, and does nothing
+else until that record is saved. If it cannot be saved (for example, the
+Keychain is locked), abyss shows **Couldn't start logout**: nothing was
+ended or deleted, you are still signed in on this Mac, and you can **Retry**
+or **Stay signed in**. A logout Telegram started (it ended the session)
+offers only Retry.
+
+Once the record is saved, a logout that is interrupted (abyss quits or
+crashes before the deletion finishes) or whose deletion failed is finished
+at the next start, before anything else: abyss never signs that account
+back in. This holds only for a logout whose record was saved; a logout that
+could not start leaves the account signed in, as the screen says.
+
+If abyss cannot read that record at startup, it cannot tell whether a
+logout is unfinished, so it shows **Couldn't read Keychain**, loads and
+deletes nothing, and waits. **Retry** reads the record again: if there is
+none, abyss starts normally with your account; if there is one, it finishes
+that logout; if it still cannot read it, it keeps waiting.
 

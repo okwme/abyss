@@ -1,6 +1,8 @@
 //! Logout (plan sections 5 and 16) and cache provisioning.
 //!
-//! Two steps, run like the other lifecycle steps so the actor keeps serving:
+//! First the logout-pending marker is made durable (`marker`): a logout
+//! whose marker cannot be written does nothing at all. Then two steps, run
+//! like the other lifecycle steps so the actor keeps serving:
 //! 1. **Remote:** `Terminate{gen}` (no write for this account is applied any
 //!    more), `auth.logOut` with the runner still alive (10 s), then the
 //!    instance is retired (quit, join, revoke).
@@ -17,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -24,11 +27,12 @@ use super::Actor;
 use super::apply::user_error;
 use super::binding::{Rebinding, finish_rebinding};
 use super::jobs::CallError;
-use super::lifecycle::{LogoutStage, Phase, REBUILD_CAPS, Retired, Step, retire};
-use super::marker::mark_logout_pending;
+use super::lifecycle::{Live, LogoutStage, Phase, REBUILD_CAPS, Retired, Step, retire};
+use super::marker::{Marking, mark_logout_pending, mark_until};
 
 use crate::api::{
-    AuthState, Event, LocalDeletion, LogoutStatus, RemoteLogout, StorageError, UserError,
+    AuthState, Event, LocalDeletion, LogoutStatus, LogoutTrigger, RemoteLogout, StorageError,
+    UserError,
 };
 use crate::backend::{Backend, BackendError, Client};
 use crate::cache::{self, CacheError, CacheHandle, CacheKey};
@@ -105,19 +109,6 @@ impl LocalDone {
     }
 }
 
-/// Writes the logout-pending marker unless shutdown starts first (`None`).
-async fn mark_until(
-    persist: &PersistHandle,
-    remote: Option<RemoteLogout>,
-    shutdown: &CancellationToken,
-) -> Option<Result<(), crate::secret::StoreError>> {
-    tokio::select! {
-        biased;
-        () = shutdown.cancelled() => None,
-        res = mark_logout_pending(persist, remote) => Some(res),
-    }
-}
-
 async fn sign_out<C: Client>(client: Arc<C>, shutdown: &CancellationToken) -> RemoteLogout {
     tokio::select! {
         biased;
@@ -138,8 +129,10 @@ async fn delete_local(
     parts: Option<(PathBuf, Option<Rebinding>)>,
     remote: Option<RemoteLogout>,
 ) -> LocalDone {
-    // Again first (a retry, a resume, or shutdown during the remote step):
-    // the marker outlives a deletion that fails or is cut short.
+    // Refreshes the remote result only. Every path here starts from a
+    // marker that was written (the gate in `marker`) or read (startup), and
+    // the Keychain updates in place, so a failed rewrite keeps that marker:
+    // the deletion below never runs without one (review round 19).
     let _ = mark_logout_pending(&persist, remote).await;
     let session = match account {
         Some(account) => persist
@@ -244,20 +237,81 @@ pub(crate) async fn open_cache(
     .flatten()
 }
 
+/// The remote step's inputs, detached from the actor.
+struct RemoteStep<B: Backend> {
+    account: Option<AccountGen>,
+    persist: PersistHandle,
+    shutdown: CancellationToken,
+    plan: RemotePlan,
+    live: Option<Live<B>>,
+    /// A retirement that was running when the teardown began.
+    retiring: Option<JoinHandle<Step<B>>>,
+}
+
+impl<B: Backend> RemoteStep<B> {
+    /// `Terminate`, `auth.logOut` with the runner alive, then retirement.
+    /// The marker is already durable.
+    async fn run(self) -> Step<B> {
+        let Self {
+            account,
+            persist,
+            shutdown,
+            plan,
+            live,
+            retiring,
+        } = self;
+        if let Some(step) = retiring {
+            // Its instance and outcomes belong to the old account.
+            let _ = step.await;
+        }
+        if let Some(account) = account {
+            let _ = persist.terminate(account).await;
+        }
+        let remote = match (plan, &live) {
+            (RemotePlan::Attempt, Some(l)) => sign_out(Arc::clone(&l.client), &shutdown).await,
+            (RemotePlan::Attempt, None) => RemoteLogout::Failed(UserError::Network),
+            (RemotePlan::ServerRevoked, _) => RemoteLogout::Revoked,
+            (RemotePlan::Skip, _) => RemoteLogout::NotAttempted,
+        };
+        // Best effort: the marker written before still resumes the logout;
+        // this only refines what a resumed one reports.
+        let _ = mark_until(&persist, Some(remote), &shutdown).await;
+        let retired = match live {
+            Some(l) => Some(retire(l, REBUILD_CAPS, &shutdown).await),
+            None => None,
+        };
+        Step::SignedOut { remote, retired }
+    }
+}
+
 impl<B: Backend> Actor<B> {
     pub(super) async fn on_logout_command(&mut self) {
-        if self.life.phase == Phase::LoggingOut(LogoutStage::Unfinished) {
-            let remote = self
-                .unfinished_logout
-                .map_or(RemoteLogout::NotAttempted, |(remote, _)| remote);
-            return self.retry_logout(remote).await;
+        match self.life.phase {
+            Phase::LoggingOut(LogoutStage::Unfinished) => {
+                let remote = self
+                    .unfinished_logout
+                    .map_or(RemoteLogout::NotAttempted, |(remote, _)| remote);
+                return self.retry_logout(remote).await;
+            }
+            // Never a deletion on an unread marker: read it again.
+            Phase::LoggingOut(LogoutStage::Unknown) => return self.retry_startup().await,
+            _ => {}
+        }
+        // Retry of a logout that could not start.
+        if let Some((blocked, error)) = self.logout_gate.take_blocked() {
+            if matches!(self.life.phase, Phase::Retiring(_)) {
+                // It stays retryable.
+                self.logout_gate.put_blocked(blocked, error);
+                return self.error(UserError::Busy).await;
+            }
+            return self.start_logout(blocked).await;
         }
         let plan = if self.auth.signed_in {
             RemotePlan::Attempt
         } else {
             RemotePlan::Skip
         };
-        self.start_logout(plan).await;
+        self.request_logout(plan, LogoutTrigger::User).await;
     }
 
     /// A call answered `AUTH_KEY_UNREGISTERED`/`SESSION_REVOKED`: the key is
@@ -268,22 +322,55 @@ impl<B: Backend> Actor<B> {
             return;
         }
         self.auth.phone_error = Some(UserError::SessionRevoked);
-        self.start_logout(RemotePlan::ServerRevoked).await;
+        self.request_logout(RemotePlan::ServerRevoked, LogoutTrigger::Server)
+            .await;
     }
 
-    async fn start_logout(&mut self, plan: RemotePlan) {
+    /// A new logout request. One already waiting on its marker (running or
+    /// failed) absorbs it: a failed marker is retried only by the user, so
+    /// repeated revocations never hammer the Keychain.
+    async fn request_logout(&mut self, plan: RemotePlan, trigger: LogoutTrigger) {
+        if self.logout_gate.escalate(plan, trigger) {
+            return self.emit_auth().await;
+        }
+        let resume = self.auth.state.clone();
+        self.start_logout(Marking {
+            plan,
+            trigger,
+            resume,
+        })
+        .await;
+    }
+
+    /// Admits a logout: its marker is written first, and nothing else
+    /// happens until that write succeeded (review round 19).
+    async fn start_logout(&mut self, marking: Marking) {
         match self.life.phase {
+            Phase::LoggingOut(_) => self.emit_auth().await,
+            Phase::Retiring(_) => self.error(UserError::Busy).await,
+            _ if self.logout_gate.is_marking() => self.emit_auth().await,
+            _ => self.begin_marking(marking),
+        }
+    }
+
+    /// The marker is durable: the teardown starts. From here on a crash or
+    /// a failed deletion resumes the logout at the next startup.
+    pub(super) async fn tear_down(&mut self, plan: RemotePlan) {
+        let retiring = match self.life.phase {
             Phase::LoggingOut(_) => return self.emit_auth().await,
-            Phase::Retiring(_) => return self.error(UserError::Busy).await,
+            // A rebuild began while the marker was written: the logout
+            // waits for that retirement inside its remote step.
+            Phase::Retiring(_) => self.life.step_mut().take(),
             // No instance yet; the build is just dropped.
             Phase::Building => {
                 if let Some(step) = self.life.step_mut().take() {
                     step.abort();
                     let _ = step.await;
                 }
+                None
             }
-            Phase::Booting | Phase::Live | Phase::Halted | Phase::SignedOut => {}
-        }
+            Phase::Booting | Phase::Live | Phase::Halted | Phase::SignedOut => None,
+        };
         let live = self.live.take();
         // The account's data and the UI's views are reset below.
         let _ = self.begin_retire();
@@ -294,38 +381,16 @@ impl<B: Backend> Actor<B> {
         self.quarantine_cache();
         self.reset_account_data().await;
         self.set_auth(AuthState::LoggingOut).await;
-        let account = self.account.generation().ok();
-        let persist = self.persist.clone();
-        let shutdown = self.cancel.clone();
-        let events = self.events.clone();
+        let remote = RemoteStep {
+            account: self.account.generation().ok(),
+            persist: self.persist.clone(),
+            shutdown: self.cancel.clone(),
+            plan,
+            live,
+            retiring,
+        };
         self.life.phase = Phase::LoggingOut(LogoutStage::Remote);
-        *self.life.step_mut() = Some(tokio::spawn(async move {
-            // Durable before any side effect: a crash or a failed deletion
-            // from here on resumes the logout at the next startup (round 15,
-            // A). A failed write is reported; the logout is still wanted.
-            // Shutdown stops waiting on a stalled store: its local step
-            // writes the marker again, within the shutdown deadline.
-            if let Some(Err(e)) = mark_until(&persist, None, &shutdown).await {
-                let _ = events.send(Event::Error(UserError::from(&e))).await;
-            }
-            if let Some(account) = account {
-                let _ = persist.terminate(account).await;
-            }
-            let remote = match (plan, &live) {
-                (RemotePlan::Attempt, Some(l)) => sign_out(Arc::clone(&l.client), &shutdown).await,
-                (RemotePlan::Attempt, None) => RemoteLogout::Failed(UserError::Network),
-                (RemotePlan::ServerRevoked, _) => RemoteLogout::Revoked,
-                (RemotePlan::Skip, _) => RemoteLogout::NotAttempted,
-            };
-            // Best effort: the marker written before still resumes the
-            // logout; this only refines what a resumed one reports.
-            let _ = mark_until(&persist, Some(remote), &shutdown).await;
-            let retired = match live {
-                Some(l) => Some(retire(l, REBUILD_CAPS, &shutdown).await),
-                None => None,
-            };
-            Step::SignedOut { remote, retired }
-        }));
+        *self.life.step_mut() = Some(tokio::spawn(remote.run()));
     }
 
     /// The remote step finished: the instance is gone. Its send outcomes
@@ -442,7 +507,8 @@ impl<B: Backend> Actor<B> {
     /// generation, an erased cache and no pending sends.
     pub(super) async fn abandon_account(&mut self) {
         self.auth.phone_error = Some(UserError::AccountMigrated);
-        self.start_logout(RemotePlan::Skip).await;
+        self.request_logout(RemotePlan::Skip, LogoutTrigger::Server)
+            .await;
     }
 
     /// Moves the served cache aside, open but never read, until the local

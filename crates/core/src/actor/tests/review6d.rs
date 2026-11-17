@@ -18,7 +18,7 @@ use crate::model::LocalId;
 use crate::secret::{SecretItem, SecretStore};
 
 const PHONE: &str = "+44 7700 900123";
-const HASH: &str = "00112233445566778899aabbccddeeff";
+pub(super) const HASH: &str = "00112233445566778899aabbccddeeff";
 /// Polls of the store (10 ms apart, real time) before a test gives up.
 const STORE_POLLS: usize = 300;
 
@@ -29,14 +29,14 @@ fn script(env: EnvResolution) -> FakeScript {
     script
 }
 
-fn entered() -> ApiCredentials {
+pub(super) fn entered() -> ApiCredentials {
     ApiCredentials {
         api_id: crate::api::ApiId::new(FAKE_API_ID).unwrap(),
         api_hash: ApiHash::parse(HASH).unwrap(),
     }
 }
 
-async fn signed_out_with(env: EnvResolution, setup: Setup) -> Harness {
+pub(super) async fn signed_out_with(env: EnvResolution, setup: Setup) -> Harness {
     let (backend, fake) = FakeBackend::new(script(env));
     let setup = Setup {
         signed_out: true,
@@ -54,7 +54,7 @@ fn is_phone(s: &AuthState) -> bool {
 }
 
 impl Harness {
-    async fn reach_code(&mut self) {
+    pub(super) async fn reach_code(&mut self) {
         self.auth(is_phone).await;
         self.send(Command::SubmitPhone(PHONE.into())).await;
         self.auth(is_code).await;
@@ -67,7 +67,7 @@ impl Harness {
     }
 
     /// Whether the credential item is gone within the poll budget.
-    async fn item_absent(&self) -> bool {
+    pub(super) async fn item_absent(&self) -> bool {
         self.item_reaches(|present| !present).await
     }
 
@@ -479,14 +479,14 @@ async fn commands_queued_after_logout_never_act_for_the_next_account() {
 }
 
 /// Whether the store holds a signed-in session item.
-async fn stored_signed_in(store: &crate::secret::MemoryStore) -> bool {
+pub(super) async fn stored_signed_in(store: &crate::secret::MemoryStore) -> bool {
     let persist = crate::session::PersistHandle::spawn(store.clone()).unwrap();
     let loaded = persist.load_session().await.unwrap();
     loaded.snapshot.is_signed_in().unwrap()
 }
 
 /// Restarts over `store` with a demo server, as the same device would.
-async fn restart_over(store: &crate::secret::MemoryStore, setup: Setup) -> Harness {
+pub(super) async fn restart_over(store: &crate::secret::MemoryStore, setup: Setup) -> Harness {
     let (backend, fake) = FakeBackend::new(super::review6c::demo());
     let setup = Setup {
         store: Some(store.clone()),
@@ -574,79 +574,5 @@ async fn marker_left_by_a_crash_resumes_the_logout() {
     );
     assert!(!stored_signed_in(&h.store).await);
     assert!(h.store.get(SecretItem::LogoutPending).unwrap().is_none());
-    h.stop().await;
-}
-
-/// Round 15, A: a marker that cannot be read fails closed: startup is
-/// blocked in "Logout incomplete" (no session, no client) until Retry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unreadable_marker_blocks_startup() {
-    use crate::api::LocalDeletion;
-
-    let store = crate::secret::MemoryStore::new();
-    store
-        .set(
-            SecretItem::Session,
-            &crate::session::signed_in_blob(
-                crate::backend::fake::FAKE_SELF_ID,
-                crate::backend::fake::FAKE_SELF_HASH,
-            ),
-        )
-        .unwrap();
-    let setup = Setup {
-        marker_unreadable: true,
-        ..Setup::default()
-    };
-    let mut h = restart_over(&store, setup).await;
-    let (ev, seen) = h
-        .until(|e| matches!(e, Event::Auth(AuthState::LoggedOut { .. })))
-        .await;
-    assert!(matches!(
-        ev,
-        Event::Auth(AuthState::LoggedOut {
-            local: LocalDeletion::Failed(_),
-            ..
-        })
-    ));
-    assert!(
-        !seen
-            .iter()
-            .any(|e| matches!(e, Event::Auth(s) if s.is_signed_in()))
-    );
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(h.fake.builds(), 0, "no client while blocked");
-    assert!(stored_signed_in(&h.store).await, "nothing deleted unasked");
-    h.send(Command::Logout).await;
-    h.until(|e| {
-        matches!(
-            e,
-            Event::Auth(AuthState::LoggedOut {
-                local: LocalDeletion::Deleted,
-                ..
-            })
-        )
-    })
-    .await;
-    assert!(!stored_signed_in(&h.store).await);
-    h.stop().await;
-}
-
-/// Round 15, A: a marker that cannot be written is reported, and the logout
-/// still runs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_marker_write_is_reported() {
-    let (backend, fake) = FakeBackend::new(super::review6c::demo());
-    let mut h = start(backend, fake, Setup::default()).await;
-    h.online().await;
-    h.faults.fail_set_of(SecretItem::LogoutPending);
-    h.send(Command::Logout).await;
-    let (_, seen) = h
-        .until(|e| matches!(e, Event::Auth(AuthState::LoggedOut { .. })))
-        .await;
-    assert!(
-        seen.iter()
-            .any(|e| matches!(e, Event::Error(UserError::Storage(_)))),
-        "no error reported: {seen:?}"
-    );
     h.stop().await;
 }

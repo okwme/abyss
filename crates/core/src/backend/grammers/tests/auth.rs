@@ -181,6 +181,65 @@ fn delivery_text_is_kept_and_sanitized() {
     }
 }
 
+/// Round 19, finding 6: only an unambiguous Fragment address is kept;
+/// misleading hosts are dropped (the screen then shows no address).
+#[test]
+fn fragment_urls_are_parsed_strictly() {
+    use crate::backend::grammers::auth::safe_url;
+    for good in [
+        "https://fragment.com/number/888",
+        "https://fragment.com",
+        "https://fragment.com:443/number/888?x=1#y",
+        "https://www.fragment.com/number/888",
+    ] {
+        assert_eq!(safe_url(good).as_deref(), Some(good), "{good}");
+    }
+    let long_path = format!("https://fragment.com/{}", "a".repeat(235));
+    assert_eq!(long_path.len(), 256);
+    assert!(safe_url(&long_path).is_some(), "256 bytes fit");
+    let too_long = format!("{long_path}a");
+    let bad = [
+        // Userinfo and suffix confusion.
+        "https://fragment.com@evil.example/",
+        "https://user:pw@fragment.com/",
+        "https://fragment.com.evil.example/",
+        "https://evilfragment.com/",
+        "https://fragment.com\\@evil.example/",
+        // Ports, schemes.
+        "https://fragment.com:8443/",
+        "https://fragment.com:/",
+        "http://fragment.com/",
+        "javascript:alert(1)",
+        // IDN, punycode, case tricks.
+        "https://fragмent.com/",
+        "https://xn--frgment-9ya.com/",
+        "https://xn--80ak6aa92e.fragment.com/",
+        "https://FRAGMENT.COM/",
+        // Controls, bidi marks, spaces.
+        "https://fragment.com/\u{202e}moc.live",
+        "https://fragment.com/\u{0}",
+        "https://fragment.com/a b",
+        "https://fragment.com\t/",
+        too_long.as_str(),
+    ];
+    for url in bad {
+        assert_eq!(safe_url(url), None, "{url:?}");
+    }
+}
+
+/// Round 19, finding 7: `phone_code_hash` never reaches a log.
+#[test]
+fn mapped_code_debug_redacts_the_hash() {
+    let sentinel = "SENTINEL-CODE-HASH-7f3a";
+    let mapped = MappedCode {
+        hash: sentinel.into(),
+        sent: mapped(CodeDelivery::App, Some(5)).sent,
+    };
+    let shown = format!("{mapped:?} {mapped:#?}");
+    assert!(!shown.contains(sentinel), "{shown}");
+    assert!(shown.contains("<redacted>"), "{shown}");
+}
+
 /// Round 11, finding 3: `updates.getState` after an authorization. A
 /// revocation in between is propagated (not swallowed as "no state"); only
 /// transport and flood failures are best-effort; anything else is

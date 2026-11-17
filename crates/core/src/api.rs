@@ -6,8 +6,8 @@ use crate::store::ViewGen;
 pub use crate::auth_types::{
     ApiCredentials, ApiHash, ApiHashError, ApiId, ApiIdError, AuthState, CodeDelivery,
     CredentialError, CredentialItem, CredentialSource, EnvVar, LocalDeletion, LogoutStatus,
-    MAX_CODE_DIGITS, MAX_DELIVERY_TEXT, NewLogin, NextDelivery, PASSWORD_CAPACITY, PasswordBuf,
-    PasswordTooLong, RemoteLogout, SaveStatus, SentCodeInfo, StorageError, mask_phone,
+    LogoutTrigger, MAX_CODE_DIGITS, MAX_DELIVERY_TEXT, NewLogin, NextDelivery, PASSWORD_CAPACITY,
+    PasswordBuf, PasswordTooLong, RemoteLogout, SaveStatus, SentCodeInfo, StorageError, mask_phone,
 };
 
 /// Generation of the client instance. Bumps on every rebuild, login and logout;
@@ -79,8 +79,13 @@ pub enum Command {
     RetryCredentialSave,
     /// One login step back (plan section 17.3): code, password and the
     /// official-app screens go to the phone screen; the phone screen goes to
-    /// the credential screens. Refused once signed in (only logout goes back).
+    /// the credential screens. Refused once signed in (only logout goes back),
+    /// except on [`AuthState::LogoutNotStarted`] after a user's logout, where
+    /// it stays signed in.
     Back,
+    /// Reads the logout-pending marker again after startup could not
+    /// ([`AuthState::StartupBlocked`]).
+    RetryStartup,
 }
 
 impl std::fmt::Debug for Command {
@@ -116,6 +121,7 @@ impl std::fmt::Debug for Command {
             Self::ReloadCredentials => f.write_str("ReloadCredentials"),
             Self::RetryCredentialSave => f.write_str("RetryCredentialSave"),
             Self::Back => f.write_str("Back"),
+            Self::RetryStartup => f.write_str("RetryStartup"),
         }
     }
 }

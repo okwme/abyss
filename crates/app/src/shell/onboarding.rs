@@ -169,12 +169,27 @@ impl Session {
         cx.notify();
     }
 
-    /// "Logout incomplete": Retry runs the local deletion again.
+    /// "Logout incomplete": Retry runs the local deletion again. "Couldn't
+    /// start logout": Retry writes the marker again; the screen stays until
+    /// core says the logout started (or failed to again).
     pub(super) fn retry_logout(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
-        if matches!(self.auth, AuthView::LogoutIncomplete { .. })
-            && self.admit_auth(Command::Logout, window, cx).is_ok()
-        {
-            self.set_auth(AuthView::LoggingOut, window, cx);
+        match self.auth {
+            AuthView::LogoutIncomplete { .. } => {
+                if self.admit_auth(Command::Logout, window, cx).is_ok() {
+                    self.set_auth(AuthView::LoggingOut, window, cx);
+                }
+            }
+            AuthView::LogoutNotStarted { .. } => {
+                let _ = self.admit_auth(Command::Logout, window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// "Couldn't read Keychain" at startup: core reads the marker again.
+    pub(super) fn retry_startup(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        if self.auth == AuthView::StartupBlocked {
+            let _ = self.admit_auth(Command::RetryStartup, window, cx);
         }
     }
 }

@@ -432,7 +432,7 @@ async fn prepare<B: Backend>(
 
 /// Loads the stored session. A Keychain that cannot be read leaves the
 /// account unknown, with a warning.
-async fn load_account(
+pub(crate) async fn load_account(
     persist: &PersistHandle,
     events: &EventSender,
 ) -> (crate::session::SessionSnapshot, Identity) {

@@ -97,6 +97,9 @@ pub(super) enum LogoutStage {
     /// The local step failed: "Logout incomplete" until a Retry succeeds.
     /// No instance, no login.
     Unfinished,
+    /// Startup could not read the logout-pending marker: nothing loaded,
+    /// served, built or deleted until `Command::RetryStartup` reads it.
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -350,7 +353,12 @@ fn keep(
     match joined {
         Ok((id, done)) => {
             kinds.remove(&id);
-            if done.parked.is_some() || matches!(done.outcome, Outcome::Send { .. }) {
+            if done.parked.is_some()
+                || matches!(
+                    done.outcome,
+                    Outcome::Send { .. } | Outcome::SendExpired { .. }
+                )
+            {
                 dones.push(done);
             }
         }

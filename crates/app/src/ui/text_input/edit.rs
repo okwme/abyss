@@ -518,6 +518,25 @@ mod tests {
         assert_eq!(b.text(), "12345");
     }
 
+    /// Round 19, 3: a lone `*` flash-call pattern accepts a number of any
+    /// length, so a complete international number fits the code field.
+    #[test]
+    fn lone_wildcard_flash_call_takes_a_whole_number() {
+        use abyss_core::api::{CodeDelivery, SentCodeInfo};
+        let sent = SentCodeInfo {
+            delivery: CodeDelivery::FlashCall {
+                pattern: "*".into(),
+            },
+            length: None,
+            next: None,
+            resend_at: None,
+        };
+        let mut b = EditBuffer::new(Limits::CODE);
+        b.set_max_utf16(sent.max_code_digits());
+        assert_eq!(b.replace(None, "447700900123"), Fit::Whole);
+        assert_eq!(b.text(), "447700900123");
+    }
+
     #[test]
     fn line_policy() {
         let mut single = EditBuffer::new(Limits {

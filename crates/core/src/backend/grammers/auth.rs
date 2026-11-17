@@ -67,10 +67,20 @@ impl std::fmt::Debug for GrammersPasswordToken {
 }
 
 /// A mapped `auth.sentCode`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MappedCode {
+    /// `phone_code_hash`: login material, never logged.
     pub(crate) hash: String,
     pub(crate) sent: SentCode,
+}
+
+impl std::fmt::Debug for MappedCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedCode")
+            .field("hash", &"<redacted>")
+            .field("sent", &self.sent)
+            .finish()
+    }
 }
 
 /// A flash-call pattern or missed-call prefix as shown: digits, `+`, `*`,
@@ -82,13 +92,59 @@ pub(crate) fn number_text(raw: &str) -> String {
         .collect()
 }
 
-/// A server-supplied URL, kept only if it is `https://`, printable ASCII
-/// without spaces, and bounded. Shown as text; nothing opens it.
+/// The Fragment host: its number pages are `https://fragment.com/number/…`.
+const FRAGMENT_HOST: &str = "fragment.com";
+/// The longest DNS label.
+const MAX_LABEL: usize = 63;
+
+/// A server-supplied Fragment URL, kept only if it is unambiguously on
+/// Fragment (review round 19, finding 6): bounded printable ASCII (no
+/// spaces, controls or bidi marks), `https://`, no userinfo, no port but
+/// the default, and a host that is `fragment.com` or a lowercase subdomain
+/// of it (no punycode labels). Anything else is dropped, so the screen
+/// shows no address rather than a misleading one. Shown as text; nothing
+/// opens it. A small parser on purpose: no URL crate for one field.
 pub(crate) fn safe_url(raw: &str) -> Option<String> {
-    let ok = raw.starts_with("https://")
-        && raw.len() <= MAX_DELIVERY_TEXT
-        && raw.bytes().all(|b| b.is_ascii_graphic());
-    ok.then(|| raw.to_owned())
+    if raw.len() > MAX_DELIVERY_TEXT || !raw.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    let rest = raw.strip_prefix("https://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = rest.get(..end)?;
+    // Userinfo (`fragment.com@evil.example`) is never allowed.
+    if authority.contains('@') {
+        return None;
+    }
+    let host = match authority.split_once(':') {
+        Some((host, "443")) => host,
+        Some(_) => return None,
+        None => authority,
+    };
+    fragment_host(host).then(|| raw.to_owned())
+}
+
+/// `fragment.com`, or a subdomain of it made of plain lowercase labels.
+fn fragment_host(host: &str) -> bool {
+    let Some(sub) = host.strip_suffix(FRAGMENT_HOST) else {
+        return false;
+    };
+    if sub.is_empty() {
+        return true;
+    }
+    // `evilfragment.com` is not a subdomain.
+    let Some(labels) = sub.strip_suffix('.') else {
+        return false;
+    };
+    labels.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= MAX_LABEL
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && !label.starts_with("xn--")
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    })
 }
 
 /// The supported delivery of a sent-code type, with its code length.

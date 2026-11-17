@@ -187,6 +187,29 @@ pub(super) async fn finish_rebinding(
 }
 
 impl<B: Backend> Actor<B> {
+    /// Startup was blocked with the cache quarantined, and the session was
+    /// loaded since (`marker::retry_startup`): bind the cache for that
+    /// `identity` as `provision_cache` would have.
+    pub(super) async fn reprovision_cache(&mut self, identity: Identity) {
+        let Some(parts) = self.cache_parts.as_mut() else {
+            return;
+        };
+        let open = parts.take_open(self.cache.take());
+        let bound = match identity {
+            Identity::Verified(id) => settle(&self.persist, &parts.dir, open, Some(id)).await,
+            Identity::SignedOut => settle(&self.persist, &parts.dir, open, None).await,
+            Identity::Unknown => open.map(|(handle, key)| Bound {
+                handle,
+                key,
+                gate: Gate::Quarantined,
+                owner: None,
+            }),
+        };
+        if let Some(bound) = bound {
+            self.cache = parts.keep(bound);
+        }
+    }
+
     /// A login completed: bind the cache to the account it signed in to.
     /// Without a self user to verify against, the cache stays quarantined.
     pub(super) async fn bind_cache(&mut self) {

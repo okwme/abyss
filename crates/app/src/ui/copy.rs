@@ -56,6 +56,24 @@ pub(crate) const LOGOUT_INCOMPLETE_DETAIL: &str = "Some of this account's data c
 pub(crate) const LOGOUT_REMOTE_UNCONFIRMED: &str = "Telegram didn't confirm the sign-out: end \
      the session from Active Sessions on another device.";
 
+/// The logout-pending marker could not be written, so nothing was done
+/// (review round 19).
+pub(crate) const LOGOUT_NOT_STARTED_TITLE: &str = "Couldn't start logout";
+pub(crate) const LOGOUT_NOT_STARTED_USER: &str = "abyss couldn't record the logout in the \
+     Keychain, so nothing was changed: you're still signed in on this Mac. Unlock the Keychain \
+     and retry.";
+pub(crate) const LOGOUT_NOT_STARTED_SERVER: &str = "Telegram ended this session, but abyss \
+     couldn't record the logout in the Keychain, so nothing was deleted from this Mac yet. \
+     Unlock the Keychain and retry.";
+pub(crate) const STAY_SIGNED_IN: &str = "Stay signed in";
+
+/// Startup couldn't read the logout-pending marker (review round 19). This
+/// is not a logout: nothing is deleted on it.
+pub(crate) const STARTUP_BLOCKED_TITLE: &str = "Couldn't read Keychain";
+pub(crate) const STARTUP_BLOCKED_DETAIL: &str = "abyss couldn't read its Keychain items, so it \
+     can't tell whether a logout is unfinished. Nothing was loaded or deleted. Unlock the \
+     Keychain and retry.";
+
 /// Logout asks first: it deletes local data (plan section 17.3, task 6c).
 pub(crate) const LOGOUT_CONFIRM_TITLE: &str = "Log out?";
 pub(crate) const LOGOUT_CONFIRM_DETAIL: &str = "This ends the session with Telegram and deletes \

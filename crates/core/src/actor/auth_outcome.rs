@@ -18,6 +18,7 @@ impl<B: Backend> Actor<B> {
             AuthMsg::Step { tag, step } => self.on_auth_step(tag, step).await,
             AuthMsg::Cred { attempt, done } => self.on_cred(attempt, done).await,
             AuthMsg::CacheSettled(generation) => self.on_cache_settled(generation).await,
+            AuthMsg::LogoutMarked(res) => self.on_logout_marked(res).await,
         }
     }
 

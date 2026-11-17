@@ -141,6 +141,7 @@ impl<B: Backend> Actor<B> {
         let err = call_error(&done.outcome).filter(|_| current);
         match done.outcome {
             Outcome::Send { local_id, res } => self.on_send(local_id, res).await,
+            Outcome::SendExpired { local_id } => self.send_window_closed(local_id).await,
             _ if !current => {}
             Outcome::Dialogs { step, res } => {
                 self.on_dialogs(step, res).await;

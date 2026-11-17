@@ -239,6 +239,8 @@ pub(super) enum AuthMsg<C: Client> {
     /// A background cache re-binding with this generation sent its result
     /// to its join handle (see `binding`).
     CacheSettled(u64),
+    /// The logout-pending marker write finished (see `marker`).
+    LogoutMarked(Result<(), crate::api::StorageError>),
 }
 
 /// The running login task.
@@ -516,6 +518,8 @@ pub(super) fn sent_info(sent: SentCode) -> SentCodeInfo {
 
 impl<B: Backend> Actor<B> {
     pub(super) async fn set_auth(&mut self, state: AuthState) {
+        // A logout waiting on its marker decides what is shown (`marker`).
+        let state = self.logout_gate.hold(state);
         self.auth.state = state.clone();
         self.emit(Event::Auth(state)).await;
     }

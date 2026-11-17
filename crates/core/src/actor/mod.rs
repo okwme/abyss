@@ -162,6 +162,8 @@ pub(crate) struct Actor<B: Backend> {
     unfinished_logout: Option<(RemoteLogout, crate::api::LocalDeletion)>,
     /// Startup found the logout-pending marker (see `marker`).
     pending_logout: Option<PendingLogout>,
+    /// A logout waiting on its marker, or one that could not start.
+    logout_gate: marker::LogoutGate,
 }
 
 pub(crate) struct ActorChannels {
@@ -240,6 +242,7 @@ impl<B: Backend> Actor<B> {
             logout_remote: None,
             unfinished_logout: None,
             pending_logout: init.pending_logout,
+            logout_gate: marker::LogoutGate::default(),
         };
         let channels = ActorChannels {
             commands: init.commands,
@@ -328,23 +331,29 @@ impl<B: Backend> Actor<B> {
     async fn start(&mut self) {
         self.set_auth(AuthState::Connecting).await;
         self.emit(Event::Connection(ConnState::Connecting)).await;
-        if let Some(cache) = self.cache.clone() {
-            let cgen = self.cgen;
-            self.spawn_local(TaskKind::CacheChats, async move {
-                let chats = cache.chats().await.ok();
-                Done {
-                    cgen,
-                    parked: None,
-                    outcome: jobs::Outcome::CacheChats(chats),
-                }
-            });
-        }
+        self.load_cached_chats();
         self.resolve_credentials().await;
         // An interrupted logout finishes before any client is built.
         if let Some(pending) = self.pending_logout.take() {
             return self.resume_logout(pending).await;
         }
         self.start_build(Duration::ZERO);
+    }
+
+    /// Shows the served cache's chats until the server answers.
+    fn load_cached_chats(&mut self) {
+        let Some(cache) = self.cache.clone() else {
+            return;
+        };
+        let cgen = self.cgen;
+        self.spawn_local(TaskKind::CacheChats, async move {
+            let chats = cache.chats().await.ok();
+            Done {
+                cgen,
+                parked: None,
+                outcome: jobs::Outcome::CacheChats(chats),
+            }
+        });
     }
 
     /// Spawns a task that is not bound to a client instance (cache reads).
@@ -513,7 +522,8 @@ impl<B: Backend> Actor<B> {
     }
 
     /// Admits a UI command. An account-scoped one is refused while no
-    /// account is signed in, during a logout, or when the UI made it in
+    /// account is signed in, during a logout (from its marker write on), or
+    /// when the UI made it in
     /// another account epoch: a command queued behind a logout, or made for
     /// the old account, never acts for the next one (review round 15, C).
     async fn on_stamped(&mut self, stamped: Stamped) {
@@ -522,7 +532,11 @@ impl<B: Backend> Actor<B> {
             return self.on_command(cmd).await;
         }
         let current = epoch == self.events.epoch();
-        let signed_in = self.auth.signed_in && !matches!(self.life.phase, Phase::LoggingOut(_));
+        // A logout writing its marker counts as begun: what the UI queued
+        // behind it is refused, as during the teardown (review round 19).
+        let signed_in = self.auth.signed_in
+            && !matches!(self.life.phase, Phase::LoggingOut(_))
+            && !self.logout_gate.is_marking();
         if current && signed_in {
             return self.on_command(cmd).await;
         }
@@ -577,6 +591,7 @@ impl<B: Backend> Actor<B> {
             Command::ReloadCredentials => self.reload_credentials().await,
             Command::RetryCredentialSave => self.retry_credential_save().await,
             Command::Back => self.back().await,
+            Command::RetryStartup => self.retry_startup().await,
         }
     }
 

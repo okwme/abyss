@@ -10,7 +10,10 @@
 //!
 //! **Proof (round 11, finding 4).** An entered pair is saved only once a
 //! code request of the current attempt succeeded on an instance built for
-//! that very slot version: `Creds::proven` records the version. Nothing is
+//! that very slot version: `Creds::proven` records the attempt and the
+//! version (round 19, finding 5: a proof of an earlier attempt with the
+//! same pair does not carry over, and a queued save of an earlier attempt
+//! is skipped like one of an earlier version). Nothing is
 //! inferred from the screen, so a flood wait on the first code request, or
 //! a login confirmed by `fetch_self` after a new pair was entered, proves
 //! nothing. Save and delete failures are explicit ([`CredentialItem`]) with
@@ -73,8 +76,8 @@ pub(super) enum CredDone {
 pub(super) struct Creds {
     /// The source of the pair in use (`None`: no pair).
     source: Option<CredentialSource>,
-    /// The slot version a successful code request proved.
-    proven: Option<u64>,
+    /// The attempt and slot version a successful code request proved.
+    proven: Option<(AttemptId, u64)>,
     /// The slot version saved to the Keychain.
     saved: Option<u64>,
     /// A save of the entered pair is queued or running.
@@ -216,14 +219,15 @@ impl<B: Backend> Actor<B> {
     }
 
     /// Starts the next queued operation unless one runs. A save of a pair
-    /// no longer in use is skipped.
+    /// no longer in use, or queued by an earlier attempt, is skipped.
     async fn next_cred(&mut self) {
         if self.auth.creds.running.is_some() {
             return;
         }
         let version = self.backend.credentials().version();
+        let current = self.auth.attempt();
         while let Some((attempt, op)) = self.auth.creds.ops.pop_front() {
-            if matches!(op, CredOp::Save(_, v) if v != version) {
+            if matches!(op, CredOp::Save(_, v) if v != version || attempt != current) {
                 self.auth.creds.saving = false;
                 if self.auth.creds.item == CredentialItem::Saving {
                     self.set_item(CredentialItem::Settled).await;
@@ -331,17 +335,19 @@ impl<B: Backend> Actor<B> {
     pub(super) async fn prove_credentials(&mut self) {
         let slot = self.backend.credentials();
         if slot.taken() == slot.version() {
-            self.auth.creds.proven = Some(slot.version());
+            self.auth.creds.proven = Some((self.auth.attempt(), slot.version()));
         }
         self.persist_proven().await;
     }
 
-    /// Saves the entered pair in use if it is proven and not saved yet.
+    /// Saves the entered pair in use if this attempt proved it and it is
+    /// not saved yet.
     pub(super) async fn persist_proven(&mut self) {
         let version = self.backend.credentials().version();
+        let attempt = self.auth.attempt();
         let creds = &self.auth.creds;
         if creds.source != Some(CredentialSource::Entered)
-            || creds.proven != Some(version)
+            || creds.proven != Some((attempt, version))
             || creds.saved == Some(version)
             || creds.saving
         {
@@ -352,7 +358,6 @@ impl<B: Backend> Actor<B> {
         };
         self.auth.creds.saving = true;
         self.set_item(CredentialItem::Saving).await;
-        let attempt = self.auth.attempt();
         self.queue_cred(attempt, CredOp::Save(pair, version)).await;
     }
 
@@ -410,6 +415,10 @@ impl<B: Backend> Actor<B> {
     /// phone screen goes to the credential screens. Only before the session
     /// is authorized.
     pub(super) async fn back(&mut self) {
+        // "Stay signed in" after a logout that could not start.
+        if let Some(state) = self.logout_gate.stay_signed_in() {
+            return self.set_auth(state).await;
+        }
         if self.auth.signed_in || matches!(self.life.phase, Phase::LoggingOut(_)) {
             return self.emit_auth().await;
         }

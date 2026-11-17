@@ -321,9 +321,13 @@ pub struct SentCodeInfo {
 impl SentCodeInfo {
     /// The most digits the code entry takes for this delivery: a flash
     /// call's pattern length (the whole calling number), else the stated
-    /// length, else [`MAX_CODE_DIGITS`]; never more than that.
+    /// length, else [`MAX_CODE_DIGITS`]; never more than that. A pattern
+    /// that is a lone `*` accepts a number of any length
+    /// (<https://core.telegram.org/api/pattern>), so it gets the full
+    /// allowance; `*` among digits stands for one digit.
     pub fn max_code_digits(&self) -> usize {
         let digits = match &self.delivery {
+            CodeDelivery::FlashCall { pattern } if pattern.trim() == "*" => None,
             CodeDelivery::FlashCall { pattern } => {
                 let n = pattern
                     .chars()
@@ -554,6 +558,30 @@ pub enum AuthState {
         remote: RemoteLogout,
         local: LocalDeletion,
     },
+    /// The logout-pending marker could not be written, so the logout did
+    /// not start: nothing was ended or deleted, and the session is intact
+    /// (review round 19). `Command::Logout` retries; for a logout the user
+    /// asked for, `Command::Back` stays signed in.
+    LogoutNotStarted {
+        error: StorageError,
+        trigger: LogoutTrigger,
+    },
+    /// Startup could not read the logout-pending marker, so it cannot tell
+    /// whether a logout is pending: nothing is loaded or deleted until
+    /// `Command::RetryStartup` reads it (review round 19).
+    StartupBlocked {
+        error: StorageError,
+    },
+}
+
+/// Who started a logout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogoutTrigger {
+    /// The user: they may stay signed in instead.
+    User,
+    /// The server ended the session, or a repeated migration abandoned it:
+    /// the account cannot continue.
+    Server,
 }
 
 impl AuthState {
@@ -677,6 +705,11 @@ mod tests {
             pattern: "*".repeat(40),
         };
         assert_eq!(info(long, None).max_code_digits(), MAX_CODE_DIGITS);
+        // Round 19, 3: a lone `*` is any number of digits, not one.
+        let any = CodeDelivery::FlashCall {
+            pattern: "*".into(),
+        };
+        assert_eq!(info(any, None).max_code_digits(), MAX_CODE_DIGITS);
         let missed = CodeDelivery::MissedCall {
             prefix: "+44 7700".into(),
         };
