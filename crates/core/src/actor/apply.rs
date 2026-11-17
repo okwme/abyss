@@ -1,6 +1,7 @@
 //! Applying completions and live updates to the store, cache and UI.
 
 use super::Actor;
+use super::FoldersLoad;
 use super::boot::{BootKind, Origin, Snapshot, TailVia};
 use super::jobs::{
     CallError, CallResult, DialogsStep, Done, Load, Outcome, PAGE, ReqId, StreamEnd,
@@ -12,7 +13,7 @@ use crate::backend::{
     Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, StreamError, Update,
 };
 use crate::cache::CacheCmd;
-use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerFolder};
+use crate::model::{ChatFolder, ChatId, ChatSummary, Message, MsgId, PeerFolder};
 use crate::store::{Bump, Change, Last, Rest, Unread, ViewGen, Window};
 
 pub(super) fn user_error(e: CallError) -> UserError {
@@ -35,7 +36,8 @@ fn call_error(outcome: &Outcome) -> Option<CallError> {
         Outcome::Dialogs { res: Err(e), .. }
         | Outcome::History { res: Err(e), .. }
         | Outcome::Send { res: Err(e), .. }
-        | Outcome::Read(Err(e)) => Some(*e),
+        | Outcome::Read(Err(e))
+        | Outcome::ChatFolders(Err(e)) => Some(*e),
         _ => None,
     }
 }
@@ -161,6 +163,7 @@ impl<B: Backend> Actor<B> {
             }
             // Read marks are best effort; the next read covers a lost one.
             Outcome::Read(_) | Outcome::UpdatesEnded(StreamEnd::Cancelled) => {}
+            Outcome::ChatFolders(res) => self.on_chat_folders(res).await,
             Outcome::CacheChats(chats) => self.on_cache_chats(chats).await,
             Outcome::CacheHistory {
                 load,
@@ -301,6 +304,9 @@ impl<B: Backend> Actor<B> {
                 self.emit(event).await;
                 let has_more = self.dialogs_next.is_some();
                 self.emit(Event::DialogsPaging { has_more }).await;
+                if step == DialogsStep::First {
+                    self.load_folders();
+                }
             }
             Err(e) => {
                 self.error(user_error(e)).await;
@@ -310,6 +316,20 @@ impl<B: Backend> Actor<B> {
         }
         if std::mem::take(&mut self.dialogs_queued) {
             self.load_dialogs().await;
+        }
+    }
+
+    /// The chat folders arrived (or failed to: they stay as they were, and
+    /// the next first page asks again; nothing is shown to the user).
+    async fn on_chat_folders(&mut self, res: CallResult<Vec<ChatFolder>>) {
+        let again = self.folders == FoldersLoad::Again;
+        self.folders = FoldersLoad::Idle;
+        match res {
+            Ok(folders) => self.emit(Event::ChatFolders(folders)).await,
+            Err(e) => tracing::debug!(?e, "chat folders not loaded"),
+        }
+        if again {
+            self.load_folders();
         }
     }
 
@@ -682,6 +702,7 @@ impl<B: Backend> Actor<B> {
             }
             Update::MessageId { random_id, id } => self.on_message_id(random_id, id).await,
             Update::Folders(moves) => self.on_folders(moves).await,
+            Update::ChatFoldersChanged => self.load_folders(),
         }
     }
 

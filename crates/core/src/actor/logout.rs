@@ -531,5 +531,6 @@ impl<B: Backend> Actor<B> {
         self.dialogs_loaded = false;
         self.dialogs_next = None;
         self.emit(Event::DialogsReset(Vec::new())).await;
+        self.emit(Event::ChatFolders(Vec::new())).await;
     }
 }

@@ -14,6 +14,9 @@ pub(crate) const WORDMARK: &str = "abyss";
 pub(crate) const SELECT_CHAT: &str = "Select a chat";
 pub(crate) const NO_CHATS: &str = "No chats yet";
 pub(crate) const NO_ARCHIVED: &str = "No archived chats";
+pub(crate) const NO_FOLDER_CHATS: &str = "No chats in this folder";
+/// The first folder tab: the main list, archive entry included.
+pub(crate) const ALL_CHATS: &str = "All";
 pub(crate) const ARCHIVE: &str = "Archive";
 /// The archive view's title, which leads back to the main list.
 pub(crate) const ARCHIVE_BACK: &str = "‹ Archive";
@@ -79,7 +82,7 @@ pub(crate) fn conn_label(conn: Option<ConnState>) -> SharedString {
 /// The kind tag next to a chat title; private chats have none.
 pub(crate) fn kind_label(kind: ChatKind) -> Option<&'static str> {
     match kind {
-        ChatKind::Private => None,
+        ChatKind::Private { .. } => None,
         ChatKind::Bot => Some("bot"),
         ChatKind::Group
         | ChatKind::Supergroup {

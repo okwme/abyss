@@ -1,6 +1,6 @@
 //! Commands the UI sends to core and events core sends back.
 
-use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId};
+use crate::model::{ChatFolder, ChatId, ChatSummary, LocalId, Message, MsgId};
 use crate::store::ViewGen;
 
 pub use crate::auth_types::{
@@ -271,6 +271,10 @@ pub enum Event {
     /// moves an unpinned chat to the top of the unpinned section exactly when
     /// `last_id` grew; read-state changes keep `last_id`.
     ChatBumped(ChatSummary),
+    /// The account's chat folders, in server order, replacing the UI's
+    /// copy. Sent after each first dialogs page and whenever they change;
+    /// empty after a logout.
+    ChatFolders(Vec<ChatFolder>),
     History {
         chat: ChatId,
         view: ViewGen,
@@ -358,6 +362,10 @@ impl Event {
         BASE + match self {
             Event::DialogsReset(v) | Event::DialogsAppended(v) => chats(v),
             Event::ChatBumped(c) => c.retained_bytes(),
+            Event::ChatFolders(v) => {
+                std::mem::size_of_val(v.as_slice())
+                    + v.iter().map(ChatFolder::retained_bytes).sum::<usize>()
+            }
             Event::History {
                 messages, removed, ..
             } => {

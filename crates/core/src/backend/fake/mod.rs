@@ -22,7 +22,8 @@ use super::{
 use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
 use crate::credentials::{CredentialSlot, EnvResolution};
 use crate::model::{
-    Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerFolder, PeerKind, ThreadKey,
+    Body, ChatFolder, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerFolder, PeerKind,
+    ThreadKey,
 };
 use crate::rich_text::RichText;
 use crate::session::AbyssSession;
@@ -41,6 +42,7 @@ const MAX_LOG: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
     Dialogs,
+    ChatFolders,
     History,
     Send,
     Read,
@@ -101,6 +103,8 @@ pub enum QuitBehavior {
 #[derive(Clone, Debug)]
 pub struct FakeScript {
     pub dialogs: Vec<ChatSummary>,
+    /// Chat folders, in server order.
+    pub folders: Vec<ChatFolder>,
     /// Per chat, ascending by id.
     pub history: HashMap<ChatId, Vec<Message>>,
     pub latency: Duration,
@@ -115,6 +119,7 @@ impl Default for FakeScript {
     fn default() -> Self {
         Self {
             dialogs: Vec::new(),
+            folders: Vec::new(),
             history: HashMap::new(),
             latency: Duration::ZERO,
             login: FakeLogin::default(),
@@ -220,7 +225,7 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
                 gigagroup: false,
             }
         } else {
-            ChatKind::Private
+            ChatKind::Private { contact: false }
         },
         pinned: false,
         unread: 0,
@@ -229,6 +234,7 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
+        muted: false,
         folder: PeerFolder::Main,
     }
 }
@@ -268,6 +274,7 @@ enum StreamCmd {
 #[derive(Debug, Default)]
 struct State {
     dialogs: Vec<ChatSummary>,
+    folders: Vec<ChatFolder>,
     history: HashMap<ChatId, Vec<Message>>,
     faults: HashMap<Op, VecDeque<Fault>>,
     /// Extra waits before the next calls' faults or answers (`lead`).
@@ -329,6 +336,7 @@ impl FakeBackend {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 dialogs: script.dialogs,
+                folders: script.folders,
                 history: script.history,
                 auth: auth::ServerAuth::new(script.login),
                 ..State::default()
@@ -563,6 +571,12 @@ impl FakeHandle {
     /// Edits the server's dialog list (server order).
     pub fn edit_dialogs(&self, f: impl FnOnce(&mut Vec<ChatSummary>)) {
         self.shared.with(|s| f(&mut s.dialogs));
+    }
+
+    /// Replaces the server's chat folders (push
+    /// [`Update::ChatFoldersChanged`] to have core fetch them).
+    pub fn set_folders(&self, folders: Vec<ChatFolder>) {
+        self.shared.with(|s| s.folders = folders);
     }
 
     /// Replaces a chat's server-side history (e.g. simulate deletions).
@@ -884,6 +898,11 @@ impl Client for FakeClient {
             });
             DialogsPage { chats, next }
         }))
+    }
+
+    async fn chat_folders(&self) -> Result<Vec<ChatFolder>, BackendError> {
+        let _g = self.enter(Op::ChatFolders).await?;
+        Ok(self.shared.with(|s| s.folders.clone()))
     }
 
     async fn history(

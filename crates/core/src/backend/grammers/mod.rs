@@ -50,7 +50,7 @@ use super::{
     PasswordChallenge, Seed, SessionSeed, SessionSnapshot, SignIn,
 };
 use crate::api::{ApiCredentials, PasswordBuf};
-use crate::model::{ChatId, MsgId};
+use crate::model::{ChatFolder, ChatId, MsgId};
 use crate::session::{AbyssSession, PersistHandle};
 use calls::Calls;
 
@@ -268,6 +268,10 @@ impl Client for GrammersClient {
         limit: u32,
     ) -> Result<DialogsPage, BackendError> {
         self.calls.dialogs(cursor, limit).await
+    }
+
+    async fn chat_folders(&self) -> Result<Vec<ChatFolder>, BackendError> {
+        self.calls.chat_folders().await
     }
 
     async fn history(

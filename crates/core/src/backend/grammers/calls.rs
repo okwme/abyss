@@ -17,7 +17,7 @@ use super::invoke::{Invoke, RetryClass, call};
 use super::map::{self, Directory};
 use super::pins::Pins;
 use crate::backend::{BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery};
-use crate::model::{ChatId, MsgId};
+use crate::model::{ChatFolder, ChatId, MsgId};
 use crate::session::{AbyssSession, PinRequest, Pinned};
 
 /// Telegram's page size limit for dialogs and history.
@@ -36,6 +36,14 @@ fn fail(e: &InvocationError) -> BackendError {
 fn oversized() -> BackendError {
     tracing::warn!("oversized telegram response rejected");
     BackendError::Rejected
+}
+
+/// The wall clock in Unix seconds (`0` before the epoch, which only a broken
+/// clock reports: every mute then reads as active).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Where a later dialogs page starts.
@@ -316,7 +324,7 @@ impl<I: Invoke> Calls<I> {
         let limit = usize::try_from(limit).unwrap_or(0);
         let parts = map::dialogs_parts(&resp, limit).map_err(|map::Oversized| oversized())?;
         let dir = Directory::from_lists(parts.users, parts.chats);
-        let mapped = map::dialogs(&parts, &dir, limit);
+        let mapped = map::dialogs(&parts, &dir, limit, unix_now());
         let cursor = mapped.next.as_ref().and_then(|c| c.offset_peer);
         let handoff: Vec<ChatId> = mapped.chats.iter().map(|c| c.id).chain(cursor).collect();
         self.remember(&dir, &handoff);
@@ -329,6 +337,18 @@ impl<I: Invoke> Calls<I> {
             chats: mapped.chats,
             next: mapped.next,
         })
+    }
+
+    /// `messages.getDialogFilters`. `inputPeerSelf` maps to the signed-in
+    /// user, read from the session.
+    pub(crate) async fn chat_folders(&self) -> Result<Vec<ChatFolder>, BackendError> {
+        let request = tl::functions::messages::GetDialogFilters {};
+        let resp = call(&self.invoker, RetryClass::Read, &request)
+            .await
+            .map_err(|e| fail(&e))?;
+        let raw = map::folders::raw_folders(&resp).map_err(|map::Oversized| oversized())?;
+        let self_id = self.session.snapshot().self_id().ok().flatten();
+        Ok(map::folders::chat_folders(raw, self_id))
     }
 
     pub(crate) async fn history(

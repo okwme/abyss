@@ -79,6 +79,7 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
         let empty = match shown {
             Shown::Main => copy::NO_CHATS,
             Shown::Archive => copy::NO_ARCHIVED,
+            Shown::Folder(_) => copy::NO_FOLDER_CHATS,
         };
         centered().child(muted(empty)).into_any_element()
     } else {
@@ -123,6 +124,7 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
                         .child(appearance_button(cx)),
                 ),
         )
+        .children(folder_tabs(session, theme, cx))
         .child(body)
         // Last, so it paints over the rows and takes their clicks.
         .children(retry)
@@ -132,7 +134,7 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
 /// leads back.
 fn sidebar_title(shown: Shown, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     match shown {
-        Shown::Main => div()
+        Shown::Main | Shown::Folder(_) => div()
             .flex()
             .items_center()
             .gap_2()
@@ -146,6 +148,60 @@ fn sidebar_title(shown: Shown, theme: &Theme, cx: &mut Context<'_, Root>) -> Any
             .into_any_element(),
         Shown::Archive => back_button(cx).into_any_element(),
     }
+}
+
+/// The chat folder tabs ("All", then each folder in server order), when the
+/// account has folders and the archive is not shown.
+fn folder_tabs(
+    session: &Session,
+    theme: &Theme,
+    cx: &mut Context<'_, Root>,
+) -> Option<Stateful<Div>> {
+    let list = &session.shell.list;
+    let shown = list.shown();
+    if list.folders().is_empty() || shown == Shown::Archive {
+        return None;
+    }
+    let all = std::iter::once((Shown::Main, SharedString::from(copy::ALL_CHATS)));
+    let folders = list
+        .folders()
+        .iter()
+        .map(|f| (Shown::Folder(f.id), SharedString::from(f.title.clone())));
+    let tabs = all.chain(folders).enumerate().map(|(ix, (target, title))| {
+        let selected = target == shown;
+        let mark: Hsla = if selected {
+            theme.text.into()
+        } else {
+            transparent_black()
+        };
+        div()
+            .id(("folder-tab", ix))
+            .flex_none()
+            .px_2()
+            .pb_1()
+            .border_b_2()
+            .border_color(mark)
+            .text_sm()
+            .cursor_pointer()
+            .child(title)
+            .when(!selected, |d| d.text_color(theme::quiet(theme.text)))
+            .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
+                root.with_session(|s, cx| s.show_chats(target, window, cx), cx);
+            }))
+    });
+    Some(
+        div()
+            .id("folder-tabs")
+            .flex()
+            .flex_none()
+            .gap_1()
+            .px_1()
+            .pt_1()
+            .overflow_x_scroll()
+            .bg(theme.surface(Depth::NOW))
+            .text_color(theme.text)
+            .children(tabs),
+    )
 }
 
 /// Leaves the archive for the main list.
@@ -524,7 +580,7 @@ fn message_row(
         tz: format::local_tz(),
         groupish: shell
             .selected_chat()
-            .is_some_and(|c| !matches!(c.kind, ChatKind::Private | ChatKind::Bot)),
+            .is_some_and(|c| !matches!(c.kind, ChatKind::Private { .. } | ChatKind::Bot)),
     };
     let prev_date = ix
         .checked_sub(1)

@@ -102,6 +102,16 @@ pub(crate) enum Internal {
     Wake,
 }
 
+/// The chat folders load (`Job::ChatFolders`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FoldersLoad {
+    Idle,
+    /// Queued or running.
+    Running,
+    /// Queued or running, and another load is wanted after it.
+    Again,
+}
+
 pub(crate) struct Actor<B: Backend> {
     backend: Arc<B>,
     events: EventSender,
@@ -138,6 +148,7 @@ pub(crate) struct Actor<B: Backend> {
     next_req: u64,
     dialogs_busy: bool,
     dialogs_queued: bool,
+    folders: FoldersLoad,
     dialogs_loaded: bool,
     dialogs_next: Option<DialogsCursor>,
     open: Option<ChatId>,
@@ -227,6 +238,7 @@ impl<B: Backend> Actor<B> {
             next_req: 0,
             dialogs_busy: false,
             dialogs_queued: false,
+            folders: FoldersLoad::Idle,
             dialogs_loaded: false,
             dialogs_next: None,
             open: None,
@@ -451,6 +463,7 @@ impl<B: Backend> Actor<B> {
     /// answers it, and a full bootstrap invalidates its view (task 10g).
     fn purge_queued(&mut self) {
         let keep = |job: &Job| matches!(job, Job::Send { .. } | Job::Read { .. });
+        self.folders = FoldersLoad::Idle;
         let (kept, purged): (Vec<Job>, Vec<Job>) = self.queue.drain(..).partition(keep);
         self.queue = kept.into();
         let purged: Vec<Job> = self.priority.drain(..).chain(purged).collect();
@@ -461,7 +474,7 @@ impl<B: Backend> Actor<B> {
                     self.release_history(load);
                     self.covers.fetch_ended(load.chat, load.req);
                 }
-                Job::Send { .. } | Job::Read { .. } => {}
+                Job::Send { .. } | Job::Read { .. } | Job::ChatFolders => {}
             }
         }
     }
@@ -509,6 +522,7 @@ impl<B: Backend> Actor<B> {
     /// released by unwinding; clear the state it held and keep running.
     async fn on_panic(&mut self, kind: Option<TaskKind>) {
         match kind {
+            Some(TaskKind::ChatFolders) => self.folders = FoldersLoad::Idle,
             Some(TaskKind::Dialogs) => {
                 self.dialogs_busy = false;
                 self.load_ended(LoadTarget::Dialogs, Some(UserError::Internal))
@@ -608,6 +622,21 @@ impl<B: Backend> Actor<B> {
             Command::RetryCredentialSave => self.retry_credential_save().await,
             Command::Back => self.back().await,
             Command::RetryStartup => self.retry_startup().await,
+        }
+    }
+
+    /// Loads the chat folders in the background: after each first dialogs
+    /// page and when they change. At most one load runs, with at most one
+    /// more after it; a full queue drops it quietly (the next first page
+    /// asks again).
+    fn load_folders(&mut self) {
+        match self.folders {
+            FoldersLoad::Running | FoldersLoad::Again => self.folders = FoldersLoad::Again,
+            FoldersLoad::Idle if self.queue.len() < MAX_QUEUED => {
+                self.queue.push_back(Job::ChatFolders);
+                self.folders = FoldersLoad::Running;
+            }
+            FoldersLoad::Idle => {}
         }
     }
 

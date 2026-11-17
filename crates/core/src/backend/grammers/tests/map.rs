@@ -553,7 +553,7 @@ fn dialogs_map_kinds_counts_previews_and_exclude_broadcasts() {
         "last\nline",
     ))];
     let dir = Directory::from_lists(&users, &chats);
-    let out = lists::dialogs(&parts(&dialogs, &messages, &users, &chats), &dir, 100);
+    let out = lists::dialogs(&parts(&dialogs, &messages, &users, &chats), &dir, 100, 0);
     assert_eq!(out.excluded, 1);
     assert_eq!(out.next, None);
     let ids: Vec<i64> = out.chats.iter().map(|c| c.id.id).collect();
@@ -602,6 +602,7 @@ fn dialogs_cursor_follows_the_last_raw_dialog() {
         },
         &dir,
         2,
+        0,
     );
     let next = page.next.expect("a full slice continues");
     assert_eq!(next.offset_peer, Some(cid(20)), "even when excluded");
@@ -613,6 +614,7 @@ fn dialogs_cursor_follows_the_last_raw_dialog() {
         },
         &dir,
         3,
+        0,
     );
     assert_eq!(short.next, None, "a short slice is the last page");
 }
@@ -627,7 +629,7 @@ fn folders_communities_and_unknown_peers_are_skipped() {
         tl::enums::Dialog::Dialog(dialog(peer_user(7), 2)),
     ];
     let dir = Directory::from_lists(&users, &[]);
-    let out = lists::dialogs(&parts(&dialogs, &[], &users, &[]), &dir, 100);
+    let out = lists::dialogs(&parts(&dialogs, &[], &users, &[]), &dir, 100, 0);
     let ids: Vec<i64> = out.chats.iter().map(|c| c.id.id).collect();
     assert_eq!(ids, vec![7], "the folder's peer is not listed as a chat");
     assert_eq!(out.chats[0].last, None);
@@ -649,7 +651,7 @@ fn archived_dialogs_are_in_the_archive_and_keep_their_place() {
         .map(tl::enums::Dialog::Dialog)
         .collect();
     let dir = Directory::from_lists(&users, &[]);
-    let out = lists::dialogs(&parts(&dialogs, &[], &users, &[]), &dir, 100);
+    let out = lists::dialogs(&parts(&dialogs, &[], &users, &[]), &dir, 100, 0);
     let folders: Vec<(i64, PeerFolder)> = out.chats.iter().map(|c| (c.id.id, c.folder)).collect();
     assert_eq!(
         folders,
@@ -714,7 +716,7 @@ fn a_folder_at_the_page_boundary_continues_the_list() {
         tl::enums::Dialog::Dialog(dialog(peer_user(99), 3)),
         folder(peer_user(8), 6),
     ];
-    let page = lists::dialogs(&slice(&dialogs, &messages, &users), &dir, 3);
+    let page = lists::dialogs(&slice(&dialogs, &messages, &users), &dir, 3, 0);
     assert_eq!(page.chats.len(), 1);
     let next = page.next.expect("a full raw page continues");
     assert_eq!(next.offset_peer, Some(uid(8)));
@@ -727,14 +729,14 @@ fn a_folder_at_the_page_boundary_continues_the_list() {
         tl::enums::Dialog::Dialog(dialog(peer_user(7), 1)),
         community(5),
     ];
-    let page = lists::dialogs(&slice(&dialogs, &messages, &users), &dir, 3);
+    let page = lists::dialogs(&slice(&dialogs, &messages, &users), &dir, 3, 0);
     let next = page.next.expect("a full raw page continues");
     assert_eq!(next.offset_peer, Some(uid(7)));
     assert_eq!((next.offset_id, next.offset_date), (1, 1_700_000_001));
 
     // Only folders: nothing shown, and still not the end of the list.
     let dialogs = vec![folder(peer_user(8), 6), folder(peer_user(7), 1)];
-    let page = lists::dialogs(&slice(&dialogs, &messages, &users), &dir, 2);
+    let page = lists::dialogs(&slice(&dialogs, &messages, &users), &dir, 2, 0);
     assert!(page.chats.is_empty());
     assert_eq!(page.next.map(|n| n.offset_peer), Some(Some(uid(7))));
 }
@@ -940,7 +942,7 @@ fn debug_of_mapping_types_shows_no_names_text_or_phones() {
     let dialogs = vec![tl::enums::Dialog::Dialog(dialog(peer_user(7), 1))];
     let dir = Directory::from_lists(&users, &chats);
     let dparts = parts(&dialogs, &messages, &users, &chats);
-    let mapped = lists::dialogs(&dparts, &dir, 10);
+    let mapped = lists::dialogs(&dparts, &dir, 10, 0);
     assert_eq!(mapped.chats.len(), 1, "the fixture maps");
     let mparts = MessagesParts {
         messages: &messages,
@@ -1130,4 +1132,157 @@ fn sent_ids_come_only_from_our_random_id() {
     assert_eq!(lists::sent_id(&full(5), 5), Some(MsgId(78)));
     assert_eq!(lists::sent_id(&full(6), 5), None);
     assert_eq!(lists::sent_id(&U::TooLong, 5), None);
+}
+
+// --- chat folders ---
+
+fn text(s: &str) -> tl::enums::TextWithEntities {
+    tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+        text: s.into(),
+        entities: vec![],
+    })
+}
+
+fn input_user(id: i64) -> tl::enums::InputPeer {
+    tl::enums::InputPeer::User(tl::types::InputPeerUser {
+        user_id: id,
+        access_hash: 1,
+    })
+}
+
+fn raw_folder(id: i32, title: &str) -> tl::types::DialogFilter {
+    tl::types::DialogFilter {
+        contacts: false,
+        non_contacts: false,
+        groups: false,
+        broadcasts: false,
+        bots: false,
+        exclude_muted: false,
+        exclude_read: false,
+        exclude_archived: false,
+        title_noanimate: false,
+        id,
+        title: text(title),
+        emoticon: None,
+        color: None,
+        pinned_peers: vec![],
+        include_peers: vec![],
+        exclude_peers: vec![],
+    }
+}
+
+fn filters(list: Vec<tl::enums::DialogFilter>) -> tl::enums::messages::DialogFilters {
+    tl::enums::messages::DialogFilters::Filters(tl::types::messages::DialogFilters {
+        tags_enabled: false,
+        filters: list,
+    })
+}
+
+#[test]
+fn chat_folders_map_rules_peers_and_titles() {
+    use crate::backend::grammers::map::folders;
+    use crate::model::FolderRules;
+    let mut work = raw_folder(2, "Wo\u{202e}rk");
+    work.groups = true;
+    work.exclude_read = true;
+    work.pinned_peers = vec![tl::enums::InputPeer::PeerSelf];
+    work.include_peers = vec![
+        input_user(7),
+        tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: 3 }),
+        input_user(-1),
+        tl::enums::InputPeer::Empty,
+    ];
+    work.exclude_peers = vec![tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+        channel_id: 10,
+        access_hash: 1,
+    })];
+    let shared = tl::enums::DialogFilter::Chatlist(tl::types::DialogFilterChatlist {
+        has_my_invites: false,
+        title_noanimate: false,
+        id: 3,
+        title: text("Shared"),
+        emoticon: None,
+        color: None,
+        pinned_peers: vec![],
+        include_peers: vec![input_user(8)],
+    });
+    let resp = filters(vec![
+        tl::enums::DialogFilter::Default,
+        tl::enums::DialogFilter::Filter(work),
+        shared,
+    ]);
+    let raw = folders::raw_folders(&resp).unwrap();
+    let out = folders::chat_folders(raw, Some(42));
+    assert_eq!(out.len(), 2, "the All position is not a folder");
+    let w = &out[0];
+    assert_eq!((w.id, w.title.as_str(), w.shared), (2, "Work", false));
+    assert!(w.rules.has(FolderRules::GROUPS) && w.rules.has(FolderRules::EXCLUDE_READ));
+    assert!(!w.rules.has(FolderRules::CONTACTS));
+    assert_eq!(w.pinned, vec![uid(42)], "self is the signed-in user");
+    assert_eq!(w.include, vec![uid(7), gid(3)], "unmappable peers dropped");
+    assert_eq!(w.exclude, vec![cid(10)]);
+    assert!(out[1].shared && out[1].include == vec![uid(8)]);
+    assert!(
+        folders::chat_folders(raw, None)[0].pinned.is_empty(),
+        "self unknown: dropped"
+    );
+}
+
+#[test]
+fn oversized_folder_responses_are_rejected() {
+    use crate::backend::grammers::map::folders::{self, MAX_FOLDER_PEERS, MAX_FOLDERS};
+    let many = (0..=MAX_FOLDERS)
+        .map(|i| tl::enums::DialogFilter::Filter(raw_folder(i32::try_from(i).unwrap(), "f")))
+        .collect();
+    assert!(folders::raw_folders(&filters(many)).is_err());
+    let mut big = raw_folder(2, "f");
+    big.include_peers = (0..=i64::try_from(MAX_FOLDER_PEERS).unwrap())
+        .map(input_user)
+        .collect();
+    assert!(folders::raw_folders(&filters(vec![tl::enums::DialogFilter::Filter(big)])).is_err());
+}
+
+#[test]
+fn folder_changes_ask_for_a_refetch() {
+    use tl::enums::Update as U;
+    let changed = [
+        U::DialogFilters,
+        U::DialogFilterOrder(tl::types::UpdateDialogFilterOrder { order: vec![2, 3] }),
+        U::DialogFilter(tl::types::UpdateDialogFilter {
+            id: 2,
+            filter: None,
+        }),
+    ];
+    for u in &changed {
+        assert!(matches!(
+            lists::update(u, &Directory::default()),
+            Some(Update::ChatFoldersChanged)
+        ));
+    }
+}
+
+#[test]
+fn muted_follows_mute_until_and_contacts_their_flag() {
+    let mut ann = user(7, "Ann", "");
+    ann.contact = true;
+    let users = users(vec![ann, user(8, "Bob", "")]);
+    let mute = |until| {
+        tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
+            mute_until: until,
+            ..super::notify_settings_raw()
+        })
+    };
+    let mut muted = dialog(peer_user(7), 1);
+    muted.notify_settings = mute(Some(2_000));
+    let mut expired = dialog(peer_user(8), 2);
+    expired.notify_settings = mute(Some(1_000));
+    let dialogs: Vec<_> = [muted, expired]
+        .into_iter()
+        .map(tl::enums::Dialog::Dialog)
+        .collect();
+    let dir = Directory::from_lists(&users, &[]);
+    let out = lists::dialogs(&parts(&dialogs, &[], &users, &[]), &dir, 100, 1_500);
+    assert!(out.chats[0].muted && !out.chats[1].muted);
+    assert_eq!(out.chats[0].kind, ChatKind::Private { contact: true });
+    assert_eq!(out.chats[1].kind, ChatKind::Private { contact: false });
 }

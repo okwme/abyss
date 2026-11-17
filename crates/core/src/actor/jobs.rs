@@ -15,7 +15,7 @@ use crate::backend::{
     StreamItem, UpdateStream,
 };
 use crate::cache::CacheHandle;
-use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId};
+use crate::model::{ChatFolder, ChatId, ChatSummary, LocalId, Message, MsgId};
 use crate::store::ViewGen;
 
 /// Messages per history page (server and cache).
@@ -73,6 +73,8 @@ pub(super) enum Job {
         chat: ChatId,
         max_id: MsgId,
     },
+    /// The chat folders (folders plan, part B).
+    ChatFolders,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +128,7 @@ pub(super) enum Outcome {
         local_id: LocalId,
     },
     Read(CallResult<()>),
+    ChatFolders(CallResult<Vec<ChatFolder>>),
     CacheChats(Option<Vec<ChatSummary>>),
     CacheHistory {
         load: Load,
@@ -153,6 +156,7 @@ pub(super) enum TaskKind {
     History(Load, HistoryDir),
     Send(LocalId),
     Read,
+    ChatFolders,
     CacheChats,
     Updates,
     /// A login call (task 6b), for panic handling.
@@ -286,6 +290,11 @@ pub(super) fn job_future<C: Client>(
             // Read marks are best effort; the next read covers a lost one.
             let fut = admitted.run(call, Outcome::Read);
             (TaskKind::Read, Box::pin(fut))
+        }
+        Job::ChatFolders => {
+            let call = async move { client.chat_folders().await };
+            let fut = admitted.run(call, Outcome::ChatFolders);
+            (TaskKind::ChatFolders, Box::pin(fut))
         }
     }
 }

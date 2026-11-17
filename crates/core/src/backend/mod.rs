@@ -27,7 +27,7 @@ pub use seed::{MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 
 use crate::api::{CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
 pub use crate::credentials::CredentialSlot;
-use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerFolder};
+use crate::model::{ChatFolder, ChatId, ChatSummary, Message, MsgId, PeerFolder};
 
 /// Opaque position in the dialogs list, produced by the backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +81,9 @@ pub enum Update {
     /// `updateFolderPeers`: chats moved into or out of the archive, here or
     /// on another device.
     Folders(Vec<(ChatId, PeerFolder)>),
+    /// `updateDialogFilter(s)`, `updateDialogFilterOrder`: the chat folders
+    /// changed; fetch them again.
+    ChatFoldersChanged,
     /// `updateMessageID`: the server assigned `id` to the send carrying
     /// `random_id` (plan section 9). Correlated with the pending-send table.
     MessageId {
@@ -286,6 +289,10 @@ pub trait Client: Send + Sync + 'static {
         cursor: Option<DialogsCursor>,
         limit: u32,
     ) -> impl Future<Output = Result<DialogsPage, BackendError>> + Send;
+
+    /// The account's chat folders (`messages.getDialogFilters`), in server
+    /// order, without the "All chats" position.
+    fn chat_folders(&self) -> impl Future<Output = Result<Vec<ChatFolder>, BackendError>> + Send;
 
     fn history(
         &self,

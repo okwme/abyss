@@ -55,11 +55,16 @@ The work is split so each part is reviewable and useful on its own:
 - Peers are `InputPeer`s. Each is mapped to a `ChatId` with the same range checks as `chat_id`. `inputPeerSelf` maps to the signed-in user's id, and anything else that does not map is dropped.
 - Bounds: at most 64 folders, at most 512 peers per folder across `pinned + include + exclude` (Telegram's own limits are 30 and 200), and the response is rejected whole above them (`Oversized`).
 
-**Model additions for the rules.** `ChatSummary` gains `muted: bool` (from `dialog.notify_settings.mute_until` compared with the time of mapping) and `contact: bool` (from `user.contact`). These are fields, not parameters. Cache schema version 5.
+**Model additions for the rules.**
+- `ChatSummary` gains `muted: bool`, computed from `dialog.notify_settings.mute_until` against the clock when the page is mapped.
+- `ChatKind::Private` becomes `Private { contact }`, from `user.contact`. It mirrors `Supergroup { forum, gigagroup }` and keeps `ChatSummary` within `struct_excessive_bools`.
+- `FolderRules` is a `u8` flag set, like `StyleFlags`.
+- Cache schema version 5.
 
 **Core.**
 - Folders are loaded after each successful first dialogs page (bootstrap and refresh) and sent as `Event::ChatFolders(Vec<ChatFolder>)`.
-- `updateDialogFilter`, `updateDialogFilterOrder` and `updateDialogFilters` all map to `Update::ChatFoldersChanged`. Core refetches, coalesced: at most one load in flight and one queued, as with `LoadDialogs`.
+- `updateDialogFilter`, `updateDialogFilterOrder` and `updateDialogFilters` all map to `Update::ChatFoldersChanged`. Core refetches, coalesced through `FoldersLoad { Idle, Running, Again }`: at most one load in flight and one wanted after it.
+- A failed load is only logged. The next first page asks again.
 - Folders are not cached on disk. They come back with the first page.
 
 **Matching** follows Telegram's rule and runs in the UI over the loaded list:

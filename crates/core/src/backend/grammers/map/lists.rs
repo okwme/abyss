@@ -151,12 +151,18 @@ fn cursor_point(d: &tl::enums::Dialog) -> Option<(ChatId, i32)> {
     }
 }
 
-/// Maps a dialogs page requested with `limit`. Folders and communities are
+/// Maps a dialogs page requested with `limit`, at `now` (Unix seconds: a
+/// chat is muted while its `mute_until` lies ahead). Folders and communities are
 /// skipped, broadcast channels excluded. Whether more pages follow is decided
 /// from the raw response, as `iter_dialogs` does: a slice with `limit` raw
 /// entries, whatever display filtering left. The cursor continues after the
 /// last raw entry that names a peer, shown or not.
-pub(crate) fn dialogs(parts: &DialogsParts<'_>, dir: &Directory, limit: usize) -> MappedDialogs {
+pub(crate) fn dialogs(
+    parts: &DialogsParts<'_>,
+    dir: &Directory,
+    limit: usize,
+    now: i64,
+) -> MappedDialogs {
     let tops: Tops<'_> = parts
         .messages
         .iter()
@@ -168,7 +174,7 @@ pub(crate) fn dialogs(parts: &DialogsParts<'_>, dir: &Directory, limit: usize) -
     };
     for d in parts.dialogs {
         if let tl::enums::Dialog::Dialog(d) = d {
-            summarize(d, &tops, dir, &mut out);
+            summarize(d, &tops, dir, now, &mut out);
         }
     }
     let more = !parts.complete && parts.dialogs.len() >= limit;
@@ -188,7 +194,13 @@ pub(crate) fn dialogs(parts: &DialogsParts<'_>, dir: &Directory, limit: usize) -
 }
 
 /// Adds one raw dialog to the page, unless it is excluded or invalid.
-fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut MappedDialogs) {
+fn summarize(
+    d: &tl::types::Dialog,
+    tops: &Tops<'_>,
+    dir: &Directory,
+    now: i64,
+    out: &mut MappedDialogs,
+) {
     let Some(chat) = chat_id(&d.peer) else {
         return;
     };
@@ -214,11 +226,19 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
         // did not map (excluded or invalid).
         last_id: (d.top_message > 0).then_some(MsgId(d.top_message)),
         can_send: entry.can_send,
+        muted: muted(&d.notify_settings, now),
         folder: peer_folder(d.folder_id.unwrap_or(0)),
     };
     if summary.is_valid() {
         out.chats.push(summary);
     }
+}
+
+/// Whether notifications are muted at `now`: Telegram mutes until a date
+/// (`i32::MAX` for good).
+fn muted(settings: &tl::enums::PeerNotifySettings, now: i64) -> bool {
+    let tl::enums::PeerNotifySettings::Settings(s) = settings;
+    s.mute_until.is_some_and(|until| i64::from(until) > now)
 }
 
 fn count(n: i32) -> u32 {
@@ -350,6 +370,11 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
             chat: channel_chat(u.channel_id)?,
             still_unread: count(u.still_unread_count),
         }),
+        // A chat folder was created, edited, deleted or reordered: core
+        // refetches the list (folders plan, part B).
+        U::DialogFilter(_) | U::DialogFilterOrder(_) | U::DialogFilters => {
+            Some(Update::ChatFoldersChanged)
+        }
         // Archived or unarchived, here or on another device.
         U::FolderPeers(u) => {
             let moves: Vec<(ChatId, PeerFolder)> = u
