@@ -269,7 +269,7 @@ fn auth_screen(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
             cx,
         ),
 
-        AuthView::LoggingOut => onboarding::logging_out_screen(),
+        AuthView::LoggingOut | AuthView::LogoutStarting => onboarding::logging_out_screen(),
         AuthView::LogoutIncomplete { remote } => logout_incomplete_screen(*remote, cx),
         AuthView::LogoutNotStarted { trigger } => logout_not_started_screen(session, *trigger, cx),
         AuthView::StartupBlocked => startup_blocked_screen(cx),

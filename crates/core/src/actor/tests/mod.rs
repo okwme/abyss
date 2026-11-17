@@ -3,7 +3,7 @@
 
 #![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
+    clippy::panic,
     reason = "test harness helpers are not #[test] items, so allow-*-in-tests does not cover them"
 )]
 
@@ -22,6 +22,7 @@ mod review4c;
 mod review6c;
 mod review6d;
 mod review6e;
+mod review6f;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,6 +46,10 @@ use crate::secret::{FaultControl, FaultyStore, MemoryStore, SecretItem, SecretSt
 use crate::session::{PersistHandle, signed_in_blob};
 
 const WAIT: Duration = Duration::from_secs(600);
+/// Wall-clock bound of one wait, whatever the test's clock does.
+const REAL_WAIT: Duration = Duration::from_secs(120);
+/// How often a wait checks [`REAL_WAIT`] (test clock).
+const WAIT_SLICE: Duration = Duration::from_millis(250);
 
 struct Harness {
     cmd: mpsc::Sender<Stamped>,
@@ -189,7 +194,14 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
     if unreadable {
         faults.heal_item(SecretItem::Session);
     }
+    let unread_marker = matches!(pending_logout, Some(super::PendingLogout::Unreadable(_)));
     let (cache, cache_parts) = match setup.cache_dir {
+        // As `core::prepare`: an unreadable marker opens no cache.
+        Some(dir) if unread_marker => {
+            let mut parts = super::CacheParts::closed(dir);
+            parts.hold_settle.clone_from(&setup.hold_settle);
+            (None, Some(parts))
+        }
         Some(dir) => {
             let provisioned = provision_cache(&persist, dir, identity).await;
             let mut parts = provisioned.parts;
@@ -242,20 +254,26 @@ impl Harness {
     }
 
     /// Waits for an event matching `pred`, returning it and everything skipped.
+    /// Bounded twice: [`WAIT`] on the test's clock (paused tests advance it
+    /// freely) and [`REAL_WAIT`] of wall time, so a hang fails the test with
+    /// the events seen instead of stalling the run.
     async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> (Event, Vec<Event>) {
         let mut skipped = Vec::new();
-        let found = tokio::time::timeout(WAIT, async {
-            loop {
-                let ev = self.events.recv().await.expect("actor stopped");
-                if pred(&ev) {
-                    return ev;
-                }
-                skipped.push(ev);
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            assert!(
+                started.elapsed() < REAL_WAIT && tokio::time::Instant::now() < deadline,
+                "timed out waiting for an event; seen: {skipped:?}"
+            );
+            // Cancel-safe: an event is never lost between slices.
+            match tokio::time::timeout(WAIT_SLICE, self.events.recv()).await {
+                Ok(Some(ev)) if pred(&ev) => return (ev, skipped),
+                Ok(Some(ev)) => skipped.push(ev),
+                Ok(None) => panic!("actor stopped; seen: {skipped:?}"),
+                Err(_) => {}
             }
-        })
-        .await
-        .expect("timed out waiting for event");
-        (found, skipped)
+        }
     }
 
     /// Waits until the instance is online; returns the events before it.

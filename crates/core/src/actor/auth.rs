@@ -518,15 +518,15 @@ pub(super) fn sent_info(sent: SentCode) -> SentCodeInfo {
 
 impl<B: Backend> Actor<B> {
     pub(super) async fn set_auth(&mut self, state: AuthState) {
-        // A logout waiting on its marker decides what is shown (`marker`).
-        let state = self.logout_gate.hold(state);
-        self.auth.state = state.clone();
-        self.emit(Event::Auth(state)).await;
+        self.auth.state = state;
+        self.emit_auth().await;
     }
 
     /// Repeats the current state (a command that does not apply to it).
+    /// A logout that could not start overlays it (`marker::LogoutGate`).
     pub(super) async fn emit_auth(&self) {
-        self.emit(Event::Auth(self.auth.state.clone())).await;
+        let shown = self.logout_gate.shown(&self.auth.state);
+        self.emit(Event::Auth(shown)).await;
     }
 
     /// Admits a login call: one at a time, on an instance in the right

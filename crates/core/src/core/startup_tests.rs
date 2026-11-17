@@ -2,11 +2,12 @@
 
 use std::time::{Duration, Instant};
 
+use super::CacheConfig;
 use super::{CoreConfig, SendError, start_with};
 use crate::SHUTDOWN_DEADLINE;
-use crate::api::{Command, SaveStatus};
-use crate::backend::fake::{FakeBackend, FakeScript};
-use crate::secret::{FaultyStore, MemoryStore};
+use crate::api::{AuthState, Command, Event, SaveStatus};
+use crate::backend::fake::{FAKE_SELF_HASH, FAKE_SELF_ID, FakeBackend, FakeScript};
+use crate::secret::{FaultyStore, MemoryStore, SecretItem, SecretStore};
 
 /// Finding 4: a stalled Keychain read at startup (a prompt nobody answers)
 /// must not hold up the shutdown acknowledgement.
@@ -147,6 +148,54 @@ async fn cached_history_survives_a_core_restart() {
     );
     assert!(crate::cache::wait_closed(
         Some(&dir),
+        Duration::from_secs(10)
+    ));
+}
+
+/// Review round 25, finding 4: an unreadable logout marker means unknown,
+/// so startup opens no cache: a malformed cache key (which opening answers
+/// by destroying the cache and replacing the key) is left alone until
+/// `RetryStartup` reads the marker as absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_marker_opens_no_cache_until_the_retry() {
+    const MALFORMED: &[u8] = &[1, 2, 3];
+    let dir = tempfile::tempdir().unwrap();
+    let inner = MemoryStore::new();
+    let session = crate::session::signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH);
+    inner.set(SecretItem::Session, &session).unwrap();
+    inner.set(SecretItem::CacheKey, MALFORMED).unwrap();
+    let (store, control) = FaultyStore::new(inner.clone());
+    control.fail_get_of(SecretItem::LogoutPending);
+    let config = CoreConfig {
+        cache: Some(CacheConfig {
+            dir: dir.path().to_path_buf(),
+        }),
+        ..CoreConfig::default()
+    };
+    let (fake, _h) = FakeBackend::new(FakeScript::demo(1, 1));
+    let mut core = start_with(config, move |_| fake, store, || {}).unwrap();
+    next_matching(&mut core, |e| {
+        matches!(e, Event::Auth(AuthState::StartupBlocked { .. }))
+    })
+    .await;
+    let key = inner.get(SecretItem::CacheKey).unwrap().unwrap();
+    assert_eq!(key.as_slice(), MALFORMED, "cache provisioned while unknown");
+    control.heal_item(SecretItem::LogoutPending);
+    core.send(Command::RetryStartup).unwrap();
+    next_matching(
+        &mut core,
+        |e| matches!(e, Event::Auth(s) if s.is_signed_in()),
+    )
+    .await;
+    let key = inner.get(SecretItem::CacheKey).unwrap().unwrap();
+    assert_ne!(key.as_slice(), MALFORMED, "not provisioned after the retry");
+    let done = core.begin_shutdown().unwrap();
+    tokio::time::timeout(SHUTDOWN_DEADLINE + Duration::from_secs(2), done)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(crate::cache::wait_closed(
+        Some(dir.path()),
         Duration::from_secs(10)
     ));
 }

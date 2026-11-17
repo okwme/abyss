@@ -15,8 +15,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::{
-    Actor, ActorChannels, ActorInit, Identity, Internal, Stamped, provision_cache,
-    read_pending_logout,
+    Actor, ActorChannels, ActorInit, CacheParts, Identity, Internal, PendingLogout, Stamped,
+    provision_cache, read_pending_logout,
 };
 
 use crate::api::{Command, Event, LogoutStatus, SaveStatus, UserError};
@@ -417,12 +417,18 @@ async fn prepare<B: Backend>(
         Some(_) => (persist.fresh_session(), Identity::Unknown),
         None => load_account(&persist, &events).await,
     };
-    let (handle, cache_parts) = match cache {
-        Some(CacheConfig { dir }) => {
+    let (handle, cache_parts) = match (cache, pending_logout) {
+        // Unknown whether a logout is pending: the cache is not even opened
+        // (opening may destroy and recreate it), only its directory is kept
+        // until `RetryStartup` reads the marker (review round 25, finding 4).
+        (Some(CacheConfig { dir }), Some(PendingLogout::Unreadable(_))) => {
+            (None, Some(CacheParts::closed(dir)))
+        }
+        (Some(CacheConfig { dir }), _) => {
             let provisioned = provision_cache(&persist, dir, identity).await;
             (provisioned.served, Some(provisioned.parts))
         }
-        None => (None, None),
+        (None, _) => (None, None),
     };
     after_load();
     Actor::new(ActorInit {

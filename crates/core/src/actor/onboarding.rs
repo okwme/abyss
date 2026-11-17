@@ -416,8 +416,8 @@ impl<B: Backend> Actor<B> {
     /// is authorized.
     pub(super) async fn back(&mut self) {
         // "Stay signed in" after a logout that could not start.
-        if let Some(state) = self.logout_gate.stay_signed_in() {
-            return self.set_auth(state).await;
+        if self.logout_gate.stay_signed_in() {
+            return self.emit_auth().await;
         }
         if self.auth.signed_in || matches!(self.life.phase, Phase::LoggingOut(_)) {
             return self.emit_auth().await;

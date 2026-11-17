@@ -323,13 +323,7 @@ impl<B: Backend> Actor<B> {
         if self.logout_gate.escalate(plan, trigger) {
             return self.emit_auth().await;
         }
-        let resume = self.auth.state.clone();
-        self.start_logout(Marking {
-            plan,
-            trigger,
-            resume,
-        })
-        .await;
+        self.start_logout(Marking { plan, trigger }).await;
     }
 
     /// Admits a logout: its marker is written first, and nothing else
@@ -339,7 +333,7 @@ impl<B: Backend> Actor<B> {
             Phase::LoggingOut(_) => self.emit_auth().await,
             Phase::Retiring(_) => self.error(UserError::Busy).await,
             _ if self.logout_gate.is_marking() => self.emit_auth().await,
-            _ => self.begin_marking(marking),
+            _ => self.begin_marking(marking).await,
         }
     }
 

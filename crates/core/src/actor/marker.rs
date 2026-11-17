@@ -32,7 +32,10 @@ use super::Actor;
 use super::auth::AuthMsg;
 use super::lifecycle::{LogoutStage, Phase, Step};
 use super::logout::RemotePlan;
-use crate::api::{AuthState, LogoutTrigger, RemoteLogout, StorageError, UserError};
+use crate::api::{
+    AuthState, Command, Event, HistoryDir, LoadTarget, LogoutTrigger, RemoteLogout, SendState,
+    StorageError, UserError,
+};
 use crate::backend::Backend;
 use crate::secret::StoreError;
 use crate::session::PersistHandle;
@@ -112,8 +115,6 @@ pub(super) async fn mark_until(
 pub(super) struct Marking {
     pub(super) plan: RemotePlan,
     pub(super) trigger: LogoutTrigger,
-    /// The state "Stay signed in" goes back to.
-    pub(super) resume: AuthState,
 }
 
 impl Marking {
@@ -132,8 +133,11 @@ impl Marking {
 /// The marker as the precondition of every logout side effect (review
 /// round 19): a logout is `marking` while its marker is written, and
 /// `blocked` once the write failed. Neither has changed anything yet.
-/// Login states reported meanwhile (the startup check's `SignedIn`, say)
-/// become the state "Stay signed in" goes back to (`hold`).
+/// "Couldn't start logout" is only an overlay on what the UI is shown
+/// (`shown`): `AuthMachine::state` stays the real login state, so login
+/// results that arrive meanwhile (the startup check's `SignedIn`, which
+/// only applies to `Connecting`) are applied as usual, and "Stay signed
+/// in" just lifts the overlay.
 #[derive(Debug, Default)]
 pub(super) struct LogoutGate {
     marking: Option<Marking>,
@@ -158,6 +162,17 @@ impl LogoutGate {
         self.marking.is_some()
     }
 
+    /// While the marker is written, the logout counts as begun for what
+    /// would act for the account: a send or a retry the UI queued behind
+    /// it is refused, as during the teardown (review rounds 19 and 25). The
+    /// rest acts as if it had come before the Logout (the account is
+    /// unchanged until the marker is durable, and the teardown ends what is
+    /// in flight then): reads and loads are answered as usual, and a
+    /// discard still cancels its send, automatic retries included.
+    pub(super) fn refuses(&self, cmd: &Command) -> bool {
+        self.is_marking() && matches!(cmd, Command::SendText { .. } | Command::RetrySend(_))
+    }
+
     pub(super) fn take_blocked(&mut self) -> Option<(Marking, StorageError)> {
         self.blocked.take()
     }
@@ -166,35 +181,31 @@ impl LogoutGate {
         self.blocked = Some((marking, error));
     }
 
-    /// "Stay signed in": the latest state of a user's logout that could not
-    /// start. `None` for the server's (the account cannot continue).
-    pub(super) fn stay_signed_in(&mut self) -> Option<AuthState> {
-        if self.blocked.as_ref()?.0.trigger != LogoutTrigger::User {
-            return None;
+    /// "Stay signed in": lifts the overlay of a user's logout that could
+    /// not start; `false` for the server's (the account cannot continue).
+    pub(super) fn stay_signed_in(&mut self) -> bool {
+        let user = self
+            .blocked
+            .as_ref()
+            .is_some_and(|(m, _)| m.trigger == LogoutTrigger::User);
+        if user {
+            self.blocked = None;
         }
-        self.blocked.take().map(|(m, _)| m.resume)
+        user
     }
 
-    /// The state to show instead of `state`. While a logout waits on its
-    /// marker, `state` becomes what "Stay signed in" goes back to; once the
-    /// write failed, "Couldn't start logout" stays up until Retry or Back.
-    pub(super) fn hold(&mut self, state: AuthState) -> AuthState {
-        if matches!(state, AuthState::LogoutNotStarted { .. }) {
-            return state;
-        }
-        if let Some(m) = self.marking.as_mut() {
-            m.resume = state.clone();
-            return state;
-        }
-        match self.blocked.as_mut() {
-            Some((m, error)) => {
-                m.resume = state;
-                AuthState::LogoutNotStarted {
-                    error: *error,
-                    trigger: m.trigger,
-                }
-            }
-            None => state,
+    /// What the UI is shown for the real login `state`: "Logging out"
+    /// (`LogoutStarting`) while the marker is written, "Couldn't start
+    /// logout" once the write failed (with the trigger as it is now, so a
+    /// revocation since takes "Stay signed in" away), else `state`.
+    pub(super) fn shown(&self, state: &AuthState) -> AuthState {
+        match (&self.blocked, &self.marking) {
+            (Some((m, error)), _) => AuthState::LogoutNotStarted {
+                error: *error,
+                trigger: m.trigger,
+            },
+            (None, Some(_)) => AuthState::LogoutStarting,
+            (None, None) => state.clone(),
         }
     }
 }
@@ -202,8 +213,9 @@ impl LogoutGate {
 impl<B: Backend> Actor<B> {
     /// Writes the marker in the background (the Keychain may prompt); the
     /// logout starts only when the write succeeded (`on_logout_marked`).
-    pub(super) fn begin_marking(&mut self, marking: Marking) {
+    pub(super) async fn begin_marking(&mut self, marking: Marking) {
         self.logout_gate.marking = Some(marking);
+        self.emit_auth().await;
         let persist = self.persist.clone();
         let tx = self.auth.sender();
         let shutdown = self.cancel.clone();
@@ -229,11 +241,43 @@ impl<B: Backend> Actor<B> {
             Ok(()) => self.tear_down(marking.plan).await,
             Err(error) => {
                 tracing::warn!("logout not started: its marker was not written");
-                let trigger = marking.trigger;
                 self.logout_gate.put_blocked(marking, error);
-                self.set_auth(AuthState::LogoutNotStarted { error, trigger })
+                self.emit_auth().await;
+            }
+        }
+    }
+
+    /// Answers an account command refused in the UI's epoch, so no UI state
+    /// waits on it (review round 25, finding 1): a send ends `Failed`, a
+    /// retry goes back to its send's state, a load ends `Busy`.
+    pub(super) async fn acknowledge_refused(&mut self, cmd: Command) {
+        match cmd {
+            Command::SendText { local_id, .. } => {
+                self.emit(Event::SendState {
+                    local_id,
+                    state: SendState::Failed,
+                })
+                .await;
+            }
+            Command::RetrySend(local_id) => {
+                if let Some(state) = self.sends.state_of(local_id) {
+                    self.emit(Event::SendState { local_id, state }).await;
+                }
+            }
+            Command::LoadDialogs => {
+                self.load_ended(LoadTarget::Dialogs, Some(UserError::Busy))
                     .await;
             }
+            Command::LoadOlder(chat) => {
+                self.history_ended(chat, HistoryDir::Older, Some(UserError::Busy))
+                    .await;
+            }
+            Command::LoadNewer(chat) => {
+                self.history_ended(chat, HistoryDir::Newer, Some(UserError::Busy))
+                    .await;
+            }
+            // Nothing waits on these.
+            _ => {}
         }
     }
 
@@ -292,6 +336,10 @@ impl<B: Backend> Actor<B> {
         self.forget_instance_session();
         self.auth.signed_in = self.account.is_signed_in().unwrap_or(false);
         self.reprovision_cache(identity).await;
+        // Out of the blocked startup before the credentials resolve: a
+        // credential error is shown, not taken for a logout's (review round
+        // 25, finding 2). `start_build` below sets the same phase.
+        self.life.phase = Phase::Building;
         self.set_auth(AuthState::Connecting).await;
         self.load_cached_chats();
         self.resolve_credentials().await;

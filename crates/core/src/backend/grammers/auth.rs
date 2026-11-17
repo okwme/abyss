@@ -104,6 +104,12 @@ const MAX_LABEL: usize = 63;
 /// of it (no punycode labels). Anything else is dropped, so the screen
 /// shows no address rather than a misleading one. Shown as text; nothing
 /// opens it. A small parser on purpose: no URL crate for one field.
+///
+/// Telegram documents `fragment.com` as the host (`auth.sentCodeTypeFragmentSms`
+/// carries "the URL to open on Fragment"). Whether it ever sends a subdomain,
+/// and what its path looks like, is unverified (no live sample): subdomains
+/// are allowed only as plain lowercase labels under it, and the path is not
+/// checked beyond being printable ASCII (review round 25).
 pub(crate) fn safe_url(raw: &str) -> Option<String> {
     if raw.len() > MAX_DELIVERY_TEXT || !raw.bytes().all(|b| b.is_ascii_graphic()) {
         return None;

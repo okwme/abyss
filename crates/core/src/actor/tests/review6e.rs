@@ -96,6 +96,41 @@ async fn failed_marker_write_performs_no_side_effect() {
     h.stop().await;
 }
 
+/// The hang under load in `failed_marker_write_performs_no_side_effect`:
+/// the startup check (`fetch_self`) answers only after a logout's marker
+/// write failed. It must still sign the account in behind "Couldn't start
+/// logout", so "Stay signed in" shows the account, not `Connecting`.
+/// Before the fix the overlay replaced the real login state, the check
+/// (which applies only to `Connecting`) was dropped, and Back restored
+/// `Connecting` for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_check_answering_behind_an_unstarted_logout_still_signs_in() {
+    let (backend, fake) = FakeBackend::new(super::review6c::demo());
+    fake.inject(Op::FetchSelf, Fault::Delay(Duration::from_millis(1500)));
+    let mut h = start(backend, fake, Setup::default()).await;
+    h.online().await;
+    h.faults.fail_set_of(SecretItem::LogoutPending);
+    h.send(Command::Logout).await;
+    let (_, seen) = h
+        .until(|e| matches!(e, Event::Auth(s) if is_not_started(s)))
+        .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, Event::Auth(s) if s.is_signed_in())),
+        "the check answered before the marker failed: {seen:?}"
+    );
+    // The check answers behind the overlay: still "Couldn't start logout".
+    h.auth(is_not_started).await;
+    h.send(Command::Back).await;
+    let (ev, _) = h.until(|e| matches!(e, Event::Auth(_))).await;
+    assert!(
+        matches!(&ev, Event::Auth(s) if s.is_signed_in()),
+        "Stay signed in showed {ev:?}"
+    );
+    h.stop().await;
+}
+
 /// Finding 1 (high), the invariant across a restart: the marker write, the
 /// remote logout and the session delete all fail, then the process
 /// restarts. The restart may load the session only if no logout side
@@ -378,6 +413,14 @@ async fn flooded_send_ends(h: &mut Harness) -> (SendState, bool) {
     }
 }
 
+/// Backend attempts of `LocalId(1)`, the first send made (its `random_id`
+/// is the first one the fake saw).
+fn flooded_attempts(h: &Harness) -> usize {
+    let attempts = h.fake.send_attempts();
+    let first = attempts.first().unwrap().1;
+    attempts.iter().filter(|(_, id)| *id == first).count()
+}
+
 /// Online, with `LocalId(1)` flood-waited for 599 s (its automatic window
 /// is 600 s).
 async fn flooded_at_zero() -> Harness {
@@ -418,6 +461,7 @@ async fn queued_flood_retry_admitted_past_the_window_fails() {
     let (state, warned) = flooded_send_ends(&mut h).await;
     assert_eq!(state, SendState::Failed, "sent past the window");
     assert!(warned, "no FloodWait error before Failed");
+    assert_eq!(flooded_attempts(&h), 1, "the backend saw the resend");
     h.stop().await;
 }
 
@@ -433,6 +477,7 @@ async fn queued_flood_retry_surviving_a_rebuild_fails_past_the_window() {
     let (state, warned) = flooded_send_ends(&mut h).await;
     assert_eq!(state, SendState::Failed, "sent past the window");
     assert!(warned, "no FloodWait error before Failed");
+    assert_eq!(flooded_attempts(&h), 1, "the backend saw the resend");
     assert!(h.fake.builds() >= 2, "no rebuild happened");
     h.stop().await;
 }

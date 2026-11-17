@@ -43,7 +43,7 @@ pub(crate) use marker::{PendingLogout, read_pending_logout};
 
 use crate::api::{
     AuthState, ClientGen, Command, ConnState, Event, HistoryDir, LoadTarget, RemoteLogout,
-    SaveStatus, SendState, UserError, WindowState,
+    SaveStatus, UserError, WindowState,
 };
 use crate::backend::{Backend, DialogsCursor, HistoryQuery, StreamItem};
 use crate::cache::CacheHandle;
@@ -538,33 +538,25 @@ impl<B: Backend> Actor<B> {
     }
 
     /// Admits a UI command. An account-scoped one is refused while no
-    /// account is signed in, during a logout (from its marker write on), or
-    /// when the UI made it in
-    /// another account epoch: a command queued behind a logout, or made for
-    /// the old account, never acts for the next one (review round 15, C).
+    /// account is signed in, during a logout (a send or retry already while
+    /// its marker is written, `LogoutGate::refuses`), or when the UI made it
+    /// in another account epoch: a command queued behind a logout, or made
+    /// for the old account, never acts for the next one (review round 15,
+    /// C). A refusal in the UI's epoch is answered (`acknowledge_refused`).
     async fn on_stamped(&mut self, stamped: Stamped) {
         let Stamped { epoch, cmd } = stamped;
         if !account_scoped(&cmd) {
             return self.on_command(cmd).await;
         }
         let current = epoch == self.events.epoch();
-        // A logout writing its marker counts as begun: what the UI queued
-        // behind it is refused, as during the teardown (review round 19).
-        let signed_in = self.auth.signed_in
-            && !matches!(self.life.phase, Phase::LoggingOut(_))
-            && !self.logout_gate.is_marking();
-        if current && signed_in {
+        let signed_in = self.auth.signed_in && !matches!(self.life.phase, Phase::LoggingOut(_));
+        if current && signed_in && !self.logout_gate.refuses(&cmd) {
             return self.on_command(cmd).await;
         }
         tracing::debug!(current, signed_in, "account command refused");
-        // A send the UI shows for this epoch ends failed; one made for an
-        // earlier epoch is not the UI's anymore.
-        if let (true, Command::SendText { local_id, .. }) = (current, cmd) {
-            self.emit(Event::SendState {
-                local_id,
-                state: SendState::Failed,
-            })
-            .await;
+        // A command made for an earlier epoch is not the UI's anymore.
+        if current {
+            self.acknowledge_refused(cmd).await;
         }
     }
 

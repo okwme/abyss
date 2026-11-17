@@ -112,6 +112,11 @@ pub(super) struct PendingSends {
 }
 
 impl PendingSends {
+    /// The state of a send in the table (`None`: no such send).
+    pub(super) fn state_of(&self, id: LocalId) -> Option<SendState> {
+        self.map.get(&id).map(|p| p.state)
+    }
+
     fn insert(&mut self, id: LocalId, p: Pending) {
         self.map.insert(id, p);
         self.rev = self.rev.wrapping_add(1);

@@ -85,6 +85,10 @@ pub(crate) enum AuthView {
         url: Option<SharedString>,
     },
     LoggingOut,
+    /// A logout's marker is being written: "Logging out" over the account's
+    /// UI, which is kept (nothing has changed yet) but not shown, so no
+    /// send, retry or selection is made meanwhile (review round 25).
+    LogoutStarting,
     /// The logout's local deletion failed: "Logout incomplete" with Retry.
     /// Core accepts no login until the retry succeeds.
     LogoutIncomplete {
@@ -256,6 +260,7 @@ pub(crate) fn project(state: AuthState, prev: &AuthView, now: Instant) -> Projec
         AuthState::SignedIn { new_login, .. } => signed_in(new_login, Saved::Yes),
         AuthState::SignedInUnsaved { new_login, .. } => signed_in(new_login, Saved::No),
         AuthState::LoggingOut => Projection::view(AuthView::LoggingOut),
+        AuthState::LogoutStarting => Projection::view(AuthView::LogoutStarting),
         AuthState::LoggedOut {
             remote,
             local: LocalDeletion::Failed(_),
@@ -315,6 +320,7 @@ pub(crate) fn back(view: &AuthView, source: Option<CredentialSource>) -> Back {
         | AuthView::Connecting
         | AuthView::Verifying { .. }
         | AuthView::LoggingOut
+        | AuthView::LogoutStarting
         | AuthView::LogoutIncomplete { .. }
         | AuthView::LogoutNotStarted {
             trigger: LogoutTrigger::Server,
@@ -541,6 +547,11 @@ mod tests {
         );
         assert!(!user.tears_down(), "nothing changed: the account stays");
         assert_eq!(back(&user, None), Back::Core, "stay signed in");
+        // Round 25: the marker write is shown, and keeps the account's UI.
+        let starting = at(AuthState::LogoutStarting);
+        assert_eq!(starting, AuthView::LogoutStarting);
+        assert!(!starting.tears_down());
+        assert_eq!(back(&starting, None), Back::None);
         let server = AuthView::LogoutNotStarted {
             trigger: LogoutTrigger::Server,
         };

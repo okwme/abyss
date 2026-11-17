@@ -554,6 +554,12 @@ pub enum AuthState {
         new_login: Option<NewLogin>,
     },
     LoggingOut,
+    /// A logout was asked for and its marker is being written (the
+    /// Keychain may prompt): nothing has changed yet and the account's data
+    /// stays, but sends and retries are refused until the write resolves
+    /// (review round 25, finding 1). Then `LoggingOut`, or
+    /// `LogoutNotStarted`.
+    LogoutStarting,
     LoggedOut {
         remote: RemoteLogout,
         local: LocalDeletion,
