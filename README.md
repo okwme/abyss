@@ -1,4 +1,10 @@
-# abyss
+<p align="center">
+  <img src="assets/icon/well.svg" width="96" height="96" alt="The abyss mark: six nested squares descending to a dark centre">
+</p>
+
+<h1 align="center">abyss</h1>
+
+<p align="center">Look in. Nothing looks back.</p>
 
 A small, auditable Telegram client for macOS, written in Rust with
 [GPUI](https://www.gpui.rs/) and [grammers](https://github.com/Lonami/grammers).
