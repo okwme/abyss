@@ -44,10 +44,12 @@ impl Limits {
         lines: Lines::Single,
         max_utf16: 20,
     };
+    /// A login code: up to core's bound for any delivery; the code screen
+    /// narrows it to the delivery's (`EditBuffer::set_max_utf16`).
     pub(crate) const CODE: Limits = Limits {
         filter: CharFilter::Digits,
         lines: Lines::Single,
-        max_utf16: 8,
+        max_utf16: abyss_core::api::MAX_CODE_DIGITS,
     };
     /// `api_id`: at most 10 digits (a positive 32-bit number).
     pub(crate) const API_ID: Limits = Limits {
@@ -294,6 +296,15 @@ impl EditBuffer {
     }
 
     /// Takes the content, leaving the field empty.
+    /// Changes the length bound (a code field follows the delivery). Text
+    /// over the new bound is cleared rather than cut.
+    pub(crate) fn set_max_utf16(&mut self, max: usize) {
+        self.limits.max_utf16 = max;
+        if self.utf16_len() > max {
+            drop(self.take());
+        }
+    }
+
     pub(crate) fn take(&mut self) -> String {
         self.selected = 0..0;
         self.reversed = false;
@@ -490,6 +501,21 @@ mod tests {
         let mut b = EditBuffer::new(Limits::CODE);
         b.replace(None, "12-34 5+6\n");
         assert_eq!(b.text(), "123456");
+    }
+
+    /// Finding 5: a flash call's whole number fits; the bound follows the
+    /// delivery and never exceeds core's.
+    #[test]
+    fn code_bound_follows_the_delivery() {
+        let mut b = EditBuffer::new(Limits::CODE);
+        assert_eq!(b.replace(None, "447700900123"), Fit::Whole);
+        assert_eq!(b.text(), "447700900123");
+        assert_eq!(b.replace(None, &"1".repeat(40)), Fit::Clipped);
+        assert_eq!(b.utf16_len(), abyss_core::api::MAX_CODE_DIGITS);
+        b.set_max_utf16(5);
+        assert_eq!(b.text(), "", "over the new bound: cleared");
+        assert_eq!(b.replace(None, "1234567"), Fit::Clipped);
+        assert_eq!(b.text(), "12345");
     }
 
     #[test]

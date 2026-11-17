@@ -140,6 +140,7 @@ impl KeychainStore {
             SecretItem::Session => "abyss Telegram session",
             SecretItem::CacheKey => "abyss message cache key",
             SecretItem::ApiCredentials => "abyss Telegram API credentials",
+            SecretItem::LogoutPending => "abyss logout pending",
         };
         [
             (

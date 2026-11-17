@@ -5,9 +5,9 @@ use crate::store::ViewGen;
 
 pub use crate::auth_types::{
     ApiCredentials, ApiHash, ApiHashError, ApiId, ApiIdError, AuthState, CodeDelivery,
-    CredentialError, CredentialSource, EnvVar, LocalDeletion, LogoutStatus, NewLogin, NextDelivery,
-    PASSWORD_CAPACITY, PasswordBuf, PasswordTooLong, RemoteLogout, SaveStatus, SentCodeInfo,
-    StorageError, mask_phone,
+    CredentialError, CredentialItem, CredentialSource, EnvVar, LocalDeletion, LogoutStatus,
+    MAX_CODE_DIGITS, MAX_DELIVERY_TEXT, NewLogin, NextDelivery, PASSWORD_CAPACITY, PasswordBuf,
+    PasswordTooLong, RemoteLogout, SaveStatus, SentCodeInfo, StorageError, mask_phone,
 };
 
 /// Generation of the client instance. Bumps on every rebuild, login and logout;
@@ -73,7 +73,9 @@ pub enum Command {
     /// Re-runs credential resolution: the Retry for an unreadable Keychain,
     /// or "use the saved pair" after Back.
     ReloadCredentials,
-    /// Retries saving the entered pair after a Keychain write failed.
+    /// Retries saving the entered pair after a Keychain write failed
+    /// ([`CredentialItem::SaveFailed`]). Refused unless a code request
+    /// succeeded with that pair (its proof).
     RetryCredentialSave,
     /// One login step back (plan section 17.3): code, password and the
     /// official-app screens go to the phone screen; the phone screen goes to
@@ -237,6 +239,9 @@ pub enum Event {
     /// Which credential source is in control (plan section 17.2a); `None`
     /// while none is.
     CredentialSource(Option<CredentialSource>),
+    /// The credential Keychain item's save/delete state (round 11): the UI
+    /// offers Retry on a failure.
+    CredentialItem(CredentialItem),
     Connection(ConnState),
     /// The whole chat list, replacing the UI's copy. A reloaded first page
     /// (bootstrap, refresh) is merged into the loaded list in core, so later

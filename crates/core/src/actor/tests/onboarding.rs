@@ -423,7 +423,8 @@ async fn sent_code_types_and_unsupported_flows() {
     h.send(Command::Back).await;
     h.auth(is_phone).await;
     h.send(Command::SubmitPhone("+999 1234567".into())).await;
-    h.auth(|s| *s == AuthState::OfficialAppRequired).await;
+    h.auth(|s| *s == AuthState::OfficialAppRequired { url: None })
+        .await;
     h.send(Command::Back).await;
     h.auth(is_phone).await;
     h.stop().await;

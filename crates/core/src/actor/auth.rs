@@ -11,12 +11,30 @@
 //! is consumed with it).
 //!
 //! **Ambiguous completions.** A `sign_in`/`check_password` that timed out,
-//! failed in transport, was superseded (Back) or lost with its instance may
-//! have signed in. Core then *reconciles*: [`AuthState::Verifying`] until the
-//! `is_authorized` probe gives a verified answer. "Not authorized" returns to
-//! the step; "authorized" completes the login; an inconclusive probe (a
-//! network failure, a flood wait) is retried with backoff and never read as
-//! signed out. No other login call starts while reconciliation is pending.
+//! failed in transport, was superseded (Back, Forget) or lost with its
+//! instance may have signed in. Core then *reconciles*:
+//! [`AuthState::Verifying`] until it has a verified answer. "Not authorized"
+//! returns to the step (or finishes the Back/Forget that waited); "authorized"
+//! completes the login; an inconclusive probe (a network failure, a flood
+//! wait) is retried with backoff and never read as signed out. No other
+//! login call starts while reconciliation is pending.
+//!
+//! **Completion ordering (round 11, finding 1).** grammers keeps a request
+//! queued after its caller's future is dropped, and Telegram may run
+//! parallel requests in any order, so a probe sent while the original call
+//! may still be queued can overtake it: "not authorized", then the sign-in
+//! lands. Two rules order the probe after the original invocation:
+//! 1. **Supervise.** Back and Forget never cancel a running
+//!    `sign_in`/`check_password`; they record where to go and wait for its
+//!    own answer, which is definitive (signed in, or an RPC error the server
+//!    returned) unless it is ambiguous.
+//! 2. **Retire before probing.** After an ambiguous answer (deadline,
+//!    transport), the instance the call ran on is *unsettled*: the probe never
+//!    runs there. It is retired first (quitting the runner drops the
+//!    sender's queue and closes the connection), and the probe runs on a
+//!    fresh instance. Residual: a request already written to the socket may
+//!    still execute on the server after the probe; no client-side ordering
+//!    can exclude that (plan section 13, task 6d).
 //!
 //! **Revocation.** `AUTH_KEY_UNREGISTERED`/`SESSION_REVOKED` from a login call
 //! tears the local session down (signed in or not, plan section 5). That is
@@ -102,6 +120,32 @@ pub(super) enum Resume {
     Phone,
     Code,
     Password,
+    /// Back from the phone screen: drop the pair in use, then the credential
+    /// screens.
+    Credentials,
+    /// Forget: delete the stored pair and drop the pair in use. If the
+    /// account turns out signed in, the forget is refused (log out first).
+    Forget,
+}
+
+impl Resume {
+    /// A Back or Forget recorded while reconciling: the stronger one wins.
+    fn merge(self, newer: Self) -> Self {
+        match (self, newer) {
+            (Self::Forget, _) | (_, Self::Forget) => Self::Forget,
+            (Self::Credentials, _) | (_, Self::Credentials) => Self::Credentials,
+            _ => newer,
+        }
+    }
+}
+
+/// Whether an ambiguous call's instance may still hold its request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Taint {
+    /// The current instance: it is retired before the probe runs.
+    Current,
+    /// The instance was retired already (its queue is gone).
+    Retired,
 }
 
 /// Why a login call has no answer.
@@ -192,8 +236,9 @@ pub(super) enum AuthMsg<C: Client> {
         attempt: AttemptId,
         done: CredDone,
     },
-    /// A background cache re-binding finished (see `binding`).
-    CacheSettled,
+    /// A background cache re-binding with this generation sent its result
+    /// to its join handle (see `binding`).
+    CacheSettled(u64),
 }
 
 /// The running login task.
@@ -239,6 +284,9 @@ pub(super) struct AuthMachine<C: Client> {
     timer: Option<(Instant, Wake)>,
     /// An ambiguous sign-in awaits the probe.
     pub(super) reconcile: Option<Resume>,
+    /// The instance an ambiguous sign-in ran on: its request may still be
+    /// queued there, so the probe never runs on it (module docs).
+    unsettled: Option<ClientGen>,
     probe_failures: u32,
     pub(super) creds: Creds,
 }
@@ -264,6 +312,7 @@ impl<C: Client> AuthMachine<C> {
             hint: None,
             timer: None,
             reconcile: None,
+            unsettled: None,
             probe_failures: 0,
             creds: Creds::default(),
         }
@@ -298,15 +347,25 @@ impl<C: Client> AuthMachine<C> {
         self.timer = None;
     }
 
-    /// Cancels the running login task; its result will be stale. A call
-    /// that may have signed in leaves a reconciliation behind.
-    pub(super) fn supersede(&mut self, resume: Resume) {
-        if let Some(run) = self.current.take() {
-            run.cancel.cancel();
-            if run.kind.may_sign_in() {
-                self.reconcile = Some(resume);
-            }
+    /// Supersedes the running login task. A call that may sign in is *not*
+    /// cancelled (module docs, "Supervise"): it keeps running and its own
+    /// answer settles a reconciliation that then goes to `resume`; returns
+    /// `true`. Any other call is cancelled; its result will be stale.
+    pub(super) fn supersede(&mut self, resume: Resume) -> bool {
+        let Some(run) = self.current.as_ref() else {
+            return false;
+        };
+        if run.kind.may_sign_in() {
+            self.record_resume(resume);
+            return true;
         }
+        self.abort_task();
+        false
+    }
+
+    /// Where a pending reconciliation goes when it proves "not signed in".
+    pub(super) fn record_resume(&mut self, resume: Resume) {
+        self.reconcile = Some(self.reconcile.map_or(resume, |r| r.merge(resume)));
     }
 
     /// Forgets the running task (its instance is being retired with it).
@@ -320,6 +379,7 @@ impl<C: Client> AuthMachine<C> {
         self.abort_task();
         self.clear_login();
         self.reconcile = None;
+        self.unsettled = None;
         self.probe_failures = 0;
         self.signed_in = false;
     }
@@ -536,7 +596,7 @@ impl<B: Backend> Actor<B> {
     pub(super) async fn after_live(&mut self) {
         self.reap_retired().await;
         if self.life.phase == Phase::SignedOut && self.credentials_superseded() {
-            return self.retire_for_credentials();
+            return self.retire_signed_out();
         }
         match self.life.phase {
             Phase::SignedOut if self.auth.reconcile.is_some() => self.start_probe().await,
@@ -576,8 +636,9 @@ impl<B: Backend> Actor<B> {
     async fn on_lost(&mut self, kind: AuthKind) {
         match kind {
             AuthKind::Startup => self.auth.startup_checked = false,
-            AuthKind::SignIn => self.begin_reconcile(Resume::Code).await,
-            AuthKind::Password => self.begin_reconcile(Resume::Password).await,
+            // The instance is gone with its queue: probe on the next one.
+            AuthKind::SignIn => self.begin_reconcile(Resume::Code, Taint::Retired).await,
+            AuthKind::Password => self.begin_reconcile(Resume::Password, Taint::Retired).await,
             AuthKind::Probe => self.reconcile_failed(AuthFail::Dropped).await,
             AuthKind::RequestCode => {
                 let error = Some(UserError::Network);
@@ -631,7 +692,7 @@ impl<B: Backend> Actor<B> {
             self.auth.state,
             AuthState::Phone { .. }
                 | AuthState::SignUpRequired
-                | AuthState::OfficialAppRequired
+                | AuthState::OfficialAppRequired { .. }
                 | AuthState::LoggedOut { .. }
         ) || self.auth.signed_in
         {
@@ -781,22 +842,34 @@ impl<B: Backend> Actor<B> {
         });
     }
 
-    /// An ambiguous completion: reconcile before anything else.
-    pub(super) async fn begin_reconcile(&mut self, resume: Resume) {
-        self.auth.reconcile = Some(resume);
+    /// An ambiguous completion: reconcile before anything else. A Back or
+    /// Forget recorded meanwhile keeps its destination. `taint` says whether
+    /// the call's instance may still hold the request.
+    pub(super) async fn begin_reconcile(&mut self, resume: Resume, taint: Taint) {
+        if self.auth.reconcile.is_none() {
+            self.auth.reconcile = Some(resume);
+        }
+        if taint == Taint::Current {
+            self.auth.unsettled = Some(self.cgen);
+        }
         self.auth.probe_failures = 0;
         self.start_probe().await;
     }
 
     /// Asks the server whether the session is signed in (plan section 4):
     /// authorized means a call went through, so fetch and cache the self
-    /// user and confirm.
+    /// user and confirm. Never on an unsettled instance: that one is retired
+    /// first and the probe runs once the next is up (`after_live`).
     pub(super) async fn start_probe(&mut self) {
         if self.auth.reconcile.is_none() || self.auth.current.is_some() {
             return;
         }
         if !matches!(self.auth.state, AuthState::Verifying { .. }) {
             self.set_auth(AuthState::Verifying { error: None }).await;
+        }
+        if self.auth.unsettled == Some(self.cgen) {
+            // No-op unless signed out; a retirement under way does the same.
+            return self.retire_signed_out();
         }
         let Some(prep) = self.prepare(AuthKind::Probe).await else {
             return;
@@ -836,29 +909,52 @@ impl<B: Backend> Actor<B> {
         self.set_auth(AuthState::Verifying { error }).await;
     }
 
-    /// The probe verified that the session is not signed in.
+    /// Verified: the session is not signed in (the probe, or the original
+    /// call's own definitive answer). A waiting Back or Forget finishes now.
     pub(super) async fn reconcile_not_authorized(&mut self) {
         self.auth.probe_failures = 0;
+        self.auth.unsettled = None;
         match self.auth.reconcile.take() {
             Some(Resume::Code) => self.code_state(Some(UserError::Network)).await,
             Some(Resume::Password) => self.token_unavailable(UserError::Network).await,
             Some(Resume::Phone) | None => {
                 self.set_auth(AuthState::Phone { error: None }).await;
             }
+            Some(Resume::Credentials) => self.leave_to_credentials().await,
+            Some(Resume::Forget) => self.forget_now().await,
+        }
+    }
+
+    /// The original call of a reconciliation answered (it was superseded by
+    /// Back or Forget, and supervised). `fail`: `None` is a definitive "not
+    /// signed in" (the server answered: a wrong code, a 2FA challenge, sign
+    /// up); an RPC error is too, unless revoked or ambiguous.
+    pub(super) async fn settle_original(&mut self, fail: Option<AuthFail>) {
+        match fail {
+            Some(f) if f.is_revoked() => self.login_revoked().await,
+            Some(f) if f.is_ambiguous() => {
+                self.begin_reconcile(Resume::Phone, Taint::Current).await;
+            }
+            _ => self.reconcile_not_authorized().await,
         }
     }
 
     /// `AUTH_KEY_UNREGISTERED`/`SESSION_REVOKED` during login: the local
-    /// session is torn down even though no account is signed in.
+    /// session is torn down even though no account is signed in. A Forget
+    /// that waited for reconciliation is carried out (nobody is signed in).
     pub(super) async fn login_revoked(&mut self) {
-        self.auth.reconcile = None;
+        let forget = self.auth.reconcile.take() == Some(Resume::Forget);
+        self.auth.unsettled = None;
         self.auth.clear_login();
+        if forget {
+            self.forget_item_and_pair().await;
+        }
         self.session_revoked().await;
     }
 
     pub(super) async fn code_state(&mut self, error: Option<UserError>) {
         let phone_hint = self.auth.phone_hint.clone();
-        let sent = self.auth.sent;
+        let sent = self.auth.sent.clone();
         self.set_auth(AuthState::Code {
             phone_hint,
             sent,
@@ -898,12 +994,18 @@ impl<B: Backend> Actor<B> {
         new_login: Option<NewLogin>,
     ) {
         self.auth.clear_login();
-        self.auth.reconcile = None;
+        // A Forget that waited: the account is signed in, so it is refused.
+        let refused_forget = self.auth.reconcile.take() == Some(Resume::Forget);
+        self.auth.unsettled = None;
         self.auth.probe_failures = 0;
+        // A new account epoch: commands the UI made while signed out (or
+        // for an earlier account) are refused (review round 15, C).
+        self.events.advance_epoch();
         self.auth.signed_in = true;
         self.auth.startup_checked = true;
         self.clear_halt();
-        self.credentials_proven();
+        // Retries a failed save; only a pair a code request proved.
+        self.persist_proven().await;
         let display_name = account.display_name;
         let state = if durable == SaveStatus::Confirmed {
             AuthState::SignedIn {
@@ -917,6 +1019,9 @@ impl<B: Backend> Actor<B> {
             }
         };
         self.set_auth(state).await;
+        if refused_forget {
+            self.error(UserError::SignOutFirst).await;
+        }
         // Before the bootstrap writes anything: rows are served only from a
         // cache bound to this account.
         self.bind_cache().await;

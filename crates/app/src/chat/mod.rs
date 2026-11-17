@@ -148,6 +148,28 @@ impl std::fmt::Debug for ChatShell {
 }
 
 impl ChatShell {
+    /// An account's teardown began (review round 15, B): forgets all of its
+    /// state (chat list, selection, messages, echoes, spoilers, read and
+    /// viewport state, retries, countdowns), so nothing of it reaches the
+    /// next account, even one with the same peer ids. Kept: the window's
+    /// focus state (the OS's and core's, not the account's) and the local id
+    /// counter, so a stale event for an old send never matches a new one.
+    pub(crate) fn reset(&mut self) {
+        let fresh = Self {
+            next_local: self.next_local,
+            active: self.active,
+            focus_sent: self.focus_sent,
+            focus_retry: std::mem::take(&mut self.focus_retry),
+            ..Self::default()
+        };
+        *self = fresh;
+    }
+}
+
+#[cfg(test)]
+mod reset_tests;
+
+impl ChatShell {
     pub(crate) fn selected(&self) -> Option<ChatId> {
         self.selected
     }
@@ -300,6 +322,7 @@ impl ChatShell {
             Event::Connection(state) => self.on_connection(state),
             Event::Auth(_)
             | Event::CredentialSource(_)
+            | Event::CredentialItem(_)
             | Event::Error(_)
             | Event::LoadEnded { .. } => {}
         }

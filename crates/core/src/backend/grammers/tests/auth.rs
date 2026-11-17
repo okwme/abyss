@@ -14,7 +14,8 @@ use grammers_client::tl::{self, Deserializable as _, Serializable as _};
 
 use crate::api::{ApiCredentials, CodeDelivery, CredentialError, NextDelivery};
 use crate::backend::grammers::auth::{
-    MappedCode, SignInFailure, auth_error, is_authorized, map_sent_code, send_code, sign_in_failure,
+    GrammersLoginToken, MappedCode, SignInFailure, auth_error, is_authorized, login_state,
+    map_sent_code, send_code, sign_in, sign_in_failure,
 };
 use crate::backend::grammers::invoke::Invoke;
 use crate::backend::{AuthError, BackendError, SentCode, SessionSnapshot};
@@ -111,28 +112,99 @@ fn every_sent_code_type_is_mapped() {
         ),
         (
             T::FlashCall(ty::SentCodeTypeFlashCall {
-                pattern: "+44*".into(),
+                pattern: "+44 7700 9*****".into(),
             }),
-            Ok(mapped(CodeDelivery::FlashCall, None)),
+            Ok(mapped(
+                CodeDelivery::FlashCall {
+                    pattern: "+44 7700 9*****".into(),
+                },
+                None,
+            )),
         ),
         (
             T::MissedCall(ty::SentCodeTypeMissedCall {
-                prefix: "+44".into(),
+                prefix: "+44 7700".into(),
                 length: 4,
             }),
-            Ok(mapped(CodeDelivery::MissedCall, Some(4))),
+            Ok(mapped(
+                CodeDelivery::MissedCall {
+                    prefix: "+44 7700".into(),
+                },
+                Some(4),
+            )),
         ),
         (
             T::FragmentSms(ty::SentCodeTypeFragmentSms {
-                url: "https://fragment.com".into(),
+                url: "https://fragment.com/number/888".into(),
                 length: 5,
             }),
-            Ok(mapped(CodeDelivery::FragmentSms, Some(5))),
+            Ok(mapped(
+                CodeDelivery::Fragment {
+                    url: Some("https://fragment.com/number/888".into()),
+                },
+                Some(5),
+            )),
         ),
     ];
     for (t, want) in table {
         assert_eq!(map_sent_code(code(t, None, None)), want);
     }
+}
+
+/// Round 11, finding 5: per-type info is kept and sanitized. A flash-call
+/// pattern keeps its full length (the code is the whole number); a
+/// Fragment URL that is not plain `https://` is dropped, never passed on.
+#[test]
+fn delivery_text_is_kept_and_sanitized() {
+    let flash = T::FlashCall(ty::SentCodeTypeFlashCall {
+        pattern: "+1 (555) 01*-****\u{202e}x".into(),
+    });
+    let sent = map_sent_code(code(flash, None, None)).unwrap().sent;
+    let CodeDelivery::FlashCall { pattern } = &sent.delivery else {
+        panic!("{sent:?}");
+    };
+    assert_eq!(pattern, "+1 555 01*-****");
+    let info = crate::api::SentCodeInfo {
+        delivery: sent.delivery.clone(),
+        length: sent.length,
+        next: None,
+        resend_at: None,
+    };
+    assert_eq!(info.max_code_digits(), 11, "not truncated to 8");
+    for bad in ["http://fragment.com", "javascript:alert(1)", "https://a b"] {
+        let fragment = T::FragmentSms(ty::SentCodeTypeFragmentSms {
+            url: bad.into(),
+            length: 5,
+        });
+        let sent = map_sent_code(code(fragment, None, None)).unwrap().sent;
+        assert_eq!(sent.delivery, CodeDelivery::Fragment { url: None }, "{bad}");
+    }
+}
+
+/// Round 11, finding 3: `updates.getState` after an authorization. A
+/// revocation in between is propagated (not swallowed as "no state"); only
+/// transport and flood failures are best-effort; anything else is
+/// ambiguous, so core reconciles.
+#[test]
+fn login_state_propagates_revocation() {
+    assert_eq!(
+        login_state(Err(rpc(401, "SESSION_REVOKED", None))).unwrap_err(),
+        AuthError::Backend(BackendError::Unauthorized)
+    );
+    assert_eq!(
+        login_state(Err(rpc(401, "AUTH_KEY_UNREGISTERED", None))).unwrap_err(),
+        AuthError::Backend(BackendError::Unauthorized)
+    );
+    assert_eq!(login_state(Err(rpc(420, "FLOOD_WAIT", Some(5)))), Ok(None));
+    assert_eq!(
+        login_state(Err(InvocationError::Dropped("gone"))),
+        Ok(None),
+        "transport"
+    );
+    assert_eq!(
+        login_state(Err(rpc(400, "SOMETHING_ELSE", None))).unwrap_err(),
+        AuthError::Backend(BackendError::Transient)
+    );
 }
 
 /// Email, Firebase and word/phrase codes need an official app.
@@ -387,4 +459,29 @@ async fn send_code_errors_are_typed_and_not_retried() {
         Err(AuthError::Credentials(CredentialError::ApiIdInvalid))
     );
     assert_eq!(inv.requests.lock().unwrap().len(), 1);
+}
+
+/// Round 11, finding 3: `auth.signIn` succeeds, then the key is revoked
+/// before `updates.getState`. The login reports the revocation (so core
+/// tears the session down) instead of swallowing it as "no update state".
+#[tokio::test]
+async fn revocation_between_authorization_and_completion_is_reported() {
+    let authorized = tl::enums::auth::Authorization::Authorization(ty::Authorization {
+        setup_password_required: false,
+        otherwise_relogin_days: None,
+        tmp_sessions: None,
+        future_auth_token: None,
+        user: tl::enums::User::Empty(tl::types::UserEmpty { id: 7 }),
+    });
+    let inv = mock(vec![
+        Ok(authorized.to_bytes()),
+        Err(rpc(401, "SESSION_REVOKED", None)),
+    ]);
+    let session = AbyssSession::from_snapshot(SessionSnapshot::detached()).unwrap();
+    let token = GrammersLoginToken::for_test("+447700900123", "h4sh");
+    let res = sign_in(&inv, &session, &token, "12345").await;
+    assert_eq!(
+        res.map(|_| ()),
+        Err(AuthError::Backend(BackendError::Unauthorized))
+    );
 }

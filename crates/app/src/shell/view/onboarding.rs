@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use abyss_core::api::{CredentialError, UserError};
-use gpui::{AnyElement, Context, Div, Stateful, div, prelude::*, px};
+use gpui::{AnyElement, Context, Div, SharedString, Stateful, div, prelude::*, px};
 
 use super::{
     LoginForm, back_button, button, card, centered, error_line, field, footer, muted, on,
@@ -170,7 +170,7 @@ fn keychain(cx: &mut Context<'_, Root>) -> AnyElement {
 pub(super) fn code_screen(
     session: &Session,
     phone_hint: &str,
-    sent: Option<SentView>,
+    sent: Option<&SentView>,
     error: Option<UserError>,
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
@@ -183,7 +183,11 @@ pub(super) fn code_screen(
     }
     let form = LoginForm {
         heading: crate::ui::copy::CODE_TITLE,
-        detail: text::code_detail(phone_hint, sent.map(|s| s.delivery)),
+        detail: text::code_detail(
+            phone_hint,
+            sent.map(|s| &s.delivery),
+            sent.and_then(|s| s.length),
+        ),
         input: session.code.clone().into_any_element(),
         extra,
         error,
@@ -194,7 +198,7 @@ pub(super) fn code_screen(
 }
 
 /// When Telegram offers another delivery: a countdown, then a button.
-fn resend_row(sent: Option<SentView>, cx: &mut Context<'_, Root>) -> Option<Div> {
+fn resend_row(sent: Option<&SentView>, cx: &mut Context<'_, Root>) -> Option<Div> {
     let sent = sent?;
     let next = sent.next?;
     let left = sent
@@ -229,12 +233,14 @@ pub(super) fn dead_end_screen(
     session: &Session,
     heading: &'static str,
     detail: &'static str,
+    note: Option<SharedString>,
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
     page(
         card()
             .child(title(heading))
             .child(muted(detail))
+            .children(note.map(muted))
             .child(footer(back_button(session, cx), Vec::new())),
     )
 }

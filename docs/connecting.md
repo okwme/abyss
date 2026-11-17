@@ -50,13 +50,20 @@ Press **I have my api_id and api_hash**.
 - `api_hash` takes exactly 32 hex characters. It is masked; **Show** reveals
   it. Pasted spaces and line breaks are dropped.
 
-**Continue** checks both fields, then asks Telegram for a login code. abyss
-saves the pair in your macOS Keychain (item `dev.abyss.apicreds`) only once
-Telegram has accepted it, i.e. after the first code request succeeds. If
-Telegram rejects the pair, you come back here with the reason.
+**Continue** checks both fields and takes you to the phone screen. It does
+not contact Telegram yet: the pair is first used when you enter your phone
+number and abyss asks for a login code. abyss saves the pair in your macOS
+Keychain (item `dev.abyss.apicreds`) only once Telegram has accepted it, i.e.
+after a code request with this pair succeeds. If Telegram rejects the pair,
+you come back to this screen with the reason.
+
+If saving fails, abyss says so and offers **Retry**; until a save succeeds
+you will need to enter the pair again next time.
 
 If a pair is already saved, you can use it, enter a new pair to replace it,
 or forget it. Forgetting is refused while you are signed in: log out first.
+If the Keychain refuses to delete it, abyss says the pair is still stored
+and offers **Retry**; it never claims the pair is gone before it is.
 
 ### Environment override
 
@@ -76,7 +83,13 @@ Telegram sends the code to your other Telegram sessions first.
 ## 5. Code
 
 The screen says where the code went (your Telegram app, SMS, a call, …) and,
-when Telegram offers another way, counts down until you can ask for it.
+when Telegram offers another way, counts down until you can ask for it. For
+a flash call, enter the calling number; for a missed call, enter the last
+digits of the calling number, as the screen says.
+
+If your number is a Fragment number, abyss cannot receive its code: it
+shows the Fragment address as text (it never opens it) and asks you to
+finish in an official app.
 
 Telegram and abyss will never ask for this code anywhere else.
 
@@ -109,5 +122,18 @@ unless the pair comes from the environment.
 
 Once you are signed in, the only way back is **Log out** (top right of the
 chat list). It ends the session with Telegram, then deletes this account's
-session key and message cache from this Mac. If abyss quits before the
-deletion finishes, it says so; open abyss again and log out to finish.
+session key and message cache from this Mac. The chat list, open chat and
+any unsent draft are cleared as soon as the logout starts.
+
+If Telegram cannot be reached, the logout still deletes the local data, and
+abyss tells you to end the session from Settings › Devices on another
+device. If the local deletion fails (for example, the Keychain refuses),
+abyss shows **Logout incomplete** with **Retry**, and accepts no new login
+until Retry succeeds.
+
+abyss records that a logout is in progress before it starts. If abyss quits
+or crashes before the deletion finishes, or the deletion failed, the next
+start finishes the deletion first: it never signs the old account back in.
+If that record cannot be read, abyss starts in **Logout incomplete** and
+waits for Retry.
+

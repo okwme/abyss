@@ -146,6 +146,14 @@ impl TextInput {
         self.buffer.text()
     }
 
+    /// Changes the field's length bound; text over it is cleared.
+    pub(crate) fn set_max_len(&mut self, max: usize, cx: &mut Context<'_, Self>) {
+        if self.buffer.limits().max_utf16 != max {
+            self.buffer.set_max_utf16(max);
+            cx.notify();
+        }
+    }
+
     /// Clears the field.
     pub(crate) fn clear(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         drop(self.take_text(window, cx));

@@ -19,19 +19,19 @@ use crate::secret::{MemoryStore, SecretItem, SecretStore};
 use crate::session::{PersistHandle, signed_in_blob_with_key};
 
 /// Another account than the fake's default one.
-const OTHER_ID: i64 = 424_242;
+pub(super) const OTHER_ID: i64 = 424_242;
 /// The byte the old account's auth keys are made of.
 const OLD_KEY: u8 = 0xA5;
 
 /// A demo account without 2FA.
-fn demo() -> FakeScript {
+pub(super) fn demo() -> FakeScript {
     let mut script = FakeScript::demo(2, 5);
     script.login.password = None;
     script
 }
 
 /// A server with no chats: anything shown after a login comes from the cache.
-fn empty_server() -> FakeScript {
+pub(super) fn empty_server() -> FakeScript {
     let mut script = FakeScript::default();
     script.login.password = None;
     script
@@ -67,7 +67,7 @@ fn shows_rows(e: &Event) -> bool {
 
 impl Harness {
     /// Waits for the phone prompt, then logs in; returns every event seen.
-    async fn log_in(&mut self) -> Vec<Event> {
+    pub(super) async fn log_in(&mut self) -> Vec<Event> {
         let (_, mut seen) = self
             .until(|e| matches!(e, Event::Auth(AuthState::Phone { .. })))
             .await;
@@ -76,7 +76,7 @@ impl Harness {
     }
 
     /// Logs in from the phone prompt.
-    async fn submit_login(&mut self) -> Vec<Event> {
+    pub(super) async fn submit_login(&mut self) -> Vec<Event> {
         let mut seen = Vec::new();
         self.send(Command::SubmitPhone("+44 7700 900123".into()))
             .await;
@@ -106,7 +106,7 @@ impl Harness {
 
 /// Signs in to the demo account with a cache in `dir`, caches chat 1's
 /// tail, then stops. Returns the store.
-async fn cache_the_demo_account(dir: &Path) -> MemoryStore {
+pub(super) async fn cache_the_demo_account(dir: &Path) -> MemoryStore {
     let (backend, fake) = FakeBackend::new(demo());
     let setup = Setup {
         cache_dir: Some(dir.to_path_buf()),
@@ -134,7 +134,7 @@ async fn restart(store: &MemoryStore, dir: &Path, session: StoredSession) -> Har
 }
 
 /// The first tail shown for chat 1 after opening it.
-async fn first_tail(h: &mut Harness) -> Vec<i32> {
+pub(super) async fn first_tail(h: &mut Harness) -> Vec<i32> {
     h.send(Command::OpenChat(chat(1))).await;
     match h.history(chat(1), HistoryDir::Tail).await {
         Event::History { messages, .. } => messages.iter().map(|m| m.id.0).collect(),

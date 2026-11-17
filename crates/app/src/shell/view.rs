@@ -103,10 +103,40 @@ fn session_body(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
         .size_full()
         .relative()
         .child(screen)
+        .children(credential_banner(session, cx))
         .children(logout)
         .children(confirm)
         .children(session.notice.clone().map(toast))
         .into_any_element()
+}
+
+/// The credential item's failed save or delete, with Retry (finding 6).
+fn credential_banner(session: &Session, cx: &mut Context<'_, Root>) -> Option<Div> {
+    let text = copy::onboarding::credential_item(session.cred_item)?;
+    let retry = super::onboarding::credential_retry(session.cred_item).map(|_| {
+        on(
+            secondary("credential-retry", copy::onboarding::RETRY),
+            Session::retry_credential_item,
+            cx,
+        )
+    });
+    Some(
+        div()
+            .absolute()
+            .top_2()
+            .left_4()
+            .flex()
+            .gap_2()
+            .items_center()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .child(div().text_color(rgb(FG)).child(text))
+            .children(retry),
+    )
 }
 
 /// Logout deletes local data, so it asks first.
@@ -169,19 +199,25 @@ fn auth_screen(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
             phone_hint,
             sent,
             error,
-        } => onboarding::code_screen(session, phone_hint, *sent, *error, cx),
+        } => onboarding::code_screen(session, phone_hint, sent.as_ref(), *error, cx),
         AuthView::Password { hint, error } => password_screen(session, hint.as_deref(), *error, cx),
         AuthView::FloodWait { until, .. } => flood_wait_screen(session, *until, cx),
         AuthView::Verifying { error } => onboarding::verifying_screen(*error),
-        AuthView::SignUpRequired => {
-            onboarding::dead_end_screen(session, text::SIGN_UP_TITLE, text::SIGN_UP_DETAIL, cx)
-        }
-        AuthView::OfficialAppRequired => onboarding::dead_end_screen(
+        AuthView::SignUpRequired => onboarding::dead_end_screen(
+            session,
+            text::SIGN_UP_TITLE,
+            text::SIGN_UP_DETAIL,
+            None,
+            cx,
+        ),
+        AuthView::OfficialAppRequired { url } => onboarding::dead_end_screen(
             session,
             text::OFFICIAL_APP_TITLE,
             text::OFFICIAL_APP_DETAIL,
+            url.as_deref().map(text::official_app_url),
             cx,
         ),
+
         AuthView::LoggingOut => onboarding::logging_out_screen(),
         AuthView::LogoutIncomplete { remote } => logout_incomplete_screen(*remote, cx),
         AuthView::Done {

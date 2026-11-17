@@ -474,6 +474,7 @@ fn bare_actor() -> (Actor<FakeBackend>, EventReceiver) {
         persist,
         account,
         cache_parts: None,
+        pending_logout: None,
     });
     (actor, events)
 }

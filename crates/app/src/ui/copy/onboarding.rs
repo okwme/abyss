@@ -4,7 +4,8 @@
 //! against it by a unit test, so the two cannot drift apart.
 
 use abyss_core::api::{
-    ApiIdError, CodeDelivery, CredentialError, CredentialSource, EnvVar, NextDelivery,
+    ApiIdError, CodeDelivery, CredentialError, CredentialItem, CredentialSource, EnvVar,
+    NextDelivery,
 };
 use gpui::SharedString;
 
@@ -138,18 +139,61 @@ pub(crate) const NEW_LOGIN_NOTICE: &str =
     "Your other devices will show a \"new login\" notice. That's expected.";
 pub(crate) const RESEND: &str = "Send the code another way";
 
-pub(crate) fn code_detail(phone_hint: &str, delivery: Option<CodeDelivery>) -> SharedString {
+/// Where the code went. A flash call's number pattern and a missed call's
+/// prefix and digit count come from core already sanitized and bounded.
+pub(crate) fn code_detail(
+    phone_hint: &str,
+    delivery: Option<&CodeDelivery>,
+    length: Option<u8>,
+) -> SharedString {
     let place = match delivery {
-        None | Some(CodeDelivery::App) => "in your Telegram app on another device",
-        Some(CodeDelivery::Sms) => "by SMS",
-        Some(CodeDelivery::Call) => "by a phone call that reads it out",
-        Some(CodeDelivery::FlashCall) => "as a call: the code is the calling number",
-        Some(CodeDelivery::MissedCall) => {
-            "as a missed call: the code is the last digits of the calling number"
+        None | Some(CodeDelivery::App) => "in your Telegram app on another device".to_owned(),
+        Some(CodeDelivery::Sms) => "by SMS".to_owned(),
+        Some(CodeDelivery::Call) => "by a phone call that reads it out".to_owned(),
+        Some(CodeDelivery::FlashCall { pattern }) if !pattern.is_empty() => {
+            format!("as a call: enter the calling number (it matches {pattern})")
         }
-        Some(CodeDelivery::FragmentSms) => "by SMS through fragment.com",
+        Some(CodeDelivery::FlashCall { .. }) => "as a call: enter the calling number".to_owned(),
+        Some(CodeDelivery::MissedCall { prefix }) => missed_call(prefix, length),
+        Some(CodeDelivery::Fragment { .. }) => "by SMS through fragment.com".to_owned(),
     };
     format!("Telegram sent a code for {phone_hint} {place}.").into()
+}
+
+fn missed_call(prefix: &str, length: Option<u8>) -> String {
+    let digits = match length {
+        Some(n) => format!("the last {n} digits"),
+        None => "the last digits".to_owned(),
+    };
+    if prefix.is_empty() {
+        format!("as a missed call: enter {digits} of the calling number")
+    } else {
+        format!("as a missed call from a number starting {prefix}: enter {digits} of that number")
+    }
+}
+
+/// The stored credential item's save or delete, while it needs saying.
+/// A failed delete never claims the pair is gone.
+pub(crate) fn credential_item(item: CredentialItem) -> Option<SharedString> {
+    let text = match item {
+        CredentialItem::Settled | CredentialItem::Saving => return None,
+        CredentialItem::SaveFailed(e) => format!(
+            "Your API credentials weren't saved, so you'll need to enter them again next \
+             time. {}",
+            super::storage_error(e)
+        ),
+        CredentialItem::Deleting => "Removing the saved API credentials…".to_owned(),
+        CredentialItem::DeleteFailed(e) => format!(
+            "The saved API credentials couldn't be removed and are still stored. {}",
+            super::storage_error(e)
+        ),
+    };
+    Some(text.into())
+}
+
+/// A Fragment number's address, shown as text: abyss never opens it.
+pub(crate) fn official_app_url(url: &str) -> SharedString {
+    format!("Fragment address (abyss does not open it): {url}").into()
 }
 
 pub(crate) fn resend_detail(next: NextDelivery, seconds_left: Option<u64>) -> SharedString {

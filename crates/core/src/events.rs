@@ -4,8 +4,15 @@
 //! travels with it; the receiver drops the permit as soon as it takes the event.
 //! A slow UI therefore makes core wait instead of letting queued payloads grow
 //! without limit.
+//!
+//! Each event also carries the account epoch it was sent in (review round 15,
+//! C). The receiver records the epoch of the last event it handed out, and
+//! the command half stamps every command with it: core rejects an
+//! account-scoped command stamped with another epoch, so a command the UI
+//! made for one account never reaches the next.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
@@ -28,18 +35,35 @@ fn permits_for(event: &Event) -> u32 {
     u32::try_from(units).unwrap_or(u32::MAX)
 }
 
-/// An event and the byte budget it holds until the receiver takes it.
-type Queued = (Event, OwnedSemaphorePermit);
+/// An event, the account epoch it was sent in, and the byte budget it holds
+/// until the receiver takes it.
+type Queued = (Event, u64, OwnedSemaphorePermit);
 
 #[derive(Clone, Debug)]
 pub struct EventSender {
     tx: mpsc::Sender<Queued>,
     budget: Arc<Semaphore>,
+    /// The epoch stamped on events sent from now on.
+    epoch: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
 pub struct EventReceiver {
     rx: mpsc::Receiver<Queued>,
+    /// The epoch of the last event handed out.
+    observed: Arc<AtomicU64>,
+}
+
+/// The account epoch the UI has seen: shared by the event receiver (which
+/// advances it) and the command sender (which stamps commands with it).
+#[derive(Clone, Debug, Default)]
+pub struct EpochObserver(Arc<AtomicU64>);
+
+impl EpochObserver {
+    /// The epoch of the last event the UI received.
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// The receiver is gone; core is shutting down or the UI dropped its handle.
@@ -49,7 +73,16 @@ pub struct Closed;
 pub fn channel() -> (EventSender, EventReceiver) {
     let (tx, rx) = mpsc::channel(EVENT_CAPACITY);
     let budget = Arc::new(Semaphore::new(TOTAL_PERMITS));
-    (EventSender { tx, budget }, EventReceiver { rx })
+    let sender = EventSender {
+        tx,
+        budget,
+        epoch: Arc::new(AtomicU64::new(0)),
+    };
+    let receiver = EventReceiver {
+        rx,
+        observed: Arc::new(AtomicU64::new(0)),
+    };
+    (sender, receiver)
 }
 
 impl EventSender {
@@ -60,28 +93,55 @@ impl EventSender {
             .acquire_many_owned(permits_for(&event))
             .await
             .map_err(|_| Closed)?;
-        self.tx.send((event, permit)).await.map_err(|_| Closed)
+        let epoch = self.epoch.load(Ordering::Acquire);
+        self.tx
+            .send((event, epoch, permit))
+            .await
+            .map_err(|_| Closed)
+    }
+
+    /// The current account epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Starts a new account epoch: events sent from now on carry it.
+    pub fn advance_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
     }
 }
 
 impl EventReceiver {
     /// Waits for the next event; `None` once core has stopped.
     pub async fn recv(&mut self) -> Option<Event> {
-        self.rx.recv().await.map(|(event, _permit)| event)
+        let item = self.rx.recv().await;
+        self.take(item)
     }
 
     /// Polls for the next event; `Ready(None)` once core has stopped.
     pub fn poll_recv(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Event>> {
-        self.rx
-            .poll_recv(cx)
-            .map(|item| item.map(|(event, _permit)| event))
+        self.rx.poll_recv(cx).map(|item| self.take(item))
     }
 
     /// Takes an event if one is queued, without waiting.
     pub fn try_recv(&mut self) -> Option<Event> {
-        self.rx.try_recv().ok().map(|(event, _permit)| event)
+        let item = self.rx.try_recv().ok();
+        self.take(item)
+    }
+
+    /// The epoch the UI has seen, for stamping its commands.
+    pub fn observer(&self) -> EpochObserver {
+        EpochObserver(Arc::clone(&self.observed))
+    }
+
+    /// Records the epoch of a received event and drops its byte permit.
+    fn take(&self, item: Option<Queued>) -> Option<Event> {
+        let (event, epoch, _permit) = item?;
+        self.observed.store(epoch, Ordering::Release);
+        Some(event)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

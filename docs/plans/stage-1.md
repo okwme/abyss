@@ -967,6 +967,30 @@ Open items:
 - The 10d open item on `purge_queued` stands: a rebuild drops a queued load without `LoadEnded`, and the rebuild's `ChatInvalidated` resets the UI.
 - Manual check: the reading position across a replacing refresh in the real app.
 
+**Task 6d status (2026-11-17): round 11 open items plus the round 15 re-check of task 6c, offline against the fake.** Each regression test fails on the code before its fix (checked by disabling each fix in place). Core tests are in `crates/core/src/actor/tests/review6d.rs`, plus unit tests in `auth_types.rs`, `backend/grammers/tests/auth.rs` and `actor/marker.rs`. App tests are in `chat/reset_tests.rs`, `shell/auth.rs`, `shell/onboarding.rs` and `ui/text_input/edit.rs`.
+1. **The probe could overtake an abandoned sign-in (HIGH).** grammers keeps a request queued after its future is dropped, and Telegram may run parallel requests in any order, so no probe on the same instance can prove the abandoned call did not, or will not, authorize. Design, two rules. *Supervise:* Back and Forget never cancel a running `SignIn`/`Password` task (or a probe). They record a `Resume` (`Phone`, `Code`, `Password`, `Credentials`, `Forget`; merged by strength) and wait for the call's own answer, which is definitive unless ambiguous. *Retire before probing:* after an ambiguous answer the instance is "unsettled" (`AuthMachine.unsettled`), so `start_probe` retires it (`retire_signed_out`) and probes on the fresh instance, whose queue holds nothing. The fake models the queue (`Fault::Queued`: applied after a delay unless the instance was retired). Residual: a request already written to the socket can still execute server-side after the retirement; `auth.cancelCode` is a possible later mitigation. Tests: `back_waits_for_the_queued_sign_in_instead_of_probing`, `timed_out_sign_in_is_probed_on_a_fresh_instance`.
+2. **Forget during an in-flight sign-in.** The Forget is recorded and carried out once the original call settles: a failed sign-in deletes the pair and returns to credential entry; a successful one ends signed in and refuses the Forget (`SignOutFirst`, after `SignedIn`). Tests: `forget_during_a_failed_sign_in_completes_after_it`, `forget_during_a_successful_sign_in_requires_logout`.
+3. **`complete_login` swallowed a revocation.** `login_state` maps `updates.getState`: transient or FloodWait means no state yet, 401 is `Unauthorized`, anything else is ambiguous (core reconciles). Tests: `login_state_propagates_revocation`, `revocation_between_authorization_and_completion_is_reported`.
+4. **Persistence eligibility per credential version.** `Creds.proven` and `Creds.saved` hold the slot version a successful code request of the current attempt proved. A save (and its Retry) needs `proven == version`; a superseded version's queued save is skipped. Test: `flood_wait_on_the_first_code_request_saves_nothing`.
+5. **Delivery types.** `CodeDelivery::FlashCall { pattern }`, `MissedCall { prefix }`, `Fragment { url }` (sanitized and bounded in the grammers mapping; https only for the URL). The code field takes up to `MAX_CODE_DIGITS` (15) and narrows to the delivery's bound (`SentCodeInfo::max_code_digits`). A missed call shows its prefix and digit count. Fragment goes to "Finish in an official app" (`AuthState::OfficialAppRequired { url }`), with the URL as plain text, never opened. Tests: `code_bounds_follow_the_delivery`, `delivery_text_is_kept_and_sanitized`, `code_bound_follows_the_delivery`, projection tests.
+6. **Explicit credential item state.** `Event::CredentialItem` (`Settled`, `Saving`, `SaveFailed`, `Deleting`, `DeleteFailed`). The UI shows a banner with Retry (`RetryCredentialSave` or `ForgetStoredCredentials`). Absence (`NeedCredentials { source: None }`) is claimed only after a successful delete. Tests: `failed_save_is_explicit_and_retry_saves`, `failed_forget_is_retryable_and_never_claims_absence`, `credential_item_failures_offer_retry`.
+7. **FloodWait deadline at every automatic dispatch.** `dispatch_auto` checks the 10-minute window at replay after a rebuild, at the flood-wait resume and at the transient retry; past it, `Error(FloodWait)` then `Failed`. Test: `flood_window_is_enforced_at_replay_after_a_long_outage`.
+8. **`docs/connecting.md`:** Continue goes to the phone screen, the save waits for a code request, failed save/delete Retry, delivery notes, logout recovery (Logout incomplete, Retry, the resumed logout at startup).
+9. **6c open issues.** (a) Durable logout marker: see round 15, A. (b) The revealed `api_hash` is documented as a residual in `ui/password.rs`: gpui's `LineLayoutCache` keeps the shaped `SharedString` in its current- and previous-frame caches, and an `Arc<str>` cannot be zeroized.
+
+Round 15 (re-check of task 6c):
+- **A. Durable logout marker.** `SecretItem::LogoutPending` (one byte: the remote result so far; module `actor/marker.rs`). The remote step writes it first on the persistence queue, ahead of every side effect (terminate, `auth.logOut`, deletes), and the local step writes it again first (retry, resume, shutdown). It is cleared only after the session delete and the cache erase both succeed; a failed clear is `LocalDeletion::Failed`. A failed write is reported (`Event::Error`). Startup reads it before the session: present, the session is not loaded, the cache stays quarantined, no client is built and the local deletion runs; unreadable, startup is blocked in "Logout incomplete" until Retry. Tests: `restart_after_a_failed_logout_never_signs_the_old_account_in`, `marker_left_by_a_crash_resumes_the_logout`, `unreadable_marker_blocks_startup`, `failed_marker_write_is_reported`.
+- **B. Account-scoped UI state (HIGH).** `ChatShell::reset()` is the single entry point: list, selection, window, echoes, spoilers, read and viewport state, frame retries and countdowns. It keeps the window focus state and the local id counter. `Session` calls it, clears the composer and closes the logout prompt when a teardown view begins (`AuthView::tears_down`: `LoggingOut`, `LogoutIncomplete`). Tests: `logout_forgets_account_a_before_account_b_opens_the_same_peer`, `teardown_states_reset_the_account_ui`.
+- **C. Commands queued behind Logout (HIGH).** Account epochs: the actor advances the epoch at teardown start and at sign-in. Every event carries its epoch, `CoreSender` stamps each command with the epoch of the last event received (`events::EpochObserver`), and the actor refuses account-scoped commands (loads, opens, sends, retries, discards, marks, `ViewingTail`) that are stale, sent during a logout, or sent while signed out. A refused current-epoch send ends `Failed`. The served cache is quarantined when teardown begins. API unchanged for the app. Test: `commands_queued_after_logout_never_act_for_the_next_account`.
+- **D. Lost rebind completion.** `CacheSettled(generation)` adopts only its own re-binding and awaits the join handle (the task returns right after reporting) instead of checking `is_finished()`. A report during a logout quarantines. Test: `rebind_report_before_the_task_finishes_still_adopts_the_cache` (a test hold delivers the report before the task finishes).
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` three times (369 core with 3 ignored, 150 app), `cargo tree -p abyss-core | grep -ci gpui` = 0, and a 5 s smoke run of `abyss --fake --onboarding`.
+
+Open items:
+- Finding 1 residual: a sign-in already on the wire when its instance is retired can still execute on the server. The next probe then sees the account authorized, which is safe but surprising.
+- An unreadable marker blocks startup until Retry, and Retry deletes the stored session. That is fail-closed by design; a locked Keychain at launch shows "Logout incomplete" instead of the login.
+- Composer clearing on teardown has no gpui-level test (the shell reset and the teardown predicate are tested).
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.
@@ -1103,6 +1127,7 @@ Open items:
   - Credential save and delete failures have no Retry UI, and Forget claims the pair is gone before the delete succeeds.
   - The FloodWait 10-minute deadline is not enforced at dispatch or on rebuild replay (`sends.rs`).
   - **Low:** `docs/connecting.md` overstates the flow and logout recovery.
+  - **Round 11 resolved (task 6d, 2026-11-17):** all open items are fixed (section 13, Task 6d status). The hash-input item was fixed in 6c.
 
 - **Round 10 (re-check of task 11c, 2026-11-16).** All fixed in task 11d (section 13):
   - **High:** a dialogs response cached its whole directory (up to 4,096 peers, unordered) through the 2,000-entry FIFO before core retained its dialogs, so it could evict its own dialog peers; updates also did not refresh FIFO position. Dialogs pages now hand their chats and cursor peer to core through a bounded hold, and updates touch queued peers.
@@ -1143,6 +1168,13 @@ Open items:
   - The sidebar Retry pill was painted under the chat rows, and clicks reached the row below.
   - A replacing refresh reset the list, losing the position of a user reading a late message.
   - Every activation reset all backoffs, so rapid focus toggling bypassed unexpired retry delays.
+
+- **Round 15 (re-check of task 6c, 2026-11-17).** All fixed in task 6d (section 13):
+  - The incomplete-logout state was not durable: after a failed remote logout and a failed session delete, a restart signed the old account back in. A logout-pending marker must be recorded before any side effect, checked before the session, cache or client, fail closed when unreadable, and be cleared only after both deletions.
+  - **High:** the UI kept account A's messages and draft after logout, so account B could see them under a shared peer id.
+  - **High:** commands queued behind Logout (sends included) could act for the next account. Reject account-scoped commands during logout and while signed out, quarantine the cache at teardown, and tag commands with an account generation.
+  - **Medium:** a cache re-binding could lose its only completion notification: it reported before returning, and the actor checked `is_finished()`.
+
 
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 

@@ -312,6 +312,7 @@ async fn stale_generation_completions_are_dropped() {
         persist,
         account,
         cache_parts: None,
+        pending_logout: None,
     });
     let view = actor.windows.open(chat(1));
     let stale = ClientGen(actor.cgen.0 - 1);

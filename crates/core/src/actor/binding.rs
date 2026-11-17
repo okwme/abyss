@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 
 use super::Actor;
 use super::auth::AuthMsg;
+use super::lifecycle::Phase;
 use super::logout::{CacheParts, erase_cache, open_cache};
 use crate::backend::Backend;
 use crate::cache::{Binding, CacheHandle, CacheKey};
@@ -221,26 +222,36 @@ impl<B: Backend> Actor<B> {
         let persist = self.persist.clone();
         let dir = parts.dir.clone();
         let tx = self.auth.sender();
+        parts.rebind_gen = parts.rebind_gen.wrapping_add(1);
+        let generation = parts.rebind_gen;
+        #[cfg(test)]
+        let hold = parts.hold_settle.clone();
         parts.rebinding = Some(tokio::spawn(async move {
             let bound = settle(&persist, &dir, open, Some(owner)).await;
             // A closed channel means the actor is gone.
-            let _ = tx.send(AuthMsg::CacheSettled).await;
+            let _ = tx.send(AuthMsg::CacheSettled(generation)).await;
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                let _ = hold
+                    .acquire()
+                    .await
+                    .map(tokio::sync::SemaphorePermit::forget);
+            }
             bound
         }));
     }
 
     /// A background re-binding reported: serve its cache if it is still for
     /// the signed-in account. A logout may have taken it already, and a
-    /// later re-binding may be the one running now.
-    pub(super) async fn on_cache_settled(&mut self) {
+    /// later re-binding may be the one running now (its own report adopts
+    /// it). The report is sent just before the task returns its result, so
+    /// the join handle is awaited rather than polled: a report that arrives
+    /// before the task has finished is never dropped (review round 15, D).
+    pub(super) async fn on_cache_settled(&mut self, generation: u64) {
         let Some(parts) = self.cache_parts.as_mut() else {
             return;
         };
-        if !parts
-            .rebinding
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
-        {
+        if parts.rebind_gen != generation {
             return;
         }
         let Some(task) = parts.rebinding.take() else {
@@ -250,7 +261,8 @@ impl<B: Backend> Actor<B> {
             return;
         };
         let current = self.account.self_id().ok().flatten();
-        if !self.auth.signed_in || bound.owner.is_none() || bound.owner != current {
+        let tearing_down = matches!(self.life.phase, Phase::LoggingOut(_));
+        if tearing_down || !self.auth.signed_in || bound.owner.is_none() || bound.owner != current {
             bound.gate = Gate::Quarantined;
         }
         if let Some(handle) = parts.keep(bound) {

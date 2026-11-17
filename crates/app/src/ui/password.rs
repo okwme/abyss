@@ -473,6 +473,11 @@ impl EntityInputHandler for PasswordInput {
 /// The bullets (or placeholder) to shape, with the marked range underlined.
 /// A revealed `api_hash` is drawn as itself: the shaped copy is the residual
 /// cost of Show (plan risk 9), and the platform still only sees bullets.
+/// Accepted residual (task 6d, 9b): the shaped `SharedString` is an
+/// `Arc<str>` that gpui's `LineLayoutCache` keeps in its current- and
+/// previous-frame caches. An `Arc<str>` cannot be zeroized, and those caches
+/// are gpui's, so the plaintext lives on in freed heap memory after Hide
+/// until it is reused. Wiping it is not feasible without patching gpui.
 fn masked_runs(input: &PasswordInput, style: &TextStyle) -> (SharedString, Vec<TextRun>) {
     let len = input.edit.len();
     let (text, color) = if len == 0 {

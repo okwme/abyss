@@ -2,8 +2,10 @@
 //! section 17.2a).
 
 use super::Actor;
-use super::auth::{AuthFail, AuthKind, AuthMsg, AuthStep, Probed, Resume, SignInNext, sent_info};
-use crate::api::{AuthState, UserError};
+use super::auth::{
+    AuthFail, AuthKind, AuthMsg, AuthStep, Probed, Resume, SignInNext, Taint, sent_info,
+};
+use crate::api::{AuthState, CodeDelivery, UserError};
 use crate::backend::{Account, AuthError, Backend, Client, CodeRequest, PasswordChallenge};
 
 type Token<B> = <<B as Backend>::Client as Client>::LoginToken;
@@ -15,7 +17,7 @@ impl<B: Backend> Actor<B> {
         match msg {
             AuthMsg::Step { tag, step } => self.on_auth_step(tag, step).await,
             AuthMsg::Cred { attempt, done } => self.on_cred(attempt, done).await,
-            AuthMsg::CacheSettled => self.on_cache_settled().await,
+            AuthMsg::CacheSettled(generation) => self.on_cache_settled(generation).await,
         }
     }
 
@@ -40,8 +42,7 @@ impl<B: Backend> Actor<B> {
     async fn on_startup(&mut self, res: Result<Account, AuthFail>) {
         match res {
             Err(fail) if fail.is_revoked() => return self.session_revoked().await,
-            Ok(_) => self.credentials_proven(),
-            Err(_) => {}
+            Ok(_) | Err(_) => {}
         }
         if self.auth.state != AuthState::Connecting {
             return;
@@ -58,10 +59,17 @@ impl<B: Backend> Actor<B> {
     async fn on_code_sent(&mut self, kind: AuthKind, res: Result<CodeRequest<Token<B>>, AuthFail>) {
         let fail = match res {
             Ok(CodeRequest { token, sent }) => {
+                // A successful code request of the current attempt proves
+                // the pair this instance was built with (round 11, 4).
+                self.prove_credentials().await;
+                if let CodeDelivery::Fragment { url } = sent.delivery {
+                    // An anonymous number's code is read on fragment.com:
+                    // finish in an official app. The URL is only shown.
+                    self.auth.clear_login();
+                    return self.set_auth(AuthState::OfficialAppRequired { url }).await;
+                }
                 self.auth.login_token = Some(std::sync::Arc::new(token));
                 self.auth.sent = Some(sent_info(sent));
-                // The first successful code request proves the pair.
-                self.credentials_proven();
                 return self.code_state(None).await;
             }
             Err(fail) => fail,
@@ -83,7 +91,8 @@ impl<B: Backend> Actor<B> {
             AuthFail::Auth(AuthError::Credentials(e)) => self.credentials_rejected(e).await,
             AuthFail::Auth(AuthError::OfficialAppRequired) => {
                 self.auth.clear_login();
-                self.set_auth(AuthState::OfficialAppRequired).await;
+                self.set_auth(AuthState::OfficialAppRequired { url: None })
+                    .await;
             }
             AuthFail::Auth(
                 AuthError::PhoneInvalid | AuthError::PhoneBanned | AuthError::PhoneFlood,
@@ -102,12 +111,16 @@ impl<B: Backend> Actor<B> {
     fn code_resume(&self) -> AuthState {
         AuthState::Code {
             phone_hint: self.auth.phone_hint.clone(),
-            sent: self.auth.sent,
+            sent: self.auth.sent.clone(),
             error: None,
         }
     }
 
     async fn on_sign_in(&mut self, res: Result<Next<B>, AuthFail>) {
+        if self.auth.reconcile.is_some() {
+            // Superseded and supervised: any token it carries is dropped.
+            return self.settle_original(res.err()).await;
+        }
         let fail = match res {
             Ok(SignInNext::Password(challenge)) => {
                 self.auth.login_token = None;
@@ -126,7 +139,7 @@ impl<B: Backend> Actor<B> {
             return self.login_revoked().await;
         }
         if fail.is_ambiguous() {
-            return self.begin_reconcile(Resume::Code).await;
+            return self.begin_reconcile(Resume::Code, Taint::Current).await;
         }
         if let Some(seconds) = fail.flood_seconds() {
             let resume = self.code_resume();
@@ -138,6 +151,9 @@ impl<B: Backend> Actor<B> {
     /// `check_password` answered. Anything but a wrong password consumed the
     /// token.
     async fn on_password(&mut self, res: Result<Challenge<B>, AuthFail>) {
+        if self.auth.reconcile.is_some() {
+            return self.settle_original(res.err()).await;
+        }
         let fail = match res {
             Ok(challenge) => {
                 return self
@@ -150,8 +166,9 @@ impl<B: Backend> Actor<B> {
             return self.login_revoked().await;
         }
         if fail.is_ambiguous() {
-            return self.begin_reconcile(Resume::Password).await;
+            return self.begin_reconcile(Resume::Password, Taint::Current).await;
         }
+
         self.token_consumed(fail).await;
     }
 

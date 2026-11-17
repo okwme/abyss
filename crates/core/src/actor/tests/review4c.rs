@@ -57,6 +57,7 @@ fn actor_with(cache: CacheHandle) -> (Actor<FakeBackend>, EventReceiver) {
         persist,
         account,
         cache_parts: None,
+        pending_logout: None,
     });
     (actor, events)
 }

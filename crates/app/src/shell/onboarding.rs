@@ -3,7 +3,7 @@
 //! screen and Logout (with its confirmation and Retry). Core decides
 //! everything else. A command's UI change is made only once core admitted it.
 
-use abyss_core::api::{ApiHash, ApiId, Command};
+use abyss_core::api::{ApiHash, ApiId, Command, CredentialItem};
 use gpui::{Context, Window};
 
 use super::Root;
@@ -11,6 +11,16 @@ use super::auth::{AuthView, Back, Onboarding, Stored, back};
 use super::session::{LogoutPrompt, Session};
 use crate::ui::copy::onboarding as copy;
 use crate::ui::password::{PasswordInput, Reveal};
+
+/// What Retry does for the credential item: save the pair again, or delete
+/// it again. Nothing while it is settled or in progress.
+pub(crate) fn credential_retry(item: CredentialItem) -> Option<Command> {
+    match item {
+        CredentialItem::SaveFailed(_) => Some(Command::RetryCredentialSave),
+        CredentialItem::DeleteFailed(_) => Some(Command::ForgetStoredCredentials),
+        CredentialItem::Settled | CredentialItem::Saving | CredentialItem::Deleting => None,
+    }
+}
 
 /// What a credential entry holds, checked like core checks it.
 pub(crate) fn check_entry(api_id: &str, api_hash: &str) -> Result<(ApiId, ApiHash), &'static str> {
@@ -95,6 +105,18 @@ impl Session {
         self.send(Command::ForgetStoredCredentials, window, cx);
     }
 
+    /// Retry on a failed save or delete of the credential item. The banner
+    /// stays until core reports the item again.
+    pub(super) fn retry_credential_item(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        if let Some(cmd) = credential_retry(self.cred_item) {
+            self.send(cmd, window, cx);
+        }
+    }
+
     pub(super) fn back(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         match back(&self.auth, self.source) {
             Back::None => {}
@@ -160,6 +182,34 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding 6: a failed save or delete is explicit and has Retry; a
+    /// failed delete never reads as "removed".
+    #[test]
+    fn credential_item_failures_offer_retry() {
+        use abyss_core::api::StorageError;
+        let failed = StorageError::Keychain;
+        assert!(matches!(
+            credential_retry(CredentialItem::SaveFailed(failed)),
+            Some(Command::RetryCredentialSave)
+        ));
+        assert!(matches!(
+            credential_retry(CredentialItem::DeleteFailed(failed)),
+            Some(Command::ForgetStoredCredentials)
+        ));
+        for quiet in [
+            CredentialItem::Settled,
+            CredentialItem::Saving,
+            CredentialItem::Deleting,
+        ] {
+            assert!(credential_retry(quiet).is_none());
+        }
+        assert!(copy::credential_item(CredentialItem::Settled).is_none());
+        let text = copy::credential_item(CredentialItem::DeleteFailed(failed)).unwrap();
+        assert!(text.contains("still stored"), "{text}");
+        let text = copy::credential_item(CredentialItem::SaveFailed(failed)).unwrap();
+        assert!(text.contains("weren't saved"), "{text}");
+    }
 
     #[test]
     fn entry_is_checked_like_core() {

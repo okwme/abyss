@@ -26,7 +26,9 @@ use zeroize::Zeroizing;
 
 use super::errors::{backend_error, kind};
 use super::invoke::{Invoke, RetryClass, call};
-use crate::api::{ApiCredentials, CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
+use crate::api::{
+    ApiCredentials, CodeDelivery, CredentialError, MAX_DELIVERY_TEXT, NextDelivery, PasswordBuf,
+};
 use crate::backend::{
     Account, AuthError, BackendError, CheckPassword, CodeRequest, PasswordChallenge, SentCode,
     SignIn,
@@ -42,6 +44,16 @@ pub struct GrammersLoginToken {
 impl std::fmt::Debug for GrammersLoginToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("GrammersLoginToken(<redacted>)")
+    }
+}
+
+#[cfg(test)]
+impl GrammersLoginToken {
+    pub(crate) fn for_test(phone: &str, hash: &str) -> Self {
+        Self {
+            phone: Zeroizing::new(phone.to_owned()),
+            hash: hash.to_owned(),
+        }
     }
 }
 
@@ -61,6 +73,24 @@ pub(crate) struct MappedCode {
     pub(crate) sent: SentCode,
 }
 
+/// A flash-call pattern or missed-call prefix as shown: digits, `+`, `*`,
+/// spaces and dashes only, bounded.
+pub(crate) fn number_text(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_digit() || matches!(c, '+' | '*' | ' ' | '-'))
+        .take(MAX_DELIVERY_TEXT)
+        .collect()
+}
+
+/// A server-supplied URL, kept only if it is `https://`, printable ASCII
+/// without spaces, and bounded. Shown as text; nothing opens it.
+pub(crate) fn safe_url(raw: &str) -> Option<String> {
+    let ok = raw.starts_with("https://")
+        && raw.len() <= MAX_DELIVERY_TEXT
+        && raw.bytes().all(|b| b.is_ascii_graphic());
+    ok.then(|| raw.to_owned())
+}
+
 /// The supported delivery of a sent-code type, with its code length.
 fn delivery(t: &tl::enums::auth::SentCodeType) -> Option<(CodeDelivery, Option<u8>)> {
     use tl::enums::auth::SentCodeType as T;
@@ -69,9 +99,19 @@ fn delivery(t: &tl::enums::auth::SentCodeType) -> Option<(CodeDelivery, Option<u
         T::App(x) => (CodeDelivery::App, len(x.length)),
         T::Sms(x) => (CodeDelivery::Sms, len(x.length)),
         T::Call(x) => (CodeDelivery::Call, len(x.length)),
-        T::FlashCall(_) => (CodeDelivery::FlashCall, None),
-        T::MissedCall(x) => (CodeDelivery::MissedCall, len(x.length)),
-        T::FragmentSms(x) => (CodeDelivery::FragmentSms, len(x.length)),
+        T::FlashCall(x) => {
+            let pattern = number_text(&x.pattern);
+            (CodeDelivery::FlashCall { pattern }, None)
+        }
+        T::MissedCall(x) => {
+            let prefix = number_text(&x.prefix);
+            (CodeDelivery::MissedCall { prefix }, len(x.length))
+        }
+        // Core routes this to the official-app screen with the URL as text.
+        T::FragmentSms(x) => {
+            let url = safe_url(&x.url);
+            (CodeDelivery::Fragment { url }, len(x.length))
+        }
         // Codes abyss cannot take (email, Firebase, a word or phrase), and the
         // email setup it does not implement.
         T::EmailCode(_)
@@ -427,6 +467,26 @@ async fn cache_self(session: &AbyssSession, user: &tl::types::User) -> Result<()
         .map_err(|_| BackendError::Transient)
 }
 
+/// The update state after an authorization (round 11, finding 3). Only an
+/// explicitly transient failure (transport, flood wait) is best-effort
+/// (`None`: the stream establishes its own baseline). `401` means the key
+/// was revoked between the authorization and now: propagated, so the login
+/// tears the session down. Any other failure is reported as an ambiguous
+/// transport error: the sign-in went through, so core reconciles with the
+/// probe rather than showing a definite failure.
+pub(crate) fn login_state(
+    res: Result<tl::enums::updates::State, InvocationError>,
+) -> Result<Option<tl::enums::updates::State>, AuthError> {
+    match res {
+        Ok(state) => Ok(Some(state)),
+        Err(e) => match backend_error(kind(&e)) {
+            BackendError::Transient | BackendError::FloodWait { .. } => Ok(None),
+            BackendError::Unauthorized => Err(AuthError::Backend(BackendError::Unauthorized)),
+            _ => Err(AuthError::Backend(BackendError::Transient)),
+        },
+    }
+}
+
 /// After a successful `auth.signIn`/`auth.checkPassword`, as grammers'
 /// `complete_login` (`auth.rs:113-150`): record the update state, cache the
 /// self user.
@@ -435,9 +495,8 @@ async fn complete_login<I: Invoke>(
     session: &AbyssSession,
     auth: tl::types::auth::Authorization,
 ) -> Result<Account, AuthError> {
-    let state = call(inv, RetryClass::Never, &tl::functions::updates::GetState {})
-        .await
-        .ok();
+    let state =
+        login_state(call(inv, RetryClass::Never, &tl::functions::updates::GetState {}).await)?;
     let tl::enums::User::User(user) = auth.user else {
         return Err(AuthError::Backend(BackendError::Rejected));
     };

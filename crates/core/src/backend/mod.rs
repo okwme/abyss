@@ -156,7 +156,7 @@ pub enum AuthError {
 }
 
 /// Where a login code went (`auth.sentCode`, plan section 17.2a).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SentCode {
     pub delivery: CodeDelivery,
     pub length: Option<u8>,

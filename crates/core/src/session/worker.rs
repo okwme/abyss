@@ -109,16 +109,20 @@ pub(crate) enum PersistMsg {
     ForgetCacheKey {
         reply: Reply<Result<(), StoreError>>,
     },
-    /// The API credentials item (plan section 17.1). Ordered like every
-    /// other message, so a delete queued after a write wins.
-    LoadApiCredentials {
+    /// A plain item: the API credentials (plan section 17.1) or the
+    /// logout-pending marker (review round 15, A). Ordered like every other
+    /// message, so a delete queued after a write wins.
+    LoadItem {
+        item: SecretItem,
         reply: Reply<Result<Option<Zeroizing<Vec<u8>>>, StoreError>>,
     },
-    StoreApiCredentials {
+    StoreItem {
+        item: SecretItem,
         blob: Zeroizing<Vec<u8>>,
         reply: Reply<Result<(), StoreError>>,
     },
-    DeleteApiCredentials {
+    DeleteItem {
+        item: SecretItem,
         reply: Reply<Result<(), StoreError>>,
     },
 }
@@ -299,21 +303,53 @@ impl PersistHandle {
     /// Reads the API credentials item. `Ok(None)`: none stored; `Err`: the
     /// Keychain could not be read, which is not the same.
     pub async fn load_api_credentials(&self) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
-        self.ask(|reply| PersistMsg::LoadApiCredentials { reply })
-            .await
-            .unwrap_or(Err(StoreError::Stopped))
+        self.load_item(SecretItem::ApiCredentials).await
     }
 
     /// Creates or replaces the API credentials item.
     pub async fn store_api_credentials(&self, blob: Zeroizing<Vec<u8>>) -> Result<(), StoreError> {
-        self.ask(|reply| PersistMsg::StoreApiCredentials { blob, reply })
-            .await
-            .unwrap_or(Err(StoreError::Stopped))
+        self.store_item(SecretItem::ApiCredentials, blob).await
     }
 
     /// Deletes the API credentials item; succeeds when none exists.
     pub async fn delete_api_credentials(&self) -> Result<(), StoreError> {
-        self.ask(|reply| PersistMsg::DeleteApiCredentials { reply })
+        self.delete_item(SecretItem::ApiCredentials).await
+    }
+
+    /// Reads the logout-pending marker. `Ok(None)`: no logout is pending;
+    /// `Err`: the store could not be read, which startup treats as pending.
+    pub async fn load_logout_marker(&self) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        self.load_item(SecretItem::LogoutPending).await
+    }
+
+    /// Records (or updates) the logout-pending marker.
+    pub async fn store_logout_marker(&self, blob: Zeroizing<Vec<u8>>) -> Result<(), StoreError> {
+        self.store_item(SecretItem::LogoutPending, blob).await
+    }
+
+    /// Clears the logout-pending marker; succeeds when none exists.
+    pub async fn delete_logout_marker(&self) -> Result<(), StoreError> {
+        self.delete_item(SecretItem::LogoutPending).await
+    }
+
+    async fn load_item(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        self.ask(|reply| PersistMsg::LoadItem { item, reply })
+            .await
+            .unwrap_or(Err(StoreError::Stopped))
+    }
+
+    async fn store_item(
+        &self,
+        item: SecretItem,
+        blob: Zeroizing<Vec<u8>>,
+    ) -> Result<(), StoreError> {
+        self.ask(|reply| PersistMsg::StoreItem { item, blob, reply })
+            .await
+            .unwrap_or(Err(StoreError::Stopped))
+    }
+
+    async fn delete_item(&self, item: SecretItem) -> Result<(), StoreError> {
+        self.ask(|reply| PersistMsg::DeleteItem { item, reply })
             .await
             .unwrap_or(Err(StoreError::Stopped))
     }
@@ -379,14 +415,14 @@ impl Worker {
             PersistMsg::ForgetCacheKey { reply } => {
                 drop(reply.send(delete_cache_key(&*self.store)));
             }
-            PersistMsg::LoadApiCredentials { reply } => {
-                drop(reply.send(self.store.get(SecretItem::ApiCredentials)));
+            PersistMsg::LoadItem { item, reply } => {
+                drop(reply.send(self.store.get(item)));
             }
-            PersistMsg::StoreApiCredentials { blob, reply } => {
-                drop(reply.send(self.store.set(SecretItem::ApiCredentials, &blob)));
+            PersistMsg::StoreItem { item, blob, reply } => {
+                drop(reply.send(self.store.set(item, &blob)));
             }
-            PersistMsg::DeleteApiCredentials { reply } => {
-                drop(reply.send(self.store.delete(SecretItem::ApiCredentials)));
+            PersistMsg::DeleteItem { item, reply } => {
+                drop(reply.send(self.store.delete(item)));
             }
         }
     }

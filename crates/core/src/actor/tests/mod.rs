@@ -17,6 +17,7 @@ mod review10e;
 mod review4b;
 mod review4c;
 mod review6c;
+mod review6d;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{Actor, ActorInit, Identity, Internal, provision_cache};
+use super::{Actor, ActorInit, Identity, Internal, Stamped, provision_cache};
 use crate::ShutdownReport;
 use crate::api::{AuthState, Command, ConnState, Event, HistoryDir, SendState, UserError};
 use crate::backend::fake::{
@@ -42,7 +43,7 @@ use crate::session::{PersistHandle, signed_in_blob};
 const WAIT: Duration = Duration::from_secs(600);
 
 struct Harness {
-    cmd: mpsc::Sender<Command>,
+    cmd: mpsc::Sender<Stamped>,
     internal: mpsc::Sender<Internal>,
     events: EventReceiver,
     fake: FakeHandle,
@@ -64,6 +65,7 @@ fn chat(id: i64) -> ChatId {
 
 /// How the harness prepares storage before the actor starts.
 #[derive(Default)]
+#[expect(clippy::struct_excessive_bools, reason = "independent test switches")]
 struct Setup {
     /// No stored session: the actor starts signed out.
     signed_out: bool,
@@ -81,6 +83,10 @@ struct Setup {
     /// a `StoredSession::Blob` are then ignored.
     store: Option<MemoryStore>,
     session: StoredSession,
+    /// Reading the logout-pending marker fails (round 15, A).
+    marker_unreadable: bool,
+    /// A cache re-binding reports, then waits for a permit here.
+    hold_settle: Option<Arc<Semaphore>>,
 }
 
 /// The session item at startup (task 6c).
@@ -144,6 +150,19 @@ async fn harness_with(
     start(backend, fake, setup).await
 }
 
+/// The store faults that apply to the startup reads.
+fn startup_faults(setup: &Setup, faults: &FaultControl) {
+    if setup.creds_locked {
+        faults.fail_get_of(SecretItem::ApiCredentials);
+    }
+    if setup.marker_unreadable {
+        faults.fail_get_of(SecretItem::LogoutPending);
+    }
+    if matches!(setup.session, StoredSession::Unreadable) {
+        faults.fail_get_of(SecretItem::Session);
+    }
+}
+
 async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness {
     let store = prepare_store(&setup);
     let unreadable = matches!(setup.session, StoredSession::Unreadable);
@@ -156,21 +175,22 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
             .unwrap();
     }
     let (wrapped, faults) = FaultyStore::new(store.clone());
-    if setup.creds_locked {
-        faults.fail_get_of(SecretItem::ApiCredentials);
-    }
-    if unreadable {
-        faults.fail_get_of(SecretItem::Session);
-    }
+    startup_faults(&setup, &faults);
     let persist = PersistHandle::spawn(wrapped).unwrap();
-    let (account, identity) = load(&persist).await;
+    let pending_logout = super::read_pending_logout(&persist).await;
+    let (account, identity) = match pending_logout {
+        Some(_) => (persist.fresh_session(), Identity::Unknown),
+        None => load(&persist).await,
+    };
     if unreadable {
         faults.heal_item(SecretItem::Session);
     }
     let (cache, cache_parts) = match setup.cache_dir {
         Some(dir) => {
             let provisioned = provision_cache(&persist, dir, identity).await;
-            (provisioned.served, Some(provisioned.parts))
+            let mut parts = provisioned.parts;
+            parts.hold_settle.clone_from(&setup.hold_settle);
+            (provisioned.served, Some(parts))
         }
         None => (setup.cache, None),
     };
@@ -191,7 +211,9 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
         persist,
         account,
         cache_parts,
+        pending_logout,
     });
+
     let permits = actor.admission.probe();
     let join = tokio::spawn(actor.run(channels));
     Harness {
@@ -208,8 +230,11 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
 }
 
 impl Harness {
+    /// Sends a command stamped with the epoch of the last event taken, as
+    /// `CoreSender` does.
     async fn send(&self, c: Command) {
-        self.cmd.send(c).await.unwrap();
+        let epoch = self.events.observer().get();
+        self.cmd.send(Stamped { epoch, cmd: c }).await.unwrap();
     }
 
     /// Waits for an event matching `pred`, returning it and everything skipped.

@@ -249,5 +249,6 @@ const fn item_bit(item: SecretItem) -> u8 {
         SecretItem::Session => 1,
         SecretItem::CacheKey => 2,
         SecretItem::ApiCredentials => 4,
+        SecretItem::LogoutPending => 8,
     }
 }

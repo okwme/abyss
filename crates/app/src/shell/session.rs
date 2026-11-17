@@ -5,7 +5,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use abyss_core::api::{
-    AuthState, Command, ConnState, CredentialSource, Event, PasswordBuf, UserError,
+    AuthState, Command, ConnState, CredentialItem, CredentialSource, Event, MAX_CODE_DIGITS,
+    PasswordBuf, UserError,
 };
 use abyss_core::{BackendChoice, CoreConfig, StartError};
 use gpui::{AppContext, Context, Entity, Focusable, SharedString, Subscription, Task, Window};
@@ -94,6 +95,9 @@ pub(crate) struct Session {
     pub(super) entry_error: Option<SharedString>,
     /// Which credential source is in control (core's `CredentialSource`).
     pub(super) source: Option<CredentialSource>,
+    /// The stored credential item's save or delete (core's
+    /// `CredentialItem`): a failure shows Retry.
+    pub(super) cred_item: CredentialItem,
     pub(super) composer: Entity<TextInput>,
     /// Chat list, open chat and pending sends (`crate::chat`, `shell::chats`).
     pub(super) shell: ChatShell,
@@ -157,6 +161,7 @@ impl Session {
             logout_prompt: false,
             entry_error: None,
             source: None,
+            cred_item: CredentialItem::Settled,
             composer,
             shell,
             conn: None,
@@ -245,12 +250,29 @@ impl Session {
             self.password.update(cx, PasswordInput::clear);
         }
         let ticking = next.ticking_until().is_some() && self.auth.ticking_until().is_none();
+        if next.tears_down() {
+            self.reset_account(window, cx);
+        }
+        if let AuthView::Code { sent, .. } = &next {
+            let max = sent.as_ref().map_or(MAX_CODE_DIGITS, |s| s.max_digits);
+            self.code.update(cx, |input, cx| input.set_max_len(max, cx));
+        }
         self.auth = next;
         if ticking {
             spawn_ticker(window, cx);
         }
         self.focus_for_auth(window, cx);
         cx.notify();
+    }
+
+    /// The account's teardown began (review round 15, B): nothing of it
+    /// stays on screen or in a field. The single entry point for the chat
+    /// state is `ChatShell::reset`.
+    fn reset_account(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        self.shell.reset();
+        self.composer
+            .update(cx, |input, cx| input.clear(window, cx));
+        self.logout_prompt = false;
     }
 
     /// Called every second while a countdown runs (a flood wait, a code
@@ -363,6 +385,7 @@ impl Session {
         match event {
             Event::Auth(state) => self.on_auth(state, window, cx),
             Event::CredentialSource(source) => self.source = source,
+            Event::CredentialItem(item) => self.cred_item = item,
             Event::Connection(state) => {
                 self.conn = Some(state);
                 // Reconnection restarts retries that gave up (`shell::chats`).

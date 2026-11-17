@@ -42,9 +42,14 @@ pub(crate) enum Stored {
 }
 
 /// Where the code went, for the code screen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SentView {
     pub(crate) delivery: CodeDelivery,
+    /// Digits in the code, when the server said (a missed call: how many
+    /// trailing digits of the calling number).
+    pub(crate) length: Option<u8>,
+    /// The most digits the code field takes for this delivery.
+    pub(crate) max_digits: usize,
     pub(crate) next: Option<NextDelivery>,
     pub(crate) resend_at: Option<Instant>,
 }
@@ -74,7 +79,11 @@ pub(crate) enum AuthView {
         error: Option<UserError>,
     },
     SignUpRequired,
-    OfficialAppRequired,
+    /// Finish in an official app. A Fragment number's address is shown as
+    /// text only; abyss never opens it.
+    OfficialAppRequired {
+        url: Option<SharedString>,
+    },
     LoggingOut,
     /// The logout's local deletion failed: "Logout incomplete" with Retry.
     /// Core accepts no login until the retry succeeds.
@@ -198,6 +207,8 @@ pub(crate) fn project(state: AuthState, prev: &AuthView, now: Instant) -> Projec
         } => Projection::view(AuthView::Code {
             phone_hint: phone_hint.into(),
             sent: sent.map(|s: SentCodeInfo| SentView {
+                max_digits: s.max_code_digits(),
+                length: s.length,
                 delivery: s.delivery,
                 next: s.next,
                 resend_at: s.resend_at.map(|at| instant_of(at, now)),
@@ -231,7 +242,9 @@ pub(crate) fn project(state: AuthState, prev: &AuthView, now: Instant) -> Projec
         }
         AuthState::Verifying { error } => Projection::view(AuthView::Verifying { error }),
         AuthState::SignUpRequired => Projection::view(AuthView::SignUpRequired),
-        AuthState::OfficialAppRequired => Projection::view(AuthView::OfficialAppRequired),
+        AuthState::OfficialAppRequired { url } => Projection::view(AuthView::OfficialAppRequired {
+            url: url.map(Into::into),
+        }),
         AuthState::SignedIn { new_login, .. } => signed_in(new_login, Saved::Yes),
         AuthState::SignedInUnsaved { new_login, .. } => signed_in(new_login, Saved::No),
         AuthState::LoggingOut => Projection::view(AuthView::LoggingOut),
@@ -279,7 +292,7 @@ pub(crate) fn back(view: &AuthView, source: Option<CredentialSource>) -> Back {
         | AuthView::Password { .. }
         | AuthView::FloodWait { .. }
         | AuthView::SignUpRequired
-        | AuthView::OfficialAppRequired => Back::Core,
+        | AuthView::OfficialAppRequired { .. } => Back::Core,
         AuthView::Onboarding(
             Onboarding::Welcome | Onboarding::Env { .. } | Onboarding::Keychain,
         )
@@ -331,6 +344,15 @@ impl AuthView {
             *error = None;
         }
         next
+    }
+
+    /// The account is being torn down (a logout began, or one is stuck):
+    /// the UI forgets everything of it (review round 15, B).
+    pub(crate) fn tears_down(&self) -> bool {
+        matches!(
+            self,
+            AuthView::LoggingOut | AuthView::LogoutIncomplete { .. }
+        )
     }
 
     /// A countdown is running on this screen (flood wait, code resend).
@@ -403,8 +425,16 @@ mod tests {
         );
         assert_eq!(at(AuthState::SignUpRequired), AuthView::SignUpRequired);
         assert_eq!(
-            at(AuthState::OfficialAppRequired),
-            AuthView::OfficialAppRequired
+            at(AuthState::OfficialAppRequired { url: None }),
+            AuthView::OfficialAppRequired { url: None }
+        );
+        assert_eq!(
+            at(AuthState::OfficialAppRequired {
+                url: Some("https://fragment.com/x".into())
+            }),
+            AuthView::OfficialAppRequired {
+                url: Some("https://fragment.com/x".into())
+            }
         );
         assert_eq!(at(AuthState::LoggingOut), AuthView::LoggingOut);
         let first = NewLogin {
@@ -549,7 +579,8 @@ mod tests {
             error: None,
         };
         assert_eq!(back(&code, env), Back::Core);
-        assert_eq!(back(&AuthView::OfficialAppRequired, entered), Back::Core);
+        let official = AuthView::OfficialAppRequired { url: None };
+        assert_eq!(back(&official, entered), Back::Core);
         // Only before the session is authorized.
         for view in [
             AuthView::SignedIn,
@@ -567,6 +598,23 @@ mod tests {
             resume: Box::new(AuthView::Verifying { error: None }),
         };
         assert_eq!(back(&verifying_wait, entered), Back::None);
+    }
+
+    /// Round 15, B: every teardown state resets the account's UI state;
+    /// nothing else does.
+    #[test]
+    fn teardown_states_reset_the_account_ui() {
+        let now = Instant::now();
+        let at = |s: AuthState| project(s, &AuthView::SignedIn, now).view;
+        assert!(at(AuthState::LoggingOut).tears_down());
+        let stuck = AuthState::LoggedOut {
+            remote: RemoteLogout::NotAttempted,
+            local: LocalDeletion::Failed(abyss_core::api::StorageError::Internal),
+        };
+        assert!(at(stuck).tears_down());
+        assert!(!AuthView::SignedIn.tears_down());
+        assert!(!AuthView::Phone { error: None }.tears_down());
+        assert!(!AuthView::Connecting.tears_down());
     }
 
     #[test]
@@ -614,6 +662,7 @@ mod tests {
         };
         assert_eq!(sent.delivery, CodeDelivery::Sms);
         assert_eq!(sent.next, Some(NextDelivery::Call));
+        assert_eq!(sent.max_digits, 5);
     }
 
     #[test]

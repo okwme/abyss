@@ -25,6 +25,8 @@ use super::apply::user_error;
 use super::binding::{Rebinding, finish_rebinding};
 use super::jobs::CallError;
 use super::lifecycle::{LogoutStage, Phase, REBUILD_CAPS, Retired, Step, retire};
+use super::marker::mark_logout_pending;
+
 use crate::api::{
     AuthState, Event, LocalDeletion, LogoutStatus, RemoteLogout, StorageError, UserError,
 };
@@ -45,6 +47,13 @@ pub(crate) struct CacheParts {
     pub(crate) quarantined: Option<CacheHandle>,
     /// A background erase-and-recreate for a login (see `binding`).
     pub(crate) rebinding: Option<Rebinding>,
+    /// The generation of the latest re-binding: its `CacheSettled` is the
+    /// one that adopts it.
+    pub(crate) rebind_gen: u64,
+    /// Tests: a re-binding waits for a permit after reporting, so its report
+    /// arrives before its task has finished.
+    #[cfg(test)]
+    pub(crate) hold_settle: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
 impl CacheParts {
@@ -55,6 +64,9 @@ impl CacheParts {
             key: None,
             quarantined: None,
             rebinding: None,
+            rebind_gen: 0,
+            #[cfg(test)]
+            hold_settle: None,
         }
     }
 }
@@ -93,6 +105,19 @@ impl LocalDone {
     }
 }
 
+/// Writes the logout-pending marker unless shutdown starts first (`None`).
+async fn mark_until(
+    persist: &PersistHandle,
+    remote: Option<RemoteLogout>,
+    shutdown: &CancellationToken,
+) -> Option<Result<(), crate::secret::StoreError>> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => None,
+        res = mark_logout_pending(persist, remote) => Some(res),
+    }
+}
+
 async fn sign_out<C: Client>(client: Arc<C>, shutdown: &CancellationToken) -> RemoteLogout {
     tokio::select! {
         biased;
@@ -111,7 +136,11 @@ async fn delete_local(
     account: Option<AccountGen>,
     open: Option<(CacheHandle, CacheKey)>,
     parts: Option<(PathBuf, Option<Rebinding>)>,
+    remote: Option<RemoteLogout>,
 ) -> LocalDone {
+    // Again first (a retry, a resume, or shutdown during the remote step):
+    // the marker outlives a deletion that fails or is cut short.
+    let _ = mark_logout_pending(&persist, remote).await;
     let session = match account {
         Some(account) => persist
             .delete_session(account)
@@ -132,7 +161,11 @@ async fn delete_local(
         None => (Ok(()), None),
     };
     let local = match (session, erased) {
-        (Ok(()), Ok(())) => LocalDeletion::Deleted,
+        // Both gone: only now is the logout-pending marker cleared.
+        (Ok(()), Ok(())) => match persist.delete_logout_marker().await {
+            Ok(()) => LocalDeletion::Deleted,
+            Err(e) => LocalDeletion::Failed(StorageError::from(&e)),
+        },
         (Err(e), _) | (_, Err(e)) => LocalDeletion::Failed(e),
     };
     LocalDone {
@@ -254,13 +287,26 @@ impl<B: Backend> Actor<B> {
         let live = self.live.take();
         self.begin_retire();
         self.auth.abort_task();
+        // Teardown begins: a new account epoch (commands the UI made before
+        // it are refused), and the cache is never read again (round 15, C).
+        self.events.advance_epoch();
+        self.quarantine_cache();
         self.reset_account_data().await;
         self.set_auth(AuthState::LoggingOut).await;
         let account = self.account.generation().ok();
         let persist = self.persist.clone();
         let shutdown = self.cancel.clone();
+        let events = self.events.clone();
         self.life.phase = Phase::LoggingOut(LogoutStage::Remote);
         *self.life.step_mut() = Some(tokio::spawn(async move {
+            // Durable before any side effect: a crash or a failed deletion
+            // from here on resumes the logout at the next startup (round 15,
+            // A). A failed write is reported; the logout is still wanted.
+            // Shutdown stops waiting on a stalled store: its local step
+            // writes the marker again, within the shutdown deadline.
+            if let Some(Err(e)) = mark_until(&persist, None, &shutdown).await {
+                let _ = events.send(Event::Error(UserError::from(&e))).await;
+            }
             if let Some(account) = account {
                 let _ = persist.terminate(account).await;
             }
@@ -270,6 +316,9 @@ impl<B: Backend> Actor<B> {
                 (RemotePlan::ServerRevoked, _) => RemoteLogout::Revoked,
                 (RemotePlan::Skip, _) => RemoteLogout::NotAttempted,
             };
+            // Best effort: the marker written before still resumes the
+            // logout; this only refines what a resumed one reports.
+            let _ = mark_until(&persist, Some(remote), &shutdown).await;
             let retired = match live {
                 Some(l) => Some(retire(l, REBUILD_CAPS, &shutdown).await),
                 None => None,
@@ -294,7 +343,7 @@ impl<B: Backend> Actor<B> {
     }
 
     /// The local deletion, detached from the actor's state.
-    fn local_step(&mut self) -> impl Future<Output = LocalDone> + Send + 'static {
+    pub(super) fn local_step(&mut self) -> impl Future<Output = LocalDone> + Send + 'static {
         let persist = self.persist.clone();
         let account = self.account.generation().ok();
         let served = self.cache.take();
@@ -305,7 +354,7 @@ impl<B: Backend> Actor<B> {
             ),
             None => (None, None),
         };
-        delete_local(persist, account, open, parts)
+        delete_local(persist, account, open, parts, self.logout_remote)
     }
 
     /// Shutdown: runs the local step inline, bounded by `deadline`.
@@ -358,7 +407,7 @@ impl<B: Backend> Actor<B> {
     /// The local deletion failed: the session item or the cache key may
     /// remain. No instance is built and no login is accepted until a Retry
     /// (`Command::Logout`) deletes them; shutdown reports it.
-    async fn logout_unfinished(&mut self, remote: RemoteLogout, local: LocalDeletion) {
+    pub(super) async fn logout_unfinished(&mut self, remote: RemoteLogout, local: LocalDeletion) {
         tracing::warn!("logout incomplete: local data remains");
         // The account is over either way: no later build may carry its
         // session, pinned peers, desired set or holds (task 11e).
@@ -373,6 +422,7 @@ impl<B: Backend> Actor<B> {
     /// of the first attempt is the one reported.
     async fn retry_logout(&mut self, remote: RemoteLogout) {
         self.set_auth(AuthState::LoggingOut).await;
+
         self.note_remote_logout(remote);
         self.life.phase = Phase::LoggingOut(LogoutStage::Local);
         let local = self.local_step();
@@ -392,6 +442,17 @@ impl<B: Backend> Actor<B> {
     pub(super) async fn abandon_account(&mut self) {
         self.auth.phone_error = Some(UserError::AccountMigrated);
         self.start_logout(RemotePlan::Skip).await;
+    }
+
+    /// Moves the served cache aside, open but never read, until the local
+    /// step erases it.
+    fn quarantine_cache(&mut self) {
+        let Some(parts) = self.cache_parts.as_mut() else {
+            return;
+        };
+        if parts.quarantined.is_none() {
+            parts.quarantined = self.cache.take();
+        }
     }
 
     /// Forgets everything of the old account: chats, windows, pending sends

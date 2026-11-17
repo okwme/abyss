@@ -656,11 +656,12 @@ pub(super) struct LifeAtShutdown {
 }
 
 impl<B: Backend> Actor<B> {
-    /// Task 6b: retires a signed-out instance built for API credentials no
-    /// longer in use (Back, Forget, new or rejected credentials). Like a
-    /// rebuild, without backoff or a `Rebuilding` event: the next build waits
-    /// for the credential slot to hold a pair.
-    pub(super) fn retire_for_credentials(&mut self) {
+    /// Retires the signed-out instance: one built for API credentials no
+    /// longer in use (Back, Forget, new or rejected credentials; task 6b), or
+    /// one an ambiguous sign-in may still be queued on, before the probe
+    /// (task 6d). Like a rebuild, without backoff or a `Rebuilding` event:
+    /// the next build waits for the credential slot to hold a pair.
+    pub(super) fn retire_signed_out(&mut self) {
         if self.life.phase != Phase::SignedOut {
             return;
         }

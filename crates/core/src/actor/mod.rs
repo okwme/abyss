@@ -13,6 +13,7 @@ mod jobs;
 mod lifecycle;
 mod loads;
 mod logout;
+mod marker;
 mod merge;
 mod onboarding;
 mod peers;
@@ -37,10 +38,11 @@ use boot::Boot;
 use jobs::{CallCtx, Done, Job, Load, ReqId, TaskKind};
 use lifecycle::{Lifecycle, Live, LiveEvent, Phase, Reason};
 pub(crate) use logout::CacheParts;
+pub(crate) use marker::{PendingLogout, read_pending_logout};
 
 use crate::api::{
     AuthState, ClientGen, Command, ConnState, Event, HistoryDir, LoadTarget, RemoteLogout,
-    SaveStatus, UserError, WindowState,
+    SaveStatus, SendState, UserError, WindowState,
 };
 use crate::backend::{Backend, DialogsCursor, HistoryQuery, StreamItem};
 use crate::cache::CacheHandle;
@@ -65,6 +67,31 @@ pub const READ_FLUSH: Duration = Duration::from_millis(500);
 const MAX_QUEUED: usize = 256;
 /// Stream items buffered between the update consumer and the actor.
 const UPDATE_QUEUE: usize = 256;
+
+/// Whether `cmd` acts on the signed-in account's data.
+fn account_scoped(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::LoadDialogs
+            | Command::OpenChat(_)
+            | Command::CloseChat(_)
+            | Command::LoadOlder(_)
+            | Command::LoadNewer(_)
+            | Command::SendText { .. }
+            | Command::RetrySend(_)
+            | Command::DiscardSend(_)
+            | Command::MarkRead { .. }
+            | Command::ViewingTail(_)
+    )
+}
+
+/// A UI command and the account epoch the UI had seen when it sent it
+/// (see [`crate::events`]).
+#[derive(Debug)]
+pub(crate) struct Stamped {
+    pub epoch: u64,
+    pub cmd: Command,
+}
 
 /// Control-plane messages, never queued behind UI commands.
 #[derive(Clone, Copy, Debug)]
@@ -130,10 +157,12 @@ pub(crate) struct Actor<B: Backend> {
     logout_remote: Option<RemoteLogout>,
     /// A logout whose local deletion failed, until a Retry succeeds.
     unfinished_logout: Option<(RemoteLogout, crate::api::LocalDeletion)>,
+    /// Startup found the logout-pending marker (see `marker`).
+    pending_logout: Option<PendingLogout>,
 }
 
 pub(crate) struct ActorChannels {
-    pub commands: mpsc::Receiver<Command>,
+    pub commands: mpsc::Receiver<Stamped>,
     pub internal: mpsc::Receiver<Internal>,
     pub updates: mpsc::Receiver<(ClientGen, StreamItem)>,
 }
@@ -143,13 +172,16 @@ pub(crate) struct ActorInit<B> {
     pub backend: Arc<B>,
     pub events: EventSender,
     pub cache: Option<CacheHandle>,
-    pub commands: mpsc::Receiver<Command>,
+    pub commands: mpsc::Receiver<Stamped>,
     pub internal: mpsc::Receiver<Internal>,
     pub cancel: CancellationToken,
     pub persist: PersistHandle,
     /// Loaded at startup (`PersistHandle::load_session`).
     pub account: SessionSnapshot,
     pub cache_parts: Option<CacheParts>,
+    /// Read before the session (`read_pending_logout`); when set, `account`
+    /// is a fresh one and the cache is quarantined.
+    pub pending_logout: Option<PendingLogout>,
 }
 
 async fn sleep_until(at: Option<Instant>) {
@@ -203,6 +235,7 @@ impl<B: Backend> Actor<B> {
             auth,
             logout_remote: None,
             unfinished_logout: None,
+            pending_logout: init.pending_logout,
         };
         let channels = ActorChannels {
             commands: init.commands,
@@ -240,7 +273,7 @@ impl<B: Backend> Actor<B> {
                     }
                 }
                 cmd = ch.commands.recv() => match cmd {
-                    Some(cmd) => self.on_command(cmd).await,
+                    Some(stamped) => self.on_stamped(stamped).await,
                     None => break,
                 },
                 () = sleep_until(baseline_by) => self.rebuild(Reason::NoBaseline).await,
@@ -301,6 +334,10 @@ impl<B: Backend> Actor<B> {
             });
         }
         self.resolve_credentials().await;
+        // An interrupted logout finishes before any client is built.
+        if let Some(pending) = self.pending_logout.take() {
+            return self.resume_logout(pending).await;
+        }
         self.start_build(Duration::ZERO);
     }
 
@@ -462,6 +499,32 @@ impl<B: Backend> Actor<B> {
         self.error(UserError::Internal).await;
     }
 
+    /// Admits a UI command. An account-scoped one is refused while no
+    /// account is signed in, during a logout, or when the UI made it in
+    /// another account epoch: a command queued behind a logout, or made for
+    /// the old account, never acts for the next one (review round 15, C).
+    async fn on_stamped(&mut self, stamped: Stamped) {
+        let Stamped { epoch, cmd } = stamped;
+        if !account_scoped(&cmd) {
+            return self.on_command(cmd).await;
+        }
+        let current = epoch == self.events.epoch();
+        let signed_in = self.auth.signed_in && !matches!(self.life.phase, Phase::LoggingOut(_));
+        if current && signed_in {
+            return self.on_command(cmd).await;
+        }
+        tracing::debug!(current, signed_in, "account command refused");
+        // A send the UI shows for this epoch ends failed; one made for an
+        // earlier epoch is not the UI's anymore.
+        if let (true, Command::SendText { local_id, .. }) = (current, cmd) {
+            self.emit(Event::SendState {
+                local_id,
+                state: SendState::Failed,
+            })
+            .await;
+        }
+    }
+
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
             Command::LoadDialogs => self.load_dialogs().await,
@@ -493,7 +556,7 @@ impl<B: Backend> Actor<B> {
             }
             Command::ForgetStoredCredentials => self.forget_credentials().await,
             Command::ReloadCredentials => self.reload_credentials().await,
-            Command::RetryCredentialSave => self.retry_credential_save(),
+            Command::RetryCredentialSave => self.retry_credential_save().await,
             Command::Back => self.back().await,
         }
     }

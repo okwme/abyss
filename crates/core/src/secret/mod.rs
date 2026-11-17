@@ -34,6 +34,10 @@ pub enum SecretItem {
     /// The entered API credentials (`dev.abyss.apicreds`, plan section 17.1).
     /// Survives logout; deleted only by `ForgetStoredCredentials`.
     ApiCredentials,
+    /// Present while a logout has begun and not finished deleting (review
+    /// round 15, A): startup resumes the logout before using the session.
+    /// One byte, the remote result so far.
+    LogoutPending,
 }
 
 impl SecretItem {
@@ -43,6 +47,7 @@ impl SecretItem {
             Self::Session => "session",
             Self::CacheKey => "cachekey",
             Self::ApiCredentials => "apicreds",
+            Self::LogoutPending => "logoutpending",
         }
     }
 }

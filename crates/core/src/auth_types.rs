@@ -258,21 +258,41 @@ impl std::fmt::Debug for ApiCredentials {
     }
 }
 
+/// The longest login code any delivery takes: a flash call's code is the
+/// whole calling number, and E.164 numbers have at most 15 digits.
+pub const MAX_CODE_DIGITS: usize = 15;
+/// Bound on server-supplied delivery text (a flash-call pattern, a
+/// missed-call prefix, a Fragment URL), in bytes.
+pub const MAX_DELIVERY_TEXT: usize = 256;
+
 /// How Telegram delivered a login code (`auth.SentCodeType`, the supported
-/// subset; plan section 17.2a).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// subset; plan section 17.2a). Server-supplied text is sanitized by the
+/// backend: a pattern or prefix keeps digits, `+`, `*`, spaces and dashes
+/// only, a URL must be `https://` and printable ASCII, each at most
+/// [`MAX_DELIVERY_TEXT`] bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodeDelivery {
     /// A message in the user's other Telegram sessions.
     App,
     Sms,
     /// A voice call that reads the code.
     Call,
-    /// A flash call: the code is the calling number.
-    FlashCall,
-    /// A missed call: the code is the last digits of the calling number.
-    MissedCall,
-    /// An SMS through fragment.com (anonymous numbers).
-    FragmentSms,
+    /// A flash call: the code is the whole calling number, which matches
+    /// `pattern` (`*` stands for a digit not given in advance).
+    FlashCall {
+        pattern: String,
+    },
+    /// A missed call from a number starting with `prefix`: the code is the
+    /// last [`SentCodeInfo::length`] digits of that number.
+    MissedCall {
+        prefix: String,
+    },
+    /// An SMS to an anonymous number, read on fragment.com. Core never shows
+    /// a code screen for it: it routes to [`AuthState::OfficialAppRequired`]
+    /// with this `url`, which is shown as text and never opened by abyss.
+    Fragment {
+        url: Option<String>,
+    },
 }
 
 /// How the next code would be delivered after a resend (`auth.CodeType`).
@@ -286,15 +306,55 @@ pub enum NextDelivery {
 }
 
 /// Where the login code went, for the code screen (plan section 17.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SentCodeInfo {
     pub delivery: CodeDelivery,
-    /// Digits in the code, when the server said.
+    /// Digits in the code, when the server said. For a missed call: how many
+    /// trailing digits of the calling number to enter.
     pub length: Option<u8>,
     /// What a resend would use, if the server offers one.
     pub next: Option<NextDelivery>,
     /// The server asks not to resend before this time.
     pub resend_at: Option<SystemTime>,
+}
+
+impl SentCodeInfo {
+    /// The most digits the code entry takes for this delivery: a flash
+    /// call's pattern length (the whole calling number), else the stated
+    /// length, else [`MAX_CODE_DIGITS`]; never more than that.
+    pub fn max_code_digits(&self) -> usize {
+        let digits = match &self.delivery {
+            CodeDelivery::FlashCall { pattern } => {
+                let n = pattern
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '*')
+                    .count();
+                (n > 0).then_some(n)
+            }
+            _ => self.length.map(usize::from).filter(|n| *n > 0),
+        };
+        digits.map_or(MAX_CODE_DIGITS, |n| n.min(MAX_CODE_DIGITS))
+    }
+}
+
+/// The Keychain item of entered API credentials, as far as core knows
+/// (plan section 17.2a): what the Retry controls act on. A pair is claimed
+/// absent only once its deletion succeeded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CredentialItem {
+    /// No save or delete is running or failed.
+    #[default]
+    Settled,
+    /// The proven entered pair is being saved.
+    Saving,
+    /// Saving the proven entered pair failed; it stays in memory.
+    /// `Command::RetryCredentialSave` tries again.
+    SaveFailed(StorageError),
+    /// The stored pair is being deleted; it still counts as stored.
+    Deleting,
+    /// Deleting the stored pair failed; it may still be in the Keychain.
+    /// `Command::ForgetStoredCredentials` tries again.
+    DeleteFailed(StorageError),
 }
 
 /// What the Done screen shows after a login in this run (plan section 17.3).
@@ -471,8 +531,12 @@ pub enum AuthState {
     /// The number has no account; create it in an official app.
     SignUpRequired,
     /// Telegram asked for a step abyss does not implement (email setup,
-    /// `auth.sentCodeSuccess`, …): finish it in an official app, then retry.
-    OfficialAppRequired,
+    /// `auth.sentCodeSuccess`, a Fragment code, …): finish it in an official
+    /// app, then retry. `url` is a server-supplied page for the step (the
+    /// Fragment number's page), sanitized; shown as text, never opened.
+    OfficialAppRequired {
+        url: Option<String>,
+    },
     /// `display_name` is empty until the server has answered once.
     /// `new_login` is set for a login completed in this run.
     SignedIn {
@@ -593,6 +657,35 @@ mod tests {
         assert!(CredentialError::ApiIdInvalid.allows_entry());
         assert!(CredentialError::StoredUnreadable.allows_entry());
         assert_eq!(EnvVar::ApiHash.name(), "ABYSS_API_HASH");
+    }
+
+    /// Round 11, finding 5: a flash call's code is the whole calling number
+    /// (up to 15 digits), a missed call's its stated tail.
+    #[test]
+    fn code_bounds_follow_the_delivery() {
+        let info = |delivery, length| SentCodeInfo {
+            delivery,
+            length,
+            next: None,
+            resend_at: None,
+        };
+        let flash = CodeDelivery::FlashCall {
+            pattern: "+44 7700 9*****".into(),
+        };
+        assert_eq!(info(flash, None).max_code_digits(), 12);
+        let long = CodeDelivery::FlashCall {
+            pattern: "*".repeat(40),
+        };
+        assert_eq!(info(long, None).max_code_digits(), MAX_CODE_DIGITS);
+        let missed = CodeDelivery::MissedCall {
+            prefix: "+44 7700".into(),
+        };
+        assert_eq!(info(missed, Some(4)).max_code_digits(), 4);
+        assert_eq!(info(CodeDelivery::Sms, Some(5)).max_code_digits(), 5);
+        assert_eq!(
+            info(CodeDelivery::App, None).max_code_digits(),
+            MAX_CODE_DIGITS
+        );
     }
 
     #[test]

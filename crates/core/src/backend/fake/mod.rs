@@ -7,7 +7,7 @@
 //! fixed latency, live updates pushed by the test, and counters.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -68,6 +68,12 @@ pub enum Fault {
     Panic,
     /// Succeeds after the given extra delay.
     Delay(Duration),
+    /// Login calls (`sign_in`, `check_password`): the request sits in the
+    /// sender's queue and the server applies it after the delay, whether or
+    /// not the caller still waits (grammers keeps a request queued after its
+    /// future is dropped). Retiring the instance first drops it, as quitting
+    /// the runner drops the queue. Data calls treat it as `Delay`.
+    Queued(Duration),
 }
 
 /// A fault applied to the next build.
@@ -614,11 +620,13 @@ impl FakeBackend {
         creds: Arc<ApiCredentials>,
     ) -> Instance<Self> {
         let quit = Arc::new(Notify::new());
+        let retired = Arc::new(AtomicBool::new(false));
         Instance {
             client: FakeClient {
                 shared: Arc::clone(&self.shared),
                 session: Arc::clone(&session),
                 creds,
+                retired: Arc::clone(&retired),
             },
             updates,
             runner: Box::pin(run_runner(
@@ -630,6 +638,7 @@ impl FakeBackend {
                 shared: Arc::clone(&self.shared),
                 quit,
                 session,
+                retired,
             },
         }
     }
@@ -660,6 +669,8 @@ pub struct FakeControl {
     shared: Arc<Shared>,
     quit: Arc<Notify>,
     session: Arc<AbyssSession>,
+    /// Shared with the instance's client: its queued requests are dropped.
+    retired: Arc<AtomicBool>,
 }
 
 impl InstanceControl for FakeControl {
@@ -668,6 +679,7 @@ impl InstanceControl for FakeControl {
     }
 
     fn retire(self) -> SessionSnapshot {
+        self.retired.store(true, Ordering::SeqCst);
         self.shared.retired.fetch_add(1, Ordering::SeqCst);
         // Revoke first: a late write through this instance must not reach the
         // snapshot the next instance is built from.
@@ -712,6 +724,8 @@ pub struct FakeClient {
     session: Arc<AbyssSession>,
     /// The pair this instance was built with.
     creds: Arc<ApiCredentials>,
+    /// Set when the instance is retired: queued requests are dropped.
+    retired: Arc<AtomicBool>,
 }
 
 impl FakeClient {
@@ -738,7 +752,7 @@ impl FakeClient {
         }
         match fault {
             None => {}
-            Some(Fault::Delay(d)) => tokio::time::sleep(d).await,
+            Some(Fault::Delay(d) | Fault::Queued(d)) => tokio::time::sleep(d).await,
             Some(Fault::Error(e)) => return Err(e),
             Some(Fault::Auth(_)) => return Err(BackendError::Rejected),
             Some(Fault::Hang | Fault::CompleteThenHang) => std::future::pending().await,

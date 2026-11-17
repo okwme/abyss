@@ -511,7 +511,10 @@ async fn not_authorized_probe_is_not_a_revocation() {
             .iter()
             .any(|e| matches!(e, Event::Auth(AuthState::LoggingOut)))
     );
-    assert_eq!(h.fake.builds(), 1);
+    // Task 6d: the timed-out sign-in's instance is retired before the probe
+    // (it may still hold the request); that is a rebuild, not a logout.
+    assert_eq!(h.fake.builds(), 2);
+    assert_eq!(h.fake.retired(), 1);
     h.stop().await;
 }
 

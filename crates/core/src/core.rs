@@ -14,11 +14,15 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{Actor, ActorChannels, ActorInit, Identity, Internal, provision_cache};
+use crate::actor::{
+    Actor, ActorChannels, ActorInit, Identity, Internal, Stamped, provision_cache,
+    read_pending_logout,
+};
+
 use crate::api::{Command, Event, LogoutStatus, SaveStatus, UserError};
 use crate::backend::Backend;
 use crate::backend::grammers::GrammersBackend;
-use crate::events::{self, EventReceiver, EventSender};
+use crate::events::{self, EpochObserver, EventReceiver, EventSender};
 use crate::secret::SecretStore;
 use crate::session::PersistHandle;
 
@@ -131,7 +135,9 @@ impl Drop for StopOnDrop {
 /// The command half of a [`CoreHandle`].
 #[derive(Debug)]
 pub struct CoreSender {
-    cmd: mpsc::Sender<Command>,
+    cmd: mpsc::Sender<Stamped>,
+    /// The account epoch the UI has seen (stamped on each command).
+    epoch: EpochObserver,
     cancel: CancellationToken,
     done: Option<oneshot::Receiver<ShutdownReport>>,
     /// Control plane: never queued behind UI commands.
@@ -164,9 +170,13 @@ impl CoreSender {
 
     /// Queues a command without waiting.
     pub fn send(&self, cmd: Command) -> Result<(), SendError> {
-        self.cmd.try_send(cmd).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(c) => SendError::Full(c),
-            mpsc::error::TrySendError::Closed(c) => SendError::Closed(c),
+        let stamped = Stamped {
+            epoch: self.epoch.get(),
+            cmd,
+        };
+        self.cmd.try_send(stamped).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(s) => SendError::Full(s.cmd),
+            mpsc::error::TrySendError::Closed(s) => SendError::Closed(s.cmd),
         })
     }
 
@@ -271,7 +281,7 @@ struct Boot<B> {
     persist: PersistHandle,
     cache: Option<CacheConfig>,
     events: EventSender,
-    commands: mpsc::Receiver<Command>,
+    commands: mpsc::Receiver<Stamped>,
     internal: mpsc::Receiver<Internal>,
     cancel: CancellationToken,
 }
@@ -325,10 +335,12 @@ fn start_with<B: Backend>(
             let _ = done_tx.send(report);
         })
         .map_err(StartError::Thread)?;
+    let epoch = events_rx.observer();
     let stop = Arc::new(StopOnDrop(cancel.clone()));
     Ok(CoreHandle {
         sender: CoreSender {
             cmd: cmd_tx,
+            epoch,
             cancel,
             done: Some(done_rx),
             internal: internal_tx,
@@ -371,18 +383,12 @@ async fn prepare<B: Backend>(
         internal,
         cancel,
     } = boot;
-    let (account, identity) = match persist.load_session().await {
-        Ok(loaded) => {
-            let identity = match loaded.snapshot.self_id() {
-                Ok(Some(id)) => Identity::Verified(id),
-                _ => Identity::SignedOut,
-            };
-            (loaded.snapshot, identity)
-        }
-        Err(e) => {
-            let _ = events.send(Event::Error(UserError::from(&e))).await;
-            (persist.fresh_session(), Identity::Unknown)
-        }
+    // Before the session: an interrupted logout is finished first, and the
+    // old account's session is never loaded (review round 15, A).
+    let pending_logout = read_pending_logout(&persist).await;
+    let (account, identity) = match pending_logout {
+        Some(_) => (persist.fresh_session(), Identity::Unknown),
+        None => load_account(&persist, &events).await,
     };
     let (handle, cache_parts) = match cache {
         Some(CacheConfig { dir }) => {
@@ -402,7 +408,29 @@ async fn prepare<B: Backend>(
         persist,
         account,
         cache_parts,
+        pending_logout,
     })
+}
+
+/// Loads the stored session. A Keychain that cannot be read leaves the
+/// account unknown, with a warning.
+async fn load_account(
+    persist: &PersistHandle,
+    events: &EventSender,
+) -> (crate::session::SessionSnapshot, Identity) {
+    match persist.load_session().await {
+        Ok(loaded) => {
+            let identity = match loaded.snapshot.self_id() {
+                Ok(Some(id)) => Identity::Verified(id),
+                _ => Identity::SignedOut,
+            };
+            (loaded.snapshot, identity)
+        }
+        Err(e) => {
+            let _ = events.send(Event::Error(UserError::from(&e))).await;
+            (persist.fresh_session(), Identity::Unknown)
+        }
+    }
 }
 
 #[cfg(all(test, feature = "fake"))]

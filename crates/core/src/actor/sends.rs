@@ -63,6 +63,8 @@ struct Pending {
     /// No automatic resend after a flood wait past this (set by the last
     /// user action).
     auto_until: Instant,
+    /// The last flood wait's length, for the error when the window closes.
+    last_flood: u32,
     state: SendState,
     /// Queued or running on the live instance.
     in_flight: bool,
@@ -287,6 +289,7 @@ impl<B: Backend> Actor<B> {
             attempts: 0,
             flood_waits: 0,
             auto_until: Instant::now() + AUTO_RETRY_WINDOW,
+            last_flood: 0,
             state: SendState::Sending,
             in_flight: false,
             retry_at: None,
@@ -361,7 +364,7 @@ impl<B: Backend> Actor<B> {
     /// Replays unresolved sends with their original `random_id`s (after `Online`).
     pub(super) async fn replay_sends(&mut self) {
         for local_id in self.sends.replayable() {
-            self.dispatch_send(local_id).await;
+            self.dispatch_auto(local_id).await;
         }
     }
 
@@ -369,8 +372,27 @@ impl<B: Backend> Actor<B> {
     /// for the next `Online`).
     pub(super) async fn resume_flooded_sends(&mut self) {
         for local_id in self.sends.take_due(Instant::now()) {
-            self.dispatch_send(local_id).await;
+            self.dispatch_auto(local_id).await;
         }
+    }
+
+    /// An automatic (not user-initiated) dispatch: a replay after a
+    /// rebuild, a flood wait's end, a transient retry. A flood-waited send
+    /// is checked against its [`AUTO_RETRY_WINDOW`] here, at dispatch (round
+    /// 11, finding 7), so a timer that ended during a long rebuild cannot
+    /// replay it past the window. Past it the send is `Failed`, after
+    /// `Error(FloodWait)`, as when the wait itself is too long.
+    async fn dispatch_auto(&mut self, local_id: LocalId) {
+        let Some(p) = self.sends.map.get_mut(&local_id) else {
+            return;
+        };
+        if p.flood_waits > 0 && Instant::now() >= p.auto_until {
+            let seconds = p.last_flood;
+            p.retry_at = None;
+            self.error(UserError::FloodWait { seconds }).await;
+            return self.finish_send(local_id, SendState::Failed).await;
+        }
+        self.dispatch_send(local_id).await;
     }
 
     /// A stream `updateMessageID`: the send carrying `random_id` has server
@@ -422,7 +444,7 @@ impl<B: Backend> Actor<B> {
                 | CallError::Dropped,
             ) => {
                 if attempts < MAX_ATTEMPTS {
-                    self.dispatch_send(local_id).await;
+                    self.dispatch_auto(local_id).await;
                 } else {
                     self.finish_send(local_id, SendState::Unknown { attempts })
                         .await;
@@ -447,6 +469,7 @@ impl<B: Backend> Actor<B> {
         };
         p.attempts = p.attempts.saturating_sub(1);
         p.flood_waits = p.flood_waits.saturating_add(1);
+        p.last_flood = seconds;
         let wait = Duration::from_secs(u64::from(seconds)).max(MIN_FLOOD_WAIT);
         let retry_at = Instant::now() + wait;
         if p.flood_waits > MAX_FLOOD_WAITS || retry_at > p.auto_until {
