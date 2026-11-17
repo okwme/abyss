@@ -90,6 +90,56 @@ async fn key_delete_failure_keeps_the_cache_files() {
     h.stop().await;
 }
 
+/// A cached run leaves a key and files; the next run has no cache (an
+/// unusable directory, so no cache parts). Its logout restarts over the same
+/// store.
+async fn cached_then_disabled(dir: &Path) -> Harness {
+    let mut h = with_cache(dir).await;
+    h.online().await;
+    let store = h.store.clone();
+    h.stop().await;
+    assert!(store.contains(SecretItem::CacheKey));
+    assert!(files_in(dir) > 0);
+    let (backend, fake) = FakeBackend::new(FakeScript::demo(2, 5));
+    let setup = Setup {
+        store: Some(store),
+        ..Setup::default()
+    };
+    let mut h = start(backend, fake, setup).await;
+    h.online().await;
+    h
+}
+
+/// Round 26, finding 1: a logout in a run without a cache still deletes
+/// the cache key an earlier run left, so its files are undecryptable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_without_a_cache_still_deletes_the_cache_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = cached_then_disabled(dir.path()).await;
+    h.send(Command::Logout).await;
+    let (_, local) = h.logged_out().await;
+    assert_eq!(local, LocalDeletion::Deleted);
+    assert!(!h.store.contains(SecretItem::CacheKey), "the key is gone");
+    assert!(!h.store.contains(SecretItem::LogoutPending));
+    h.stop().await;
+}
+
+/// Round 26, finding 1: if that key delete fails, the logout is not done:
+/// the marker stays, so the next start resumes the deletion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_without_a_cache_keeps_the_marker_when_the_key_delete_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = cached_then_disabled(dir.path()).await;
+    h.faults.fail_delete_of(SecretItem::CacheKey);
+    h.send(Command::Logout).await;
+    let (_, local) = h.logged_out().await;
+    assert!(matches!(local, LocalDeletion::Failed(_)), "{local:?}");
+    assert!(h.store.contains(SecretItem::CacheKey));
+    assert!(h.store.contains(SecretItem::LogoutPending), "marker kept");
+    assert!(!stored_signed_in(&h.store).await, "the session is gone");
+    h.stop().await;
+}
+
 /// `AUTH_KEY_UNREGISTERED` mid-session: the local part of logout runs without
 /// a remote call, and the user is asked to sign in again.
 #[tokio::test(start_paused = true)]

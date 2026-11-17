@@ -1,6 +1,5 @@
-//! Cache location and directory preparation (task 9b).
+//! Cache location and directory preparation (tasks 9b, 9c).
 
-use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -14,7 +13,7 @@ fn home() -> tempfile::TempDir {
 }
 
 fn real(home: &Path) -> CacheLocation {
-    CacheLocation::real(Some(home.as_os_str().to_owned())).unwrap()
+    CacheLocation::real(Some(home.to_path_buf())).unwrap()
 }
 
 fn mode(path: &Path) -> u32 {
@@ -27,7 +26,7 @@ fn mode(path: &Path) -> u32 {
 
 #[test]
 fn the_real_cache_is_in_application_support() {
-    let location = CacheLocation::real(Some(OsString::from("/Users/someone"))).unwrap();
+    let location = CacheLocation::real(Some("/Users/someone".into())).unwrap();
     assert_eq!(
         location.dir(),
         Path::new("/Users/someone/Library/Application Support/dev.abyss/cache")
@@ -35,14 +34,14 @@ fn the_real_cache_is_in_application_support() {
 }
 
 #[test]
-fn an_unset_or_relative_home_has_no_cache() {
+fn an_unknown_or_relative_home_has_no_cache() {
     assert!(matches!(
         CacheLocation::real(None),
         Err(StorageError::NoHome)
     ));
     for bad in ["", "relative/home", "~"] {
         assert!(matches!(
-            CacheLocation::real(Some(OsString::from(bad))),
+            CacheLocation::real(Some(bad.into())),
             Err(StorageError::NoHome)
         ));
     }
@@ -75,6 +74,65 @@ fn prepare_narrows_a_wider_mode() {
     let dir = prepare(&real(home.path())).unwrap();
     assert_eq!(mode(&app), 0o700);
     assert_eq!(mode(&dir), 0o700);
+}
+
+/// Adds an ACL entry with `chmod +a`.
+#[cfg(target_os = "macos")]
+fn add_acl(path: &Path, entry: &str) {
+    let status = std::process::Command::new("/bin/chmod")
+        .arg("+a")
+        .arg(entry)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(acl::has_entries(path).unwrap());
+}
+
+/// `ls -led` lists ACL entries as indented `N: ...` lines.
+#[cfg(target_os = "macos")]
+fn listed_entries(path: &Path) -> usize {
+    let out = std::process::Command::new("/bin/ls")
+        .arg("-led")
+        .arg(path)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .filter(|l| l.trim_start().starts_with(char::is_numeric))
+        .count()
+}
+
+/// Round 26, finding 3: an `everyone` allow entry, on either app-owned
+/// directory or inherited from Application Support, does not survive; the
+/// ACL of Application Support itself is left alone.
+#[cfg(target_os = "macos")]
+#[test]
+fn acl_entries_on_app_directories_are_removed() {
+    let home = home();
+    let support = home.path().join("Library/Application Support");
+    let app = support.join("dev.abyss");
+    std::fs::create_dir(&app).unwrap();
+    std::fs::create_dir(app.join("cache")).unwrap();
+    add_acl(&app, "everyone allow list,search,read");
+    add_acl(&app.join("cache"), "everyone allow list,search,read,write");
+    let inherit = "everyone allow list,search,read,file_inherit,directory_inherit";
+    add_acl(&support, inherit);
+    let dir = prepare(&real(home.path())).unwrap();
+    for path in [&app, &dir] {
+        assert!(!acl::has_entries(path).unwrap(), "{path:?}");
+        assert_eq!(listed_entries(path), 0, "{path:?}");
+    }
+    assert_eq!(listed_entries(&support), 1, "Application Support untouched");
+
+    // Created fresh under the inheriting parent: the inherited entry goes too.
+    let home = self::home();
+    let support = home.path().join("Library/Application Support");
+    add_acl(&support, inherit);
+    let dir = prepare(&real(home.path())).unwrap();
+    assert!(!acl::has_entries(&support.join("dev.abyss")).unwrap());
+    assert!(!acl::has_entries(&dir).unwrap());
 }
 
 #[test]
@@ -131,23 +189,31 @@ fn errors_never_name_the_path() {
 
 #[cfg(feature = "fake")]
 mod fake {
+    use std::ffi::OsString;
+
     use super::*;
+
+    fn fake(tmpdir: &Path, home: &Path) -> CacheLocation {
+        let tmp = Some(tmpdir.as_os_str().to_owned());
+        CacheLocation::fake(Some("1".as_ref()), tmp, Some(home.to_path_buf())).unwrap()
+    }
 
     #[test]
     fn the_fake_has_no_cache_unless_asked() {
         let tmp = Some(OsString::from("/tmp/x"));
-        assert_eq!(CacheLocation::fake(None, tmp.clone()), None);
+        assert_eq!(CacheLocation::fake(None, tmp.clone(), None), None);
         for value in ["", "0", "true", "yes", " 1"] {
             assert_eq!(
-                CacheLocation::fake(Some(value.as_ref()), tmp.clone()),
+                CacheLocation::fake(Some(value.as_ref()), tmp.clone(), None),
                 None,
                 "{value:?}"
             );
         }
         // Asked, but without an absolute TMPDIR.
-        assert_eq!(CacheLocation::fake(Some("1".as_ref()), None), None);
+        assert_eq!(CacheLocation::fake(Some("1".as_ref()), None, None), None);
+        let relative = Some("rel".into());
         assert_eq!(
-            CacheLocation::fake(Some("1".as_ref()), Some("rel".into())),
+            CacheLocation::fake(Some("1".as_ref()), relative, None),
             None
         );
     }
@@ -157,13 +223,52 @@ mod fake {
         let home = home();
         let support = home.path().join("Library/Application Support");
         // Even with TMPDIR pointed at Application Support.
-        let fake = CacheLocation::fake(Some("1".as_ref()), Some(support.into_os_string())).unwrap();
+        let fake = fake(&support, home.path());
         let real = real(home.path());
         assert_ne!(fake.dir(), real.dir());
         assert!(!fake.dir().starts_with(real.dir()));
-        assert!(fake.dir().ends_with("dev.abyss.fake/cache"));
         let dir = prepare(&fake).unwrap();
+        assert!(dir.starts_with(support.join("dev.abyss.fake")));
         assert_eq!(mode(&dir), 0o700);
         assert!(!real.dir().exists(), "the fake touched the real cache");
+    }
+
+    /// Round 26, finding 2: a `TMPDIR` inside the real app directory, by
+    /// path or through a symlink, is refused before anything is created.
+    #[test]
+    fn a_tmpdir_inside_the_real_tree_is_refused() {
+        let home = home();
+        let real_dir = prepare(&real(home.path())).unwrap();
+        let before = std::fs::read_dir(&real_dir).unwrap().count();
+        assert!(matches!(
+            prepare(&fake(&real_dir, home.path())),
+            Err(StorageError::Overlap)
+        ));
+        let link = home.path().join("tmp-link");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+        assert!(matches!(
+            prepare(&fake(&link, home.path())),
+            Err(StorageError::Overlap)
+        ));
+        assert_eq!(std::fs::read_dir(&real_dir).unwrap().count(), before);
+    }
+
+    /// Round 26, finding 2: each fake run gets a fresh directory, so a
+    /// planted `cache.db` (here a symlink to the real database) is never
+    /// adopted; an existing run directory is refused, not reused.
+    #[test]
+    fn each_fake_run_gets_a_fresh_directory() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        let first = fake(tmp.path(), home.path());
+        let dir = prepare(&first).unwrap();
+        let real_db = real(home.path()).dir().join("cache.db");
+        std::os::unix::fs::symlink(&real_db, dir.join("cache.db")).unwrap();
+        let second = fake(tmp.path(), home.path());
+        assert_ne!(second.dir(), first.dir());
+        let fresh = prepare(&second).unwrap();
+        assert_eq!(std::fs::read_dir(&fresh).unwrap().count(), 0);
+        // The same run again: refused rather than reused.
+        assert!(matches!(prepare(&first), Err(StorageError::Exists(_))));
     }
 }

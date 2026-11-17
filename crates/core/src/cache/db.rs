@@ -158,7 +158,7 @@ impl Cache {
         census::init().map_err(CacheError::Init)?;
         let entry = Open::enter(dir).map_err(CacheError::Refused)?;
         super::prepare_dir(dir)?;
-        let conn = Connection::open(super::db_path(dir))?;
+        let conn = Self::connect(dir)?;
         Self::unlock(&conn, key)?;
         Self::migrate(&conn)?;
         let bytes: i64 =
@@ -173,6 +173,20 @@ impl Cache {
             probe: None,
             _entry: entry,
         })
+    }
+
+    /// Opens the database file without following a symlink (round 26,
+    /// finding 2). The directory is resolved first, so a symlink above it
+    /// (macOS's `/var` -> `/private/var`) is allowed, while a `cache.db`
+    /// that is itself a link is refused (`SQLITE_OPEN_NOFOLLOW` fails on any
+    /// link in the name it is given). The side files (`-wal`, `-shm`,
+    /// `-journal`) are named after that resolved path, and SQLite's unix VFS
+    /// opens every file with `O_NOFOLLOW` (SQLCipher 4.20.0, `unixOpen` and
+    /// `unixOpenSharedMemory`), so a linked side file fails to open too.
+    fn connect(dir: &Path) -> Result<Connection, CacheError> {
+        let dir = std::fs::canonicalize(dir)?;
+        let flags = rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        Ok(Connection::open_with_flags(super::db_path(&dir), flags)?)
     }
 
     fn unlock(conn: &Connection, key: &CacheKey) -> Result<(), CacheError> {

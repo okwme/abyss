@@ -278,6 +278,59 @@ fn a_symlinked_directory_is_refused() {
     assert!(!target.join(DB_FILE).exists());
 }
 
+/// Round 26, finding 2: a `cache.db` that is a symlink (to another cache's
+/// database) is refused, and the target is neither opened nor changed.
+#[test]
+fn a_symlinked_database_file_is_refused() {
+    let (t, dir, key) = setup();
+    let other = t.path().join("other");
+    {
+        let mut db = Cache::open(&other, &key).unwrap();
+        db.put_messages(user(1), &[msg(user(1), 1, "a")]).unwrap();
+    }
+    let target = other.join(DB_FILE);
+    let before = std::fs::read(&target).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join(DB_FILE)).unwrap();
+    assert!(Cache::open(&dir, &key).is_err(), "opened through the link");
+    assert_eq!(std::fs::read(&target).unwrap(), before);
+}
+
+/// Round 26, finding 2: linked side files (`-wal`, `-shm`) are never
+/// followed: the open or the first write fails, and the targets are
+/// untouched.
+#[test]
+fn symlinked_side_files_are_never_followed() {
+    for side in ["-wal", "-shm"] {
+        let (t, dir, key) = setup();
+        drop(Cache::open(&dir, &key).unwrap());
+        let victim = t.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let name = format!("{DB_FILE}{side}");
+        let _ = std::fs::remove_file(dir.join(&name));
+        std::os::unix::fs::symlink(&victim, dir.join(&name)).unwrap();
+        let wrote = Cache::open(&dir, &key)
+            .and_then(|mut db| db.put_messages(user(1), &[msg(user(1), 1, "a")]));
+        assert!(wrote.is_err(), "{side}: wrote through the link");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched", "{side}");
+    }
+}
+
+/// The directory may sit below a symlink (macOS `/var` -> `/private/var`,
+/// where every temporary directory lives): only links at the leaf count.
+#[test]
+fn a_symlink_above_the_directory_is_allowed() {
+    let (t, _dir, key) = setup();
+    let real = t.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = t.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let dir = link.join("cache");
+    let mut db = Cache::open(&dir, &key).unwrap();
+    db.put_messages(user(1), &[msg(user(1), 1, "a")]).unwrap();
+    assert!(real.join("cache").join(DB_FILE).exists());
+}
+
 #[test]
 fn reconcile_removes_messages_deleted_on_server() {
     let (_t, dir, key) = setup();

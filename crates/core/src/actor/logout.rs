@@ -151,7 +151,11 @@ async fn delete_local(
             let (cache, key) = open.map_or((None, None), |(c, k)| (Some(c), Some(k)));
             erase_cache(&persist, cache, dir, key).await
         }
-        None => (Ok(()), None),
+        // No cache this run (no directory, or it could not be prepared),
+        // but an earlier run may have left one: deleting its key is the
+        // crypto-erase, so the files left behind are undecryptable (round
+        // 26, finding 1). A failure keeps the marker, like any erase.
+        None => (forget_key(&persist).await, None),
     };
     let local = match (session, erased) {
         // Both gone: only now is the logout-pending marker cleared.
@@ -190,11 +194,16 @@ pub(super) async fn erase_cache(
     (Ok(()), open_cache(persist, dir).await)
 }
 
-async fn forget_cache(persist: &PersistHandle, dir: &Path) -> Result<(), StorageError> {
+/// Deletes the cache key (absent counts as deleted).
+async fn forget_key(persist: &PersistHandle) -> Result<(), StorageError> {
     persist
         .delete_cache_key()
         .await
-        .map_err(|e| StorageError::from(&e))?;
+        .map_err(|e| StorageError::from(&e))
+}
+
+async fn forget_cache(persist: &PersistHandle, dir: &Path) -> Result<(), StorageError> {
+    forget_key(persist).await?;
     let dir = dir.to_path_buf();
     match tokio::task::spawn_blocking(move || cache::destroy_unopened(&dir)).await {
         Ok(Ok(())) => Ok(()),

@@ -58,6 +58,16 @@ pub(crate) enum LaunchError {
 }
 
 /// Decides what to start from the command line and an environment lookup.
+/// The home directory comes from the user database (`storage::home_dir`),
+/// not `HOME`.
+pub(crate) fn resolve(
+    args: impl IntoIterator<Item = OsString>,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> Result<Launch, LaunchError> {
+    resolve_in(args, var, storage::home_dir())
+}
+
+/// [`resolve`] with the home directory given.
 #[cfg_attr(
     feature = "fake",
     expect(
@@ -65,9 +75,10 @@ pub(crate) enum LaunchError {
         reason = "only builds without the fake backend fail (`FakeNotBuilt`)"
     )
 )]
-pub(crate) fn resolve(
+pub(crate) fn resolve_in(
     args: impl IntoIterator<Item = OsString>,
     var: impl Fn(&str) -> Option<OsString>,
+    home: Option<std::path::PathBuf>,
 ) -> Result<Launch, LaunchError> {
     // Skip argv[0]; ignore anything else (macOS may add `-psn_…`).
     let args: Vec<OsString> = args.into_iter().skip(1).collect();
@@ -87,6 +98,7 @@ pub(crate) fn resolve(
             cache: CacheLocation::fake(
                 var(storage::FAKE_CACHE_VAR).as_deref(),
                 var(storage::TMPDIR_VAR),
+                home,
             ),
         });
         #[cfg(not(feature = "fake"))]
@@ -98,7 +110,7 @@ pub(crate) fn resolve(
     });
     Ok(Launch::Telegram {
         env,
-        cache: CacheLocation::real(var(storage::HOME_VAR)),
+        cache: CacheLocation::real(home),
     })
 }
 
@@ -236,7 +248,9 @@ mod tests {
     /// Task 9b: the real backend gets the Application Support cache.
     #[test]
     fn the_real_backend_gets_the_real_cache() {
-        let launch = resolve(args(&[]), env(&[("HOME", "/Users/someone")]));
+        let home = Some("/Users/someone".into());
+        // `HOME` is ignored: the home directory is the user database's.
+        let launch = resolve_in(args(&[]), env(&[("HOME", "/elsewhere")]), home);
         let Ok(Launch::Telegram { cache, .. }) = launch else {
             panic!("expected the real backend");
         };
@@ -244,10 +258,25 @@ mod tests {
             cache.unwrap().dir(),
             std::path::Path::new("/Users/someone/Library/Application Support/dev.abyss/cache")
         );
-        let Ok(Launch::Telegram { cache, .. }) = resolve(args(&[]), env(&[])) else {
+        let Ok(Launch::Telegram { cache, .. }) = resolve_in(args(&[]), env(&[]), None) else {
             panic!("expected the real backend");
         };
-        assert!(cache.is_err(), "no HOME, no cache");
+        assert!(cache.is_err(), "no home, no cache");
+    }
+
+    /// Round 26: the home directory is the real user's, from the user
+    /// database, whatever `HOME` says.
+    #[test]
+    fn the_home_directory_comes_from_the_user_database() {
+        let home = crate::storage::home_dir().unwrap();
+        assert!(home.is_absolute());
+        assert!(home.is_dir());
+        let Ok(Launch::Telegram { cache, .. }) =
+            resolve(args(&[]), env(&[("HOME", "/nonexistent")]))
+        else {
+            panic!("expected the real backend");
+        };
+        assert!(cache.unwrap().dir().starts_with(&home));
     }
 
     /// Task 9b: `--fake` never gets the real cache, and a cache only when
@@ -255,22 +284,29 @@ mod tests {
     #[cfg(feature = "fake")]
     #[test]
     fn the_fake_gets_a_cache_only_when_asked() {
-        let vars = [("HOME", "/Users/someone"), ("TMPDIR", "/var/folders/t/")];
-        let Ok(Launch::Fake { cache, .. }) = resolve(args(&[FAKE_FLAG]), env(&vars)) else {
+        let home = || Some("/Users/someone".into());
+        let vars = [("TMPDIR", "/var/folders/t/")];
+        let Ok(Launch::Fake { cache, .. }) = resolve_in(args(&[FAKE_FLAG]), env(&vars), home())
+        else {
             panic!("expected the fake");
         };
         assert_eq!(cache, None);
         let asked = [
-            ("HOME", "/Users/someone"),
             ("TMPDIR", "/var/folders/t/"),
             (crate::storage::FAKE_CACHE_VAR, "1"),
         ];
-        let Ok(Launch::Fake { cache, .. }) = resolve(args(&[FAKE_FLAG]), env(&asked)) else {
+        let Ok(Launch::Fake { cache, .. }) = resolve_in(args(&[FAKE_FLAG]), env(&asked), home())
+        else {
             panic!("expected the fake");
         };
-        assert_eq!(
-            cache.unwrap().dir(),
-            std::path::Path::new("/var/folders/t/dev.abyss.fake/cache")
+        let dir = cache.unwrap().dir();
+        // A fresh run directory each time: `.../dev.abyss.fake/run-*/cache`.
+        assert!(dir.starts_with("/var/folders/t/dev.abyss.fake"), "{dir:?}");
+        assert!(dir.ends_with("cache"));
+        assert!(
+            dir.parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n.to_string_lossy().starts_with("run-"))
         );
     }
 }
