@@ -29,6 +29,8 @@ To connect to Telegram, run `cargo run -p abyss` and follow
 [Connecting abyss to Telegram](docs/connecting.md). You need your own
 `api_id` and `api_hash` from my.telegram.org; the guide walks through it.
 
+What is done, what is next and what is still undecided: [roadmap](docs/roadmap.md).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
