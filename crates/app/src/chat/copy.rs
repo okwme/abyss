@@ -13,6 +13,10 @@ use super::sends::{Echo, Phase};
 pub(crate) const WORDMARK: &str = "abyss";
 pub(crate) const SELECT_CHAT: &str = "Select a chat";
 pub(crate) const NO_CHATS: &str = "No chats yet";
+pub(crate) const NO_ARCHIVED: &str = "No archived chats";
+pub(crate) const ARCHIVE: &str = "Archive";
+/// The archive view's title, which leads back to the main list.
+pub(crate) const ARCHIVE_BACK: &str = "‹ Archive";
 pub(crate) const LOADING_HISTORY: &str = "Loading…";
 pub(crate) const START_OF_HISTORY: &str = "Start of the conversation";
 pub(crate) const EMPTY_CHAT: &str = "No messages yet";
@@ -190,6 +194,15 @@ mod send_label_tests {
         let done = now + Duration::from_secs(31);
         assert_eq!(send_label(e, done), "Resending…");
         assert!(e.can_discard() && !e.can_retry());
+    }
+}
+
+/// The archive entry's second line: how many chats, how many unread.
+pub(crate) fn archive_summary(chats: usize, unread: usize) -> SharedString {
+    let noun = if chats == 1 { "chat" } else { "chats" };
+    match unread {
+        0 => format!("{chats} {noun}").into(),
+        n => format!("{chats} {noun} · {n} unread").into(),
     }
 }
 

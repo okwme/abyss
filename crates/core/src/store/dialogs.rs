@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerFolder, Preview};
 
 /// Maximum number of dialogs held.
 pub const MAX_DIALOGS: usize = 1000;
@@ -118,8 +118,8 @@ impl Dialogs {
     /// dropping the pages loaded after it. The page becomes the head of the list
     /// in server order. Previously loaded chats it does not contain are kept
     /// after it (unpinned, newest first) when they are not newer than the page's
-    /// oldest unpinned chat; a chat that is newer but missing was left, deleted
-    /// or archived, so it goes. A page that ends the list replaces it entirely.
+    /// oldest unpinned chat; a chat that is newer but missing was left or
+    /// deleted, so it goes (an archived chat stays listed, in the archive). A page that ends the list replaces it entirely.
     /// Returns how many previously loaded chats were kept.
     pub fn merge_first_page(&mut self, page: Vec<ChatSummary>, rest: Rest) -> usize {
         let old = std::mem::take(&mut self.list);
@@ -259,6 +259,18 @@ impl Dialogs {
         Bump::Updated(summary)
     }
 
+    /// Moves a chat into or out of the archive. `None` when the chat is not
+    /// listed or already there. The order is unchanged: the archive and the
+    /// main list are views of one server-ordered list.
+    pub fn set_folder(&mut self, chat: ChatId, folder: PeerFolder) -> Option<&ChatSummary> {
+        let summary = self
+            .list
+            .iter_mut()
+            .find(|c| c.id == chat && c.folder != folder)?;
+        summary.folder = folder;
+        Some(summary)
+    }
+
     /// Sets the unread count (local read or read on another device).
     pub fn set_unread(&mut self, chat: ChatId, unread: u32) -> Option<&ChatSummary> {
         let summary = self.list.iter_mut().find(|c| c.id == chat)?;
@@ -291,6 +303,7 @@ mod tests {
             last_date: 0,
             last_id: None,
             can_send: true,
+            folder: PeerFolder::Main,
         }
     }
 
@@ -465,6 +478,24 @@ mod tests {
         let out = d.append(vec![chat(3)], Rest::Last);
         assert!(out.reordered);
         assert_eq!(ids(&d), vec![1, 3]);
+    }
+
+    #[test]
+    fn archiving_flags_the_chat_in_place() {
+        let mut d = Dialogs::default();
+        d.reset(vec![chat(1), chat(2)]);
+        let rev = d.rev();
+        let archive = PeerFolder::Archive;
+        assert!(
+            d.set_folder(id(2), archive)
+                .is_some_and(|c| c.folder == archive)
+        );
+        assert!(d.set_folder(id(2), archive).is_none(), "already archived");
+        assert!(d.set_folder(id(9), archive).is_none(), "not listed");
+        assert_eq!(ids(&d), vec![1, 2], "order unchanged");
+        assert_eq!(d.rev(), rev);
+        let main = PeerFolder::Main;
+        assert!(d.set_folder(id(2), main).is_some_and(|c| c.folder == main));
     }
 
     /// Round 9, finding 4: a bump that moves a chat changes the revision.

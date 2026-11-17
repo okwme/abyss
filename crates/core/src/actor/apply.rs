@@ -12,7 +12,7 @@ use crate::backend::{
     Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, StreamError, Update,
 };
 use crate::cache::CacheCmd;
-use crate::model::{ChatId, ChatSummary, Message, MsgId};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerFolder};
 use crate::store::{Bump, Change, Last, Rest, Unread, ViewGen, Window};
 
 pub(super) fn user_error(e: CallError) -> UserError {
@@ -681,6 +681,29 @@ impl<B: Backend> Actor<B> {
                 }
             }
             Update::MessageId { random_id, id } => self.on_message_id(random_id, id).await,
+            Update::Folders(moves) => self.on_folders(moves).await,
+        }
+    }
+
+    /// Chats moved into or out of the archive: each listed one changes in
+    /// place (`ChatBumped` without a newer message never moves a row), and
+    /// the cached list follows, so a restart shows the same split.
+    async fn on_folders(&mut self, moves: Vec<(ChatId, PeerFolder)>) {
+        let mut changed = Vec::new();
+        for (chat, folder) in moves {
+            if let Some(summary) = self.dialogs.set_folder(chat, folder) {
+                changed.push(summary.clone());
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        for summary in changed {
+            self.emit(Event::ChatBumped(summary)).await;
+        }
+        if self.cache.is_some() {
+            let all = self.dialogs.as_slice().to_vec();
+            self.cache_write(CacheCmd::PutChats(all)).await;
         }
     }
 

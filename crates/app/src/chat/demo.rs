@@ -6,8 +6,8 @@
 
 use abyss_core::backend::fake::FakeScript;
 use abyss_core::model::{
-    Body, ChatId, ChatKind, ChatSummary, MediaKind, Message, MsgId, PeerKind, Preview, Sender,
-    ThreadKey,
+    Body, ChatId, ChatKind, ChatSummary, MediaKind, Message, MsgId, PeerFolder, PeerKind, Preview,
+    Sender, ThreadKey,
 };
 use abyss_core::rich_text::{EntityKind, MAX_ENTITIES, RawEntity, RichText};
 use abyss_core::sanitize::display_name;
@@ -77,6 +77,12 @@ fn summary(n: i64, now: i64) -> ChatSummary {
                 ..
             }
         ),
+        // Every sixth chat is archived, so the demo has an archive to open.
+        folder: if n > 3 && n % 6 == 5 {
+            PeerFolder::Archive
+        } else {
+            PeerFolder::Main
+        },
     }
 }
 

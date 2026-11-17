@@ -21,7 +21,9 @@ use super::{
 };
 use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
 use crate::credentials::{CredentialSlot, EnvResolution};
-use crate::model::{Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey};
+use crate::model::{
+    Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerFolder, PeerKind, ThreadKey,
+};
 use crate::rich_text::RichText;
 use crate::session::AbyssSession;
 
@@ -227,6 +229,7 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
+        folder: PeerFolder::Main,
     }
 }
 

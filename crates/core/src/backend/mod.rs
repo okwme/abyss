@@ -27,7 +27,7 @@ pub use seed::{MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 
 use crate::api::{CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
 pub use crate::credentials::CredentialSlot;
-use crate::model::{ChatId, ChatSummary, Message, MsgId};
+use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerFolder};
 
 /// Opaque position in the dialogs list, produced by the backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +78,9 @@ pub enum Update {
         chat: ChatId,
         still_unread: u32,
     },
+    /// `updateFolderPeers`: chats moved into or out of the archive, here or
+    /// on another device.
+    Folders(Vec<(ChatId, PeerFolder)>),
     /// `updateMessageID`: the server assigned `id` to the send carrying
     /// `random_id` (plan section 9). Correlated with the pending-send table.
     MessageId {

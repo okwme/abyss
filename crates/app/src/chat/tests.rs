@@ -3,7 +3,7 @@ use std::time::Instant;
 use abyss_core::api::{
     Command, ConnState, HistoryDir, LoadTarget, SendState, UserError, WindowState,
 };
-use abyss_core::model::{Body, ChatKind, LocalId, PeerKind, ThreadKey};
+use abyss_core::model::{Body, ChatKind, LocalId, PeerFolder, PeerKind, ThreadKey};
 use abyss_core::rich_text::RichText;
 use abyss_core::store::ViewGen;
 use gpui::{
@@ -65,6 +65,7 @@ fn summary() -> ChatSummary {
         last_date: 0,
         last_id: None,
         can_send: true,
+        folder: PeerFolder::Main,
     }
 }
 
