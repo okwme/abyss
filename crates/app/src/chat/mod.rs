@@ -22,7 +22,7 @@ use std::time::Instant;
 use abyss_core::api::{ConnState, Event, LoadTarget, UserError, WindowState};
 use abyss_core::model::{ChatId, ChatSummary, Message, MsgId};
 use abyss_core::store::ViewGen;
-use gpui::{FollowMode, ListAlignment, ListState, Task, px};
+use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, Task, px};
 
 pub(crate) use self::commands::{Admit, Refused};
 use self::list::{ChatList, Pages};
@@ -77,6 +77,9 @@ pub(crate) struct ChatShell {
     /// Frame-driven commands (loads, read marks, the live tail) core
     /// refused: the next frame retries, and a wake-up makes sure one comes.
     frame_retry: Backoff,
+    /// When window activation last restarted retries that gave up
+    /// (at most once per [`retry::AUTO_RESTART_GAP`]).
+    auto_restart: Option<Instant>,
     /// The one pending wake-up for retries, if one is scheduled.
     retry_timer: Option<RetryTimer>,
     /// Names wake-ups, so a stale one (replaced since) is ignored.
@@ -123,6 +126,7 @@ impl Default for ChatShell {
             focus_sent: WindowState::Active,
             focus_retry: Backoff::default(),
             frame_retry: Backoff::default(),
+            auto_restart: None,
             retry_timer: None,
             timer_gen: 0,
             conn: None,
@@ -234,8 +238,7 @@ impl ChatShell {
     }
 
     fn row_of(&self, id: MsgId) -> Option<usize> {
-        let w = self.window.as_ref()?;
-        (0..w.len()).find(|ix| w.get(*ix).is_some_and(|m| m.id == id))
+        self.window.as_ref()?.index_of(id)
     }
 
     /// Applies a chat event from core. Other events are ignored.
@@ -386,13 +389,45 @@ impl ChatShell {
     /// A history event. A new view (a reopened chat's full `Tail`, a
     /// reload) replaces the rows; echoes are reconciled only by
     /// `Reconciled`, never by a view change.
+    ///
+    /// A replaced view keeps the reading position when the message at the
+    /// top of the viewport survives it (task 10e): a refresh that replaces
+    /// the window keeps late live messages, and the user may be reading
+    /// one. Following the tail, the list stays at the tail anyway.
     fn on_history(&mut self, chat: ChatId, batch: Batch) {
+        let anchor = self.scroll_anchor();
         let Some(w) = self.open_window(chat) else {
             return;
         };
         let applied = w.apply(batch);
+        let reset = applied == Applied::Reset;
         self.sync_rows(Some(applied));
+        if reset && let Some((id, offset_in_item)) = anchor {
+            self.restore_anchor(id, offset_in_item);
+        }
         self.after_echo_change();
+    }
+
+    /// The message at the top of the viewport and how far into it the
+    /// viewport starts, unless the list follows the tail.
+    fn scroll_anchor(&self) -> Option<(MsgId, Pixels)> {
+        if self.rows.is_following_tail() {
+            return None;
+        }
+        let top = self.rows.logical_scroll_top();
+        let id = self.window.as_ref()?.get(top.item_ix)?.id;
+        Some((id, top.offset_in_item))
+    }
+
+    /// Scrolls back to message `id`, `offset_in_item` into it, if the
+    /// window still holds it.
+    fn restore_anchor(&self, id: MsgId, offset_in_item: Pixels) {
+        if let Some(item_ix) = self.row_of(id) {
+            self.rows.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item,
+            });
+        }
     }
 
     /// Core merged the server's tail of `chat` into `view`. It ends no

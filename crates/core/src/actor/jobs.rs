@@ -140,7 +140,9 @@ pub(super) struct Done {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TaskKind {
     Dialogs,
-    History(Load),
+    /// A history load and its direction: a panic ends only that load
+    /// (task 10e), never one deferred behind it.
+    History(Load, HistoryDir),
     Send(LocalId),
     Read,
     CacheChats,
@@ -240,7 +242,7 @@ pub(super) fn job_future<C: Client>(
                 floor,
                 res,
             });
-            (TaskKind::History(load), Box::pin(fut))
+            (TaskKind::History(load, dir), Box::pin(fut))
         }
         Job::Send {
             local_id,

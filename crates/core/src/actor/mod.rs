@@ -437,11 +437,11 @@ impl<B: Backend> Actor<B> {
                     .await;
                 self.snapshot_done(boot::Snapshot::Dialogs).await;
             }
-            Some(TaskKind::History(load)) => {
+            Some(TaskKind::History(load, dir)) => {
                 self.release_history(load);
-                // The kind does not say which way it loaded: the UI ignores
-                // an end of a load it is not waiting for.
-                for dir in [HistoryDir::Older, HistoryDir::Newer] {
+                // Only the failed load ends: a load deferred behind it still
+                // runs (and answers), so ending it too would answer it twice.
+                if self.answers_user(load, dir) {
                     self.history_ended(load.chat, dir, Some(UserError::Internal))
                         .await;
                 }
@@ -611,7 +611,7 @@ impl<B: Backend> Actor<B> {
         if self.open != Some(chat) {
             return self.history_ended(chat, dir, None).await;
         }
-        if dir == HistoryDir::Older && self.older_absorbed(chat) {
+        if dir == HistoryDir::Older && self.absorb_older(chat) {
             return; // the covering fetch running answers it
         }
         if self.history_busy.contains_key(&chat) {
@@ -636,7 +636,7 @@ impl<B: Backend> Actor<B> {
         {
             let cgen = self.cgen;
             self.spawn_local(
-                TaskKind::History(load),
+                TaskKind::History(load, dir),
                 jobs::cache_history(cache, cgen, load, dir, Some(edge)),
             );
             return;

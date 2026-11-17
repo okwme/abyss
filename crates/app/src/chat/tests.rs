@@ -962,3 +962,5 @@ fn only_rows_inside_the_viewport_count_as_seen(cx: &mut TestAppContext) {
         .unwrap();
     assert_eq!(viewing(&core.take()), [None], "scrolled away from the tail");
 }
+
+mod review10e;

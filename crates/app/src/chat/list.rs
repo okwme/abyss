@@ -148,6 +148,16 @@ impl ChatList {
         self.paging.retry.reset();
     }
 
+    /// Automatic recovery (see [`Backoff::restart_if_exhausted`]).
+    pub(crate) fn recover(&mut self) {
+        self.paging.retry.restart_if_exhausted();
+    }
+
+    /// Whether page requests stopped retrying, wanted or not.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.paging.retry.gave_up()
+    }
+
     /// Whether failed requests for a page the sidebar wants stopped
     /// retrying (until [`Self::retry_now`]).
     pub(crate) fn gave_up(&self) -> bool {

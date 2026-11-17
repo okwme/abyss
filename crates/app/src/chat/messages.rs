@@ -196,6 +196,11 @@ impl MessageWindow {
         self.find(id).is_ok()
     }
 
+    /// The row of message `id`, if the window holds it.
+    pub(crate) fn index_of(&self, id: MsgId) -> Option<usize> {
+        self.find(id).ok()
+    }
+
     pub(crate) fn by_id(&self, id: MsgId) -> Option<&Message> {
         self.messages.get(self.find(id).ok()?)
     }
@@ -368,6 +373,22 @@ impl MessageWindow {
                 *load = DirLoad::default();
             }
         }
+    }
+
+    /// Automatic recovery: a direction whose retries gave up may ask again;
+    /// one that waits out a backoff keeps its deadline, and a parked one
+    /// stays parked (see [`Backoff::restart_if_exhausted`]).
+    pub(crate) fn recover(&mut self) {
+        for load in [&mut self.pending.older, &mut self.pending.newer] {
+            if !load.pending {
+                load.retry.restart_if_exhausted();
+            }
+        }
+    }
+
+    /// Whether either direction stopped retrying its failed loads.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.pending.older.retry.gave_up() || self.pending.newer.retry.gave_up()
     }
 
     /// Whether a direction with history left stopped retrying its failed

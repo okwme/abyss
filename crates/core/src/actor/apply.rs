@@ -209,8 +209,10 @@ impl<B: Backend> Actor<B> {
             }
             Err(e) => {
                 self.error(user_error(e)).await;
-                self.history_ended(load.chat, req.dir, Some(user_error(e)))
-                    .await;
+                if self.answers_user(load, req.dir) {
+                    self.history_ended(load.chat, req.dir, Some(user_error(e)))
+                        .await;
+                }
             }
         }
         if boot.is_some() {
@@ -358,6 +360,13 @@ impl<B: Backend> Actor<B> {
         if !self.is_current(chat, view) {
             return;
         }
+        // The window's oldest end moved while the cache was read (see
+        // `on_older`); a newer read needs no such check, since nothing but a
+        // deletion changes a detached window's newest end.
+        if dir == HistoryDir::Older && !self.starts_at(chat, anchor) {
+            self.defer_load(chat, dir);
+            return;
+        }
         // Only the server establishes either end of history: the cache never
         // proves the start, and a short newer page only means the cache ends
         // there (live messages may be missing from it), not that the live
@@ -434,33 +443,7 @@ impl<B: Backend> Actor<B> {
         match p.dir {
             HistoryDir::Tail if p.mode == TailMode::Merge => self.merge_tail(p).await,
             HistoryDir::Tail => self.on_tail(p).await,
-            HistoryDir::Older => {
-                let hi = match p.query {
-                    HistoryQuery::Before(id) => MsgId(id.0.saturating_sub(1)),
-                    _ => MAX_ID,
-                };
-                // A partial page is authoritative from the oldest id the
-                // server sent, even when tombstones emptied it.
-                let lo = match (p.page.has_more, p.covered) {
-                    (false, _) => Some(MIN_ID),
-                    (true, covered) => covered.map(|c| c.oldest),
-                };
-                if let Some(lo) = lo {
-                    self.reconcile(p.chat, lo, hi, &p.page.messages).await;
-                }
-                // A page core fetched on its own never drops a message.
-                let applied = if self.covers.is_fetch(p.chat, p.req) {
-                    self.windows.prepend_fitting(p.chat, p.view, p.page)
-                } else {
-                    self.windows.prepend(p.chat, p.view, p.page)
-                };
-                if let Ok(change) = applied {
-                    self.emit_history(p.chat, p.view, p.dir, change).await;
-                }
-                if let HistoryQuery::Before(edge) = p.query {
-                    self.older_covers(p.chat, p.view, (p.req, edge), lo).await;
-                }
-            }
+            HistoryDir::Older => self.on_older(p).await,
             HistoryDir::Newer => {
                 let lo = match p.query {
                     HistoryQuery::After(id) => MsgId(id.0.saturating_add(1)),
@@ -478,6 +461,64 @@ impl<B: Backend> Actor<B> {
                 }
             }
         }
+    }
+
+    /// A page of history older than the window, asked as `Before(edge)`
+    /// when `edge` was the window's oldest message. It is applied only if
+    /// `edge` still is: live messages may have trimmed the window's oldest
+    /// end meanwhile (and deletions made room again), and the page would
+    /// then leave a hole above it that coverage could span (task 10e). A
+    /// page that no longer continues the window is dropped; the user's load
+    /// it answered (its own, or one a covering fetch absorbed) starts over
+    /// from the window's current edge.
+    async fn on_older(&mut self, p: HistoryReply) {
+        let hi = match p.query {
+            HistoryQuery::Before(id) => MsgId(id.0.saturating_sub(1)),
+            _ => MAX_ID,
+        };
+        // A partial page is authoritative from the oldest id the server
+        // sent, even when tombstones emptied it.
+        let lo = match (p.page.has_more, p.covered) {
+            (false, _) => Some(MIN_ID),
+            (true, covered) => covered.map(|c| c.oldest),
+        };
+        if let Some(lo) = lo {
+            self.reconcile(p.chat, lo, hi, &p.page.messages).await;
+        }
+        // `Some(user_waits)` for a covering fetch.
+        let fetch = self.covers.fetch_ended(p.chat, p.req);
+        let edge = match p.query {
+            HistoryQuery::Before(edge) => Some(edge),
+            _ => None,
+        };
+        if edge.is_some_and(|edge| !self.starts_at(p.chat, edge)) {
+            tracing::debug!("older page no longer continues the window");
+            if fetch != Some(false) {
+                self.defer_load(p.chat, HistoryDir::Older);
+            }
+            return;
+        }
+        // A page core fetched on its own never drops a message.
+        let applied = if fetch.is_some() {
+            self.windows.prepend_fitting(p.chat, p.view, p.page)
+        } else {
+            self.windows.prepend(p.chat, p.view, p.page)
+        };
+        if let Ok(change) = applied {
+            self.emit_history(p.chat, p.view, p.dir, change).await;
+        }
+        if let Some(edge) = edge {
+            self.older_covers(p.chat, p.view, edge, lo).await;
+        }
+    }
+
+    /// Whether `chat`'s window still starts at `edge`, the oldest message
+    /// it held when an older page was asked for.
+    fn starts_at(&self, chat: ChatId, edge: MsgId) -> bool {
+        self.windows
+            .get(chat)
+            .and_then(|w| w.messages().front())
+            .is_some_and(|m| m.id == edge)
     }
 
     /// Writes a server page over `[lo, hi]` of a contiguous cache.

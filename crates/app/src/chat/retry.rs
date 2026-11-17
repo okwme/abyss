@@ -16,6 +16,13 @@ pub(crate) const FIRST_DELAY: Duration = Duration::from_millis(500);
 pub(crate) const MAX_DELAY: Duration = Duration::from_secs(8);
 /// Failures in a row after which automatic retries stop.
 pub(crate) const MAX_FAILURES: u8 = 5;
+/// Shortest time between two automatic restarts of retries that gave up
+/// (window activation; task 10e). Activation can toggle at the user's pace
+/// (or an app switcher's), so without it every toggle would buy
+/// [`MAX_FAILURES`] more attempts. At this gap a full queue sees at most
+/// `MAX_FAILURES` attempts per 30 s per retry, while a user returning to the
+/// window still gets an automatic recovery. The user's Retry is not limited.
+pub(crate) const AUTO_RESTART_GAP: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Backoff {
@@ -39,6 +46,15 @@ impl Backoff {
     /// An attempt succeeded, or a fresh trigger allows trying again at once.
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Automatic recovery: retries that gave up start over. One that still
+    /// waits keeps its deadline, so a recovery never brings an attempt
+    /// forward.
+    pub(crate) fn restart_if_exhausted(&mut self) {
+        if self.gave_up() {
+            self.reset();
+        }
     }
 
     /// Whether automatic retries stopped (until a reset).

@@ -297,7 +297,7 @@ impl<B: Backend> Actor<B> {
             Some(cache) => {
                 let cgen = self.cgen;
                 let fut = jobs::cache_history(cache, cgen, load, HistoryDir::Tail, None);
-                self.spawn_local(TaskKind::History(load), fut);
+                self.spawn_local(TaskKind::History(load, HistoryDir::Tail), fut);
             }
             None if self.is_tail_snapshot(load) => self.push_tail_snapshot(load),
             None => self.request_tail(load).await,

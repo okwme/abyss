@@ -952,6 +952,21 @@ Open items:
 - Manual checks: the Retry pills' placement, and real-network retry timing.
 - Section 13 still carries merge-conflict residue from an earlier merge on main (the `|||||||` / `<<<<<<<<<` lines and the duplicated 11e/10c notes around this note). Left for the coordinator, to avoid colliding with task 6d's edits.
 
+**Task 10e status (2026-11-17): round 17 re-check fixes to covering fetches, load acknowledgements and the Retry UI, done against the fake.** Each regression test fails with its fix reverted (checked one fix at a time by disabling it in place). Core tests are in `crates/core/src/actor/tests/review10e.rs`, app tests in `crates/app/src/chat/tests/review10e.rs` and `crates/app/src/shell/tests/fake/review10e.rs`.
+1. **A covering fetch could leave a hole and certify a send (HIGH).** An older page (`Before(edge)`) now applies only while `edge` is still the window's oldest message (`apply::on_older`, `starts_at`). The anchor is the request's own edge, so no epoch is needed: that end changes only by a trim (live messages) or a deletion, and a prepend that could restore it is single-flight with the request. A page cut off from the window is dropped; its cache reconcile still runs (it is server truth for its range). The user's load it answered starts over from the current edge (deferred, so it runs before background work): the user's own `LoadOlder`, or one a covering fetch absorbed (`Cover::user_waits`, set by `absorb_older`). Cache-served older pages get the same check. Audit: a newer page needs none. A detached window takes no live messages, its newest end changes only by a deletion (which leaves no hole), and the only things that trim it are prepends, which are single-flight. Tests: `a_covering_page_cut_off_from_the_window_is_dropped` (the round-17 scenario: 61..=110, a delayed fetch below 61 that a `LoadOlder` joins, 2,000 live messages, 50 deleted; on the old code `SendsCovered` fires), `a_users_older_page_cut_off_from_the_window_starts_over`.
+2. **A history panic acknowledged deferred work.** `TaskKind::History(Load, HistoryDir)` records the direction. A panic, and a failed call too, ends only the failed load (`answers_user`): a tail ends none, so a load deferred behind it runs and is the only answer, and a covering fetch ends only a `LoadOlder` it absorbed. Test: `a_panicked_tail_does_not_end_a_deferred_load` (exactly one answer per request, and a panicked `LoadOlder` still ends once).
+3. **Exhausted frame retries never painted the Retry pill.** `Session::drive` compares `ChatShell::retry_offered()` (history, dialogs) before and after each command and calls `cx.notify()` once when it changes. Test: `exhausted_frame_retries_paint_the_retry_pill` (full queue, no other redraw; asserts the pill's painted bounds through a `debug_selector`).
+4. **The sidebar Retry pill lay under the rows.** It is now the sidebar's last child, `occlude()`s the mouse and stops propagation in its click handler. Test: `the_sidebar_retry_pill_takes_its_click` (10 chats, pill over a row: the click sends `LoadDialogs`, no `OpenChat`; on the old code it opened chat 4).
+5. **A full replace lost the reading anchor.** Deviation: fixed in the UI, not by applying in place in core. `ChatShell::on_history` captures the message at the top of the viewport and the offset into it (unless the list follows the tail). After a `Reset` (a new view) it scrolls back to that message, if the new window holds it. This covers every replace (the round-16 rule in `merge.rs` and the gap replaces too), while core's replace semantics stay as reviewed in round 16. Test: `a_replaced_view_keeps_the_message_being_read` (late messages 101..=130 survive a replacing tail of 1..=30; 110 stays at the top, 7 px in, across two layouts).
+6. **Rapid activation bypassed retry delays.** Activation is no longer a fresh trigger. `set_focus` keeps a focus backoff that still runs (the wake-up then sends the latest state), and `auto_recover` restarts only retries that gave up, at most once per `AUTO_RESTART_GAP` (30 s, `chat/retry.rs`). A waiting retry keeps its deadline, and a parked direction stays parked. The user's Retry (`retry_loads`) and coming back online still reset everything; reconnection is paced by core's rebuild backoff. The gap is shell-wide, which is stricter than per chat (selecting a chat starts its retries afresh anyway). Test: `rapid_activation_keeps_retries_bounded` (1,000 focus toggles over 100 s against a full queue: the first backoff holds, at most 5 × 5 `LoadOlder` attempts, and Retry asks at once).
+
+Verified: fmt, clippy in both feature configs, `cargo test --workspace --features fake` (350 core with 3 ignored, 146 app), `cargo tree -p abyss-core | grep -ci gpui` = 0. The new tests passed 8 runs in a row.
+
+Open items:
+- Known conservative limitation: coverage may stay unresolved while the window has no room (2,000 messages, or the byte budget). A covering fetch then inserts nothing (`prepend_fitting`), and the echo stays until a replacing tail, a reopen or the 256-echo cap. The round-17 scenario ends this way: the window is full after the trim, so the send is never certified.
+- The 10d open item on `purge_queued` stands: a rebuild drops a queued load without `LoadEnded`, and the rebuild's `ChatInvalidated` resets the UI.
+- Manual check: the reading position across a replacing refresh in the real app.
+
 ## 14. Risks and unknowns
 
 1. **GPUI** is pre-1.0. `input.rs` is an example, not a maintained widget, and the composer and `PasswordInput` are the largest UI unknowns.
@@ -1120,6 +1135,14 @@ Open items:
   - Exhausted history and dialogs retries stayed stuck: a detached window is never refreshed, and there was no Retry control.
   - `Reconciled` cleared pending loads that core still ran after it (deferred), so the UI asked again and core fetched a page twice.
   - Automatic covering fetches ignored pending user work and window capacity. They started from completion handlers ahead of deferred user loads, and a prepend could trim the viewed end.
+
+- **Round 17 (re-check of task 10d, 2026-11-17).** All fixed in task 10e (section 13):
+  - **High:** a covering fetch could create a gap and certify a send. Live messages trimmed the window's oldest end while the fetch ran, deletions made room, and the page was prepended below a hole the cover then spanned.
+  - A panicked history task ended both directions, so a load deferred behind a panicked tail was answered twice.
+  - Exhausted frame retries did not repaint, so the Retry pill never showed.
+  - The sidebar Retry pill was painted under the chat rows, and clicks reached the row below.
+  - A replacing refresh reset the list, losing the position of a user reading a late message.
+  - Every activation reset all backoffs, so rapid focus toggling bypassed unexpired retry delays.
 
 ## 16. Encrypted message cache (added after v3.1, user decision 2026-11-16)
 

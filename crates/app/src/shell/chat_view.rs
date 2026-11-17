@@ -81,7 +81,6 @@ fn sidebar(session: &Session, cx: &mut Context<'_, Root>) -> Div {
         .w(px(SIDEBAR_WIDTH))
         .h_full()
         .relative()
-        .children(retry)
         .flex()
         .flex_col()
         .border_r_1()
@@ -96,6 +95,8 @@ fn sidebar(session: &Session, cx: &mut Context<'_, Root>) -> Div {
                 .child(muted(copy::conn_label(session.conn))),
         )
         .child(body)
+        // Last, so it paints over the rows and takes their clicks.
+        .children(retry)
 }
 
 fn chat_rows(
@@ -303,16 +304,21 @@ fn jump_button(cx: &mut Context<'_, Root>) -> Stateful<Div> {
         }))
 }
 
-/// Offered once automatic retries gave up: retries everything now.
+/// Offered once automatic retries gave up: retries everything now. An
+/// overlay: rendered after what it covers, it blocks the mouse for the
+/// rows below and stops the click there (task 10e).
 fn retry_button(
     id: &'static str,
     label: &'static str,
     cx: &mut Context<'_, Root>,
 ) -> Stateful<Div> {
     pill(id, label)
+        .debug_selector(|| id.to_owned())
         .absolute()
         .left_3()
+        .occlude()
         .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
+            cx.stop_propagation();
             root.with_session(|s, cx| s.retry_loads(window, cx), cx);
         }))
 }

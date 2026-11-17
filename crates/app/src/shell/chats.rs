@@ -80,6 +80,7 @@ impl Session {
         cx: &mut Context<'_, Root>,
         f: impl FnOnce(&mut ChatShell, crate::chat::Admit<'_>) -> Result<R, Refused>,
     ) -> Option<R> {
+        let offered = self.shell.retry_offered();
         let core = &self.core;
         let mut admit = |cmd: Command| admit(core, cmd);
         let out = match f(&mut self.shell, &mut admit) {
@@ -92,6 +93,12 @@ impl Session {
                 None
             }
         };
+        // Retries that just gave up (or started over) change the Retry
+        // pills. A quiet refusal redraws nothing else, and the last one
+        // often comes from the after-paint check, so redraw once here.
+        if self.shell.retry_offered() != offered {
+            cx.notify();
+        }
         self.schedule_retry(window, cx);
         out
     }

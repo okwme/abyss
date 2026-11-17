@@ -12,6 +12,7 @@ use gpui::FollowMode;
 
 use super::ChatShell;
 use super::messages::MessageWindow;
+use super::retry::AUTO_RESTART_GAP;
 use super::sends::Echo;
 #[cfg(test)]
 use super::sends::Echoes;
@@ -235,8 +236,10 @@ impl ChatShell {
 
     /// The window gained or lost focus. The shell follows at once (no read
     /// mark and no live tail while inactive); core is told now, or, if it
-    /// refuses, after a backoff ([`Self::retry_due`]). Activation is a fresh
-    /// trigger: retries that gave up may start over.
+    /// refuses, after a backoff ([`Self::retry_due`]): a backoff that still
+    /// runs keeps its deadline and then sends the latest state. Activation
+    /// is an automatic recovery ([`Self::auto_recover`]), not the user's
+    /// Retry: it never brings a waiting retry forward.
     pub(crate) fn set_focus(
         &mut self,
         state: WindowState,
@@ -245,17 +248,46 @@ impl ChatShell {
     ) -> Result<(), Refused> {
         if self.active != state {
             self.active = state;
-            self.focus_retry.reset();
+            // A new state for core: start afresh unless a backoff runs.
+            if self.focus_retry.due(now).is_none() {
+                self.focus_retry.reset();
+            }
             if state == WindowState::Active {
-                self.fresh_trigger();
+                self.auto_recover(now);
             }
         }
-        self.sync_focus(now, admit)
+        if self.focus_out_of_sync() && self.focus_retry.ready(now) {
+            self.sync_focus(now, admit)
+        } else {
+            Ok(())
+        }
     }
 
-    /// A genuine transition (activation, reconnection, the user's Retry):
-    /// every automatic retry that waits or gave up may try again at once.
-    /// Never called from rendering.
+    /// Automatic recovery (window activation): retries that gave up start
+    /// over, at most once per [`AUTO_RESTART_GAP`]; retries that wait keep
+    /// their deadline. Rapid activation therefore cannot multiply attempts.
+    fn auto_recover(&mut self, now: Instant) {
+        let exhausted = self.frame_retry.gave_up()
+            || self.list.exhausted()
+            || self.window.as_ref().is_some_and(MessageWindow::exhausted);
+        let recent = self
+            .auto_restart
+            .is_some_and(|at| now.saturating_duration_since(at) < AUTO_RESTART_GAP);
+        if !exhausted || recent {
+            return;
+        }
+        self.auto_restart = Some(now);
+        self.frame_retry.restart_if_exhausted();
+        self.list.recover();
+        if let Some(w) = self.window.as_mut() {
+            w.recover();
+        }
+    }
+
+    /// A genuine transition (reconnection, the user's Retry): every
+    /// automatic retry that waits or gave up may try again at once. Never
+    /// called from rendering, nor on activation (see [`Self::set_focus`]).
+    /// Reconnection is paced by core's own rebuild backoff.
     pub(crate) fn fresh_trigger(&mut self) {
         self.focus_retry.reset();
         self.frame_retry.reset();
@@ -270,6 +302,12 @@ impl ChatShell {
     /// and dialogs pages.
     pub(crate) fn history_gave_up(&self) -> bool {
         self.window.as_ref().is_some_and(MessageWindow::gave_up) || self.frame_retry.gave_up()
+    }
+
+    /// Which Retry pills the UI offers: (history, dialogs). A change needs
+    /// a redraw (`shell::chats`).
+    pub(crate) fn retry_offered(&self) -> (bool, bool) {
+        (self.history_gave_up(), self.list.gave_up())
     }
 
     /// The user pressed Retry.

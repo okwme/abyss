@@ -138,6 +138,8 @@ mod fake {
     use crate::shell::session::Started;
     use crate::ui::text_input;
 
+    mod review10e;
+
     fn open(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {
         cx.update(|cx| cx.bind_keys(text_input::key_bindings()));
         let (commands, events, harness) = link();
