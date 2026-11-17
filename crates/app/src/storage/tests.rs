@@ -253,6 +253,63 @@ mod fake {
         assert_eq!(std::fs::read_dir(&real_dir).unwrap().count(), before);
     }
 
+    /// Round 29, finding 1: without a known home the real tree can't be
+    /// located, so isolation can't be checked: no fake cache, even with a
+    /// `TMPDIR` inside an existing real cache.
+    #[test]
+    fn an_unknown_home_disables_the_fake_cache() {
+        let home = home();
+        let real_dir = prepare(&real(home.path())).unwrap();
+        let tmp = Some(real_dir.clone().into_os_string());
+        assert_eq!(CacheLocation::fake(Some("1".as_ref()), tmp, None), None);
+        assert_eq!(std::fs::read_dir(&real_dir).unwrap().count(), 0);
+    }
+
+    /// Round 29, finding 1: only a real directory that does not exist is
+    /// known not to contain the fake root. One that can't be resolved for
+    /// another reason (here, an unsearchable Application Support) refuses.
+    #[test]
+    fn an_unresolvable_real_tree_refuses_the_fake_cache() {
+        let home = home();
+        let support = home.path().join("Library/Application Support");
+        prepare(&real(home.path())).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let location = fake(tmp.path(), home.path());
+        std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let prepared = prepare(&location);
+        std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(prepared, Err(StorageError::Overlap)),
+            "{prepared:?}"
+        );
+        // A real tree that does not exist yet cannot contain it.
+        let fresh = self::home();
+        assert!(prepare(&fake(tmp.path(), fresh.path())).is_ok());
+    }
+
+    /// Round 29, finding 2: the run directory is removed at quit once the
+    /// cache is closed, and kept while a worker still has it open.
+    #[test]
+    fn the_fake_run_directory_is_removed_once_closed() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        let location = fake(tmp.path(), home.path());
+        let dir = prepare(&location).unwrap();
+        let run = location.parent();
+        let key = abyss_core::cache::CacheKey::generate().unwrap();
+        let cache = abyss_core::cache::Cache::open(&dir, &key).unwrap();
+        let none = std::time::Duration::ZERO;
+        assert!(!remove_run(&run, &dir, none), "removed while open");
+        assert!(dir.join("cache.db").exists());
+        drop(cache);
+        assert!(remove_run(&run, &dir, none));
+        assert!(!run.exists());
+        assert!(
+            tmp.path().join("dev.abyss.fake").exists(),
+            "only the run goes"
+        );
+    }
+
     /// Round 26, finding 2: each fake run gets a fresh directory, so a
     /// planted `cache.db` (here a symlink to the real database) is never
     /// adopted; an existing run directory is refused, not reused.

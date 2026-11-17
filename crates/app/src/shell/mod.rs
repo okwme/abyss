@@ -98,6 +98,9 @@ impl Root {
             if let State::Running(session) = &root.state {
                 session.cancel_core();
             }
+            // After `begin_exit`, so nothing reopens it.
+            #[cfg(feature = "fake")]
+            crate::storage::remove_fake_run();
             async {}
         });
         Self {

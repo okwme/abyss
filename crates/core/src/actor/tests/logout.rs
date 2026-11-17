@@ -140,6 +140,36 @@ async fn logout_without_a_cache_keeps_the_marker_when_the_key_delete_fails() {
     h.stop().await;
 }
 
+/// Round 29, item 4: cached run, then a cache-less logout (key deleted,
+/// files kept), then a cached restart: the new run makes a new key, cannot
+/// open the old database with it, and destroys and recreates it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cached_restart_after_a_cacheless_logout_recreates_the_database() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("cache.db");
+    let mut h = cached_then_disabled(dir.path()).await;
+    let old_inode = std::fs::metadata(&db).unwrap().ino();
+    h.send(Command::Logout).await;
+    assert_eq!(h.logged_out().await.1, LocalDeletion::Deleted);
+    let store = h.store.clone();
+    h.stop().await;
+    assert!(db.exists(), "the files outlive the key");
+    assert!(!store.contains(SecretItem::CacheKey));
+
+    let (backend, fake) = FakeBackend::new(FakeScript::demo(2, 5));
+    let setup = Setup {
+        store: Some(store),
+        cache_dir: Some(dir.path().to_path_buf()),
+        ..Setup::default()
+    };
+    let h = start(backend, fake, setup).await;
+    assert!(h.store.contains(SecretItem::CacheKey), "a new key");
+    let new_inode = std::fs::metadata(&db).unwrap().ino();
+    assert_ne!(old_inode, new_inode, "the old database was destroyed");
+    h.stop().await;
+}
+
 /// `AUTH_KEY_UNREGISTERED` mid-session: the local part of logout runs without
 /// a remote call, and the user is asked to sign in again.
 #[tokio::test(start_paused = true)]

@@ -331,6 +331,39 @@ fn a_symlink_above_the_directory_is_allowed() {
     assert!(real.join("cache").join(DB_FILE).exists());
 }
 
+/// Round 29, finding 3: SQLite names the file in a failed open's message;
+/// `CacheError` keeps the result codes and drops the message, so neither
+/// `Display` nor `Debug` shows the path.
+#[test]
+fn sql_errors_never_show_the_path() {
+    const SENTINEL: &str = "SENTINEL-user-name-7f3a";
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join(SENTINEL);
+    // A directory where the database file should be: the open fails.
+    std::fs::create_dir_all(dir.join(DB_FILE)).unwrap();
+    let key = CacheKey::generate().unwrap();
+    let Err(error) = Cache::open(&dir, &key) else {
+        panic!("opened a directory as the database");
+    };
+    assert!(matches!(error, CacheError::Sql(_)), "{error:?}");
+    // The message rusqlite carries does name the file.
+    let raw = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+        Some(format!("unable to open database file: {}", dir.display())),
+    );
+    assert!(raw.to_string().contains(SENTINEL));
+    let redacted = CacheError::from(raw);
+    for shown in [
+        error.to_string(),
+        format!("{error:?}"),
+        redacted.to_string(),
+        format!("{redacted:?}"),
+    ] {
+        assert!(!shown.contains(SENTINEL), "{shown}");
+    }
+    assert_eq!(redacted.to_string(), "cache sql: CannotOpen (14)");
+}
+
 #[test]
 fn reconcile_removes_messages_deleted_on_server() {
     let (_t, dir, key) = setup();

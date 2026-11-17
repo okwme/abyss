@@ -203,10 +203,7 @@ impl Cache {
         let rc = unsafe { ffi::sqlite3_key_v2(db, c"main".as_ptr(), literal.as_ptr().cast(), len) };
         drop(literal);
         if rc != ffi::SQLITE_OK {
-            return Err(CacheError::Sql(rusqlite::Error::SqliteFailure(
-                ffi::Error::new(rc),
-                None,
-            )));
+            return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(rc), None).into());
         }
         // Any read fails with NOTADB when the key is wrong.
         let probe: Result<i64, _> =

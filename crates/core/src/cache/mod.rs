@@ -103,7 +103,8 @@ pub enum CacheError {
     /// Admission is closed (core shutdown, process exit) or full.
     Refused(Refused),
     Io(std::io::Error),
-    Sql(rusqlite::Error),
+    /// A SQLite error, without its message (round 29).
+    Sql(SqlError),
     Encode(postcard::Error),
 }
 
@@ -129,7 +130,6 @@ impl std::error::Error for CacheError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            Self::Sql(e) => Some(e),
             Self::Encode(e) => Some(e),
             _ => None,
         }
@@ -138,7 +138,41 @@ impl std::error::Error for CacheError {
 
 impl From<rusqlite::Error> for CacheError {
     fn from(e: rusqlite::Error) -> Self {
-        Self::Sql(e)
+        Self::Sql(SqlError::from(&e))
+    }
+}
+
+/// What is kept of a `rusqlite::Error` (round 29): its SQLite result codes
+/// only. Its message is dropped, because SQLite names the database file in
+/// some (`unable to open database file: <path>`), and paths hold the user
+/// name (plan section 11). `None` codes: an error raised by rusqlite itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlError {
+    pub code: Option<rusqlite::ErrorCode>,
+    pub extended: Option<i32>,
+}
+
+impl From<&rusqlite::Error> for SqlError {
+    fn from(e: &rusqlite::Error) -> Self {
+        match e {
+            rusqlite::Error::SqliteFailure(f, _) => Self {
+                code: Some(f.code),
+                extended: Some(f.extended_code),
+            },
+            _ => Self {
+                code: None,
+                extended: None,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for SqlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.code, self.extended) {
+            (Some(code), Some(ext)) => write!(f, "{code:?} ({ext})"),
+            _ => f.write_str("rusqlite error"),
+        }
     }
 }
 

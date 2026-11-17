@@ -76,8 +76,8 @@ pub(crate) struct CacheLocation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FakeRun {
     run: String,
-    /// The real app directory, when the home directory is known.
-    real_app: Option<PathBuf>,
+    /// The real app directory, which the fake root must stay out of.
+    real_app: PathBuf,
 }
 
 impl CacheLocation {
@@ -95,7 +95,9 @@ impl CacheLocation {
     }
 
     /// The fake's cache: `None` unless `enabled` is exactly `1`, or without
-    /// an absolute `tmpdir`. `home` locates the real tree to stay out of.
+    /// an absolute `tmpdir`. `home` locates the real tree to stay out of;
+    /// without it isolation can't be checked, so there is no fake cache
+    /// (round 29).
     #[cfg(feature = "fake")]
     pub(crate) fn fake(
         enabled: Option<&std::ffi::OsStr>,
@@ -112,7 +114,11 @@ impl CacheLocation {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let real_app = Self::real(home).ok().map(|r| r.root.join(r.app));
+        let Ok(real) = Self::real(home) else {
+            tracing::warn!("{FAKE_CACHE_VAR} is set but the home directory is unknown; no cache");
+            return None;
+        };
+        let real_app = real.app_dir();
         Some(Self {
             root,
             app: FAKE_APP_ID,
@@ -237,7 +243,7 @@ pub(crate) fn prepare(location: &CacheLocation) -> Result<PathBuf, StorageError>
     let me = unsafe { libc::getuid() };
     #[cfg(feature = "fake")]
     if let Some(fake) = &location.fake {
-        refuse_overlap(&location.root, fake.real_app.as_deref())?;
+        refuse_overlap(&location.root, &fake.real_app)?;
     }
     private_dir(&location.app_dir(), location.app, me)?;
     #[cfg(feature = "fake")]
@@ -249,15 +255,17 @@ pub(crate) fn prepare(location: &CacheLocation) -> Result<PathBuf, StorageError>
     Ok(cache)
 }
 
-/// A fake root must not resolve inside the real app directory. A real
-/// directory that does not exist yet cannot contain it.
+/// A fake root must not resolve inside the real app directory. Only a real
+/// directory that does not exist (`NotFound`) is known not to contain it;
+/// any other error resolving it refuses (round 29).
 #[cfg(feature = "fake")]
-fn refuse_overlap(root: &Path, real_app: Option<&Path>) -> Result<(), StorageError> {
+fn refuse_overlap(root: &Path, real_app: &Path) -> Result<(), StorageError> {
     let root = std::fs::canonicalize(root).map_err(StorageError::Root)?;
-    let real = real_app.and_then(|r| std::fs::canonicalize(r).ok());
-    match real {
-        Some(real) if root.starts_with(&real) => Err(StorageError::Overlap),
-        _ => Ok(()),
+    match std::fs::canonicalize(real_app) {
+        Ok(real) if root.starts_with(&real) => Err(StorageError::Overlap),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(StorageError::Overlap),
     }
 }
 
@@ -304,7 +312,16 @@ fn private_dir(path: &Path, name: &'static str, owner: u32) -> Result<(), Storag
 /// The core cache config for a location, or `None` (logged): the run then
 /// goes on without a disk cache.
 pub(crate) fn config(location: Result<CacheLocation, StorageError>) -> Option<CacheConfig> {
-    match location.and_then(|l| prepare(&l)) {
+    let prepared = location.and_then(|l| {
+        let dir = prepare(&l)?;
+        #[cfg(feature = "fake")]
+        if l.fake.is_some() {
+            // One fake cache per process; a second `set` cannot happen.
+            let _ = FAKE_RUN.set((l.parent(), dir.clone()));
+        }
+        Ok(dir)
+    });
+    match prepared {
         Ok(dir) => {
             tracing::info!("disk cache enabled");
             Some(CacheConfig { dir })
@@ -312,6 +329,43 @@ pub(crate) fn config(location: Result<CacheLocation, StorageError>) -> Option<Ca
         Err(error) => {
             tracing::warn!(%error, "no disk cache this run");
             None
+        }
+    }
+}
+
+/// This process's fake run directory and its cache directory, once the
+/// fake cache is configured.
+#[cfg(feature = "fake")]
+static FAKE_RUN: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+/// How long quit waits for the fake cache's workers before cleaning up
+/// (GPUI gives `on_app_quit` 200 ms).
+#[cfg(feature = "fake")]
+const CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// At quit, after `begin_exit`: removes this run's fake cache directory
+/// once no worker has it open (round 29, finding 2). Best effort: a cache
+/// still open after [`CLEANUP_WAIT`] (an OS quit before core's ack) keeps
+/// the directory, which is never reused (each run creates its own).
+#[cfg(feature = "fake")]
+pub(crate) fn remove_fake_run() {
+    if let Some((run, cache)) = FAKE_RUN.get() {
+        remove_run(run, cache, CLEANUP_WAIT);
+    }
+}
+
+/// Removes `run` once nothing has `cache` open within `wait`; whether it
+/// was removed. `remove_dir_all` removes links, never their targets.
+#[cfg(feature = "fake")]
+fn remove_run(run: &Path, cache: &Path, wait: std::time::Duration) -> bool {
+    if !abyss_core::cache::wait_closed(Some(cache), wait) {
+        tracing::warn!("the fake cache is still open; its run directory is kept");
+        return false;
+    }
+    match std::fs::remove_dir_all(run) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "could not remove the fake run directory");
+            false
         }
     }
 }
