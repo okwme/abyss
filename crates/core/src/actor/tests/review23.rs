@@ -2,12 +2,19 @@
 //! caches alongside network retirement, not after it, and admits no new
 //! cache open while it runs.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use zeroize::Zeroizing;
+
 use super::{CacheDir, Setup, chat, start};
+use crate::actor::logout::{erase_cache, open_cache};
 use crate::api::{Command, HistoryDir};
 use crate::backend::fake::{FakeBackend, FakeScript, QuitBehavior};
 use crate::cache::{Cache, CacheError, CacheKey, Refused, wait_closed};
+use crate::secret::{MemoryStore, SecretItem, SecretStore, StoreError};
+use crate::session::PersistHandle;
 
 /// Finding 3: with a runner that ignores quit, retirement runs to its 2 s
 /// cap. The cache must be closed well before that, while admission to its
@@ -51,55 +58,82 @@ async fn shutdown_closes_the_cache_while_retirement_still_runs() {
     assert!(matches!(after.await.unwrap(), Err(CacheError::WrongKey)));
 }
 
-/// Round 24 (the round 23 gap without a test): `erase_cache` keeps the
-/// cache's directory in the census from before the old cache closes until
-/// the new one is open, so a drain cannot finish in between. A sampler
-/// reads the census as fast as it can for the whole erase-and-reopen and
-/// must never see it empty. The gap it would see without the hold spans a
-/// worker join and a persistence round trip, so the sampler catches it
-/// reliably (and with the hold, it can never fail spuriously).
+/// A store whose cache-key reads can be paused: once armed, the next read
+/// of `SecretItem::CacheKey` reports on `entered` and waits for `release`.
+struct GatedStore {
+    inner: MemoryStore,
+    gate: Arc<KeyGate>,
+}
+
+struct KeyGate {
+    armed: AtomicBool,
+    entered: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl SecretStore for GatedStore {
+    fn get(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        if item == SecretItem::CacheKey && self.gate.armed.swap(false, Ordering::SeqCst) {
+            self.gate.entered.lock().unwrap().send(()).unwrap();
+            self.gate.release.lock().unwrap().recv().unwrap();
+        }
+        self.inner.get(item)
+    }
+
+    fn set(&self, item: SecretItem, secret: &[u8]) -> Result<(), StoreError> {
+        self.inner.set(item, secret)
+    }
+
+    fn delete(&self, item: SecretItem) -> Result<(), StoreError> {
+        self.inner.delete(item)
+    }
+}
+
+/// Round 24's test, made deterministic in round 27: `erase_cache` keeps
+/// the cache's directory in the census from before the old cache closes
+/// until the new one is open, so a drain cannot finish in between. The real
+/// `open_cache` and `erase_cache` run over a store that pauses the reopen's
+/// cache-key read, which comes after the old worker has closed its database
+/// and been joined. While paused, the census must still list the
+/// directory. Without the hold it is empty there, every time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn erase_and_reopen_never_leave_the_census_empty() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    use crate::actor::logout::{erase_cache, open_cache};
-    use crate::secret::MemoryStore;
-    use crate::session::PersistHandle;
-
     let dir = CacheDir::new();
-    let persist = PersistHandle::spawn(MemoryStore::new()).unwrap();
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let gate = Arc::new(KeyGate {
+        armed: AtomicBool::new(false),
+        entered: Mutex::new(entered_tx),
+        release: Mutex::new(release_rx),
+    });
+    let store = GatedStore {
+        inner: MemoryStore::new(),
+        gate: Arc::clone(&gate),
+    };
+    let persist = PersistHandle::spawn(store).unwrap();
     let (handle, key) = open_cache(&persist, dir.path().to_path_buf())
         .await
         .unwrap();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let empty = Arc::new(AtomicUsize::new(0));
-    let sampler = {
-        let (stop, empty) = (Arc::clone(&stop), Arc::clone(&empty));
-        let path = dir.path().to_path_buf();
-        std::thread::spawn(move || {
-            let mut looks = 0_u64;
-            while !stop.load(Ordering::SeqCst) && looks < 100_000_000 {
-                if wait_closed(Some(&path), Duration::ZERO) {
-                    empty.fetch_add(1, Ordering::SeqCst);
-                }
-                looks += 1;
-            }
-            looks
-        })
-    };
-    let (erased, reopened) =
-        erase_cache(&persist, Some(handle), dir.path().to_path_buf(), Some(key)).await;
-    stop.store(true, Ordering::SeqCst);
-    let looked = sampler.join().unwrap();
+    gate.armed.store(true, Ordering::SeqCst);
+    let path = dir.path().to_path_buf();
+    let erasing =
+        tokio::spawn(async move { erase_cache(&persist, Some(handle), path, Some(key)).await });
+    let path = dir.path().to_path_buf();
+    let drained_while_paused = tokio::task::spawn_blocking(move || {
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let drained = wait_closed(Some(&path), Duration::ZERO);
+        release.send(()).unwrap();
+        drained
+    })
+    .await
+    .unwrap();
+    let (erased, reopened) = erasing.await.unwrap();
+    assert!(
+        !drained_while_paused,
+        "the census drained between the old cache's close and the reopen"
+    );
     assert!(erased.is_ok());
     let (handle, _key) = reopened.expect("a fresh cache for the next account");
-    assert!(looked > 0);
-    assert_eq!(
-        empty.load(Ordering::SeqCst),
-        0,
-        "the census drained between close and reopen"
-    );
     handle.close().await.unwrap();
 }

@@ -1,5 +1,6 @@
 //! Which cache databases are open, by directory, and SQLCipher's lifetime
-//! around process exit (plan section 13, exit SIGSEGV fix and round 23).
+//! around process exit (plan section 13, exit SIGSEGV fix; rounds 23, 24
+//! and 27).
 //!
 //! SQLCipher tears down its global state (crypto provider, private heap) in
 //! an exit-time handler (`sqlcipher_atexit`, plus a `__mod_term_func`). A
@@ -25,9 +26,21 @@
 //! - The exit hook closes admission and waits, bounded, for every entry. If
 //!   one is still open at the deadline, it ends the process with `_exit`
 //!   rather than return into SQLCipher's teardown.
+//!
+//! Process exit uses only two static atomics, [`EXITING`] and [`OPEN`]
+//! (round 27). Neither needs initializing or allocating, and neither can
+//! block. Their protocol (all `SeqCst`):
+//! - `enter` loads `EXITING` and, if it is clear, increments `OPEN`.
+//! - The exit hook stores `EXITING` and then loads `OPEN`.
+//!
+//! In any total order of those four operations, either `enter` sees
+//! `EXITING` (and refuses), or the hook sees the increment (and waits). The
+//! per-directory lists stay under the [`STATE`] mutex, which process exit
+//! never takes.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use rusqlite::ffi;
@@ -41,9 +54,9 @@ pub const EXIT_CACHE_BUSY: i32 = 75;
 /// one; tests use one per test. Beyond this, opens are refused.
 const MAX_DIRS: usize = 256;
 /// How often the exit hook looks at the census again.
-const LOCK_RETRY: Duration = Duration::from_millis(1);
+const POLL: Duration = Duration::from_millis(1);
 /// Upper bound on those looks (the deadline ends them first).
-const MAX_LOCK_TRIES: u32 = 10_000;
+const MAX_POLLS: u32 = 10_000;
 
 #[derive(Debug)]
 struct State {
@@ -52,17 +65,19 @@ struct State {
     /// Directories whose admission is closed, with how many closers hold
     /// each (core shutdowns in progress).
     closed: Vec<(PathBuf, usize)>,
-    /// Process exit has begun: nothing is admitted any more. Never reset.
-    exiting: bool,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
     open: Vec::new(),
     closed: Vec::new(),
-    exiting: false,
 });
 static CLOSED: Condvar = Condvar::new();
 static INIT: OnceLock<Result<(), InitError>> = OnceLock::new();
+/// Process exit has begun: nothing is admitted any more. Never reset.
+static EXITING: AtomicBool = AtomicBool::new(false);
+/// Entries open in every directory: the sum of `State::open`. Changed only
+/// under `STATE`, read without it by the exit hook.
+static OPEN: AtomicUsize = AtomicUsize::new(0);
 
 fn lock() -> MutexGuard<'static, State> {
     // The state is updated in single steps, so a panic elsewhere never
@@ -119,6 +134,10 @@ fn init_once() -> Result<(), InitError> {
         tracing::error!(rc, "SQLite failed to initialize; running without a cache");
         return Err(InitError::Sqlite(rc));
     }
+    // The exit hook never takes `STATE`, but warm it anyway: std's mutex
+    // may allocate its OS lock lazily on first use, and anything that
+    // touches the census near exit should not be the first to do so.
+    drop(lock());
     // SAFETY: `exit_hook` is an `extern "C" fn()` that never unwinds (its
     // body runs under `catch_unwind`), as `atexit` requires.
     let rc = unsafe { libc::atexit(exit_hook) };
@@ -141,12 +160,12 @@ pub(crate) struct Open {
 
 impl Open {
     /// Admits one more thread to the cache at `dir`, unless admission is
-    /// closed. Atomic with [`begin_exit`] and [`close_admission`]: after
-    /// either, no entry is ever admitted.
+    /// closed. Atomic with [`begin_exit`] (see the module docs) and with
+    /// [`close_admission`] (same lock): after either, no entry is admitted.
     pub(crate) fn enter(dir: &Path) -> Result<Self, Refused> {
         let mut state = lock();
         let closed = state.closed.iter().any(|(d, _)| d == dir);
-        if state.exiting || closed {
+        if EXITING.load(Ordering::SeqCst) || closed {
             return Err(Refused::Closing);
         }
         let full = state.open.len() >= MAX_DIRS;
@@ -155,6 +174,7 @@ impl Open {
             None if full => return Err(Refused::Full),
             None => state.open.push((dir.to_path_buf(), 1)),
         }
+        OPEN.fetch_add(1, Ordering::SeqCst);
         Ok(Self {
             dir: dir.to_path_buf(),
         })
@@ -172,6 +192,7 @@ impl Drop for Open {
             if left == 0 {
                 state.open.swap_remove(i);
             }
+            OPEN.fetch_sub(1, Ordering::SeqCst);
         }
         drop(state);
         CLOSED.notify_all();
@@ -223,9 +244,10 @@ impl Drop for AdmissionClosed {
 
 /// Closes admission to every cache for the rest of the process: process
 /// exit has begun. Open caches keep working until they close. Called by the
-/// exit hook, and earlier by the app when it starts to quit.
+/// exit hook, and earlier by the app when it starts to quit. Never blocks
+/// and never allocates: one atomic store (round 27).
 pub fn begin_exit() {
-    lock().exiting = true;
+    EXITING.store(true, Ordering::SeqCst);
 }
 
 fn any_open(state: &State, dir: Option<&Path>) -> bool {
@@ -259,37 +281,30 @@ pub fn wait_closed(dir: Option<&Path>, timeout: Duration) -> bool {
     drain(lock(), dir, Instant::now() + timeout)
 }
 
-/// The census lock if it is free right now. Never blocks.
-fn try_lock_now() -> Option<MutexGuard<'static, State>> {
-    match STATE.try_lock() {
-        Ok(state) => Some(state),
-        Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
-        Err(TryLockError::WouldBlock) => None,
-    }
-}
-
 /// Closes admission and polls, bounded by [`EXIT_WAIT`], until every open
 /// cache has closed. Whether they all did.
 ///
-/// It never blocks on the census lock: each look is a `try_lock`, and the
-/// guard is dropped before it sleeps. (A condvar wait would re-acquire the
-/// lock after its timeout with no bound, round 24.) Whoever holds the lock,
-/// for however long, the hook returns by the deadline plus one
-/// [`LOCK_RETRY`]. It also never logs: a log write can block on a full or
-/// locked stderr, which would hold up `_exit` indefinitely.
+/// It touches only the static atomics `EXITING` and `OPEN`, the monotonic
+/// clock and `nanosleep`: no lock, no allocation, no logging. So nothing
+/// another thread holds can delay it, and nothing it does can block. (A
+/// condvar wait would re-acquire the lock after its timeout with no bound,
+/// round 24; a log write can block on a full or locked stderr, round 24;
+/// std's mutex may allocate on first use, round 27.) It returns no earlier
+/// than the deadline, and later only by how far one `sleep(POLL)` and the
+/// scheduler overshoot it.
 fn drain_at_exit() -> bool {
+    #[cfg(test)]
+    tests::drain_started();
     let deadline = Instant::now() + EXIT_WAIT;
-    for _ in 0..MAX_LOCK_TRIES {
-        if let Some(mut state) = try_lock_now() {
-            state.exiting = true;
-            if state.open.is_empty() {
-                return true;
-            }
+    begin_exit();
+    for _ in 0..MAX_POLLS {
+        if OPEN.load(Ordering::SeqCst) == 0 {
+            return true;
         }
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(LOCK_RETRY);
+        std::thread::sleep(POLL);
     }
     false
 }
@@ -302,18 +317,15 @@ fn drain_at_exit() -> bool {
 ///   body runs under `catch_unwind`. A caught panic counts as "not
 ///   drained", and its payload is forgotten, never dropped, because a
 ///   payload destructor could panic again outside the catch.
-/// - The wait is bounded by [`EXIT_WAIT`]: every lock acquisition is a
-///   non-blocking `try_lock` ([`drain_at_exit`]), so exit never hangs on a
-///   held lock.
-/// - Nothing between the deadline and `_exit` can block: the hook does not
-///   log (stderr may be a full pipe or locked). Exit status
-///   [`EXIT_CACHE_BUSY`] is the diagnostic.
+/// - It is bounded by [`EXIT_WAIT`] and cannot block: see
+///   [`drain_at_exit`]. It neither locks nor allocates nor logs. Exit
+///   status [`EXIT_CACHE_BUSY`] is the diagnostic.
 /// - `exit` is called by the main thread (GPUI's terminate, or `main`
-///   returning in tests), which never holds the census lock or an entry:
-///   caches are opened and closed on core's runtime, blocking and
-///   `abyss-cache` threads, and no cache code calls `exit`. Were a thread
-///   holding an entry to call `exit` anyway, the wait would time out on its
-///   own entry and end in `_exit` below: a delay, not a crash or a hang.
+///   returning in tests), which never holds an entry: caches are opened and
+///   closed on core's runtime, blocking and `abyss-cache` threads, and no
+///   cache code calls `exit`. Were a thread holding an entry to call `exit`
+///   anyway, the wait would time out on its own entry and end in `_exit`
+///   below: a delay, not a crash or a hang.
 /// - If anything is still open at the deadline, returning would run
 ///   SQLCipher's teardown under a live connection. So it ends the process
 ///   with `_exit(EXIT_CACHE_BUSY)` instead. That skips the remaining
@@ -321,11 +333,16 @@ fn drain_at_exit() -> bool {
 ///   stderr). SQLite durability is unaffected: committed transactions are
 ///   durable, and the WAL is recovered on the next open.
 extern "C" fn exit_hook() {
+    #[cfg(test)]
+    tests::forbid_allocation();
     let outcome = std::panic::catch_unwind(drain_at_exit);
     #[cfg(test)]
     tests::probe_at_exit();
     match outcome {
-        Ok(true) => {}
+        Ok(true) => {
+            #[cfg(test)]
+            tests::allow_allocation();
+        }
         Ok(false) => abandon_exit(),
         Err(payload) => {
             std::mem::forget(payload);
