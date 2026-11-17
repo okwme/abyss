@@ -1245,6 +1245,10 @@ Open items:
   - **Low (pre-existing):** a rebuild abandoned a running user load without an answer. `begin_retire` returned only obligations it found in the queues, while a `LoadOlder` holding a permit was cancelled and its stale result ignored. Fix: retirement takes the owed load, queued or running (`Owed` now carries the direction), and answers it once with `LoadEnded { error: Busy }`. Nothing answers it again.
   - Choice: protecting the open window, rather than propagating evictions to the actor and resetting its view. That keeps one invariant (the open chat always has a window) instead of a new reset path. The full justification is in section 13.
 
+
+- **Round 22 (re-check of task 10g, 2026-11-17).** Fixed by the coordinator:
+  - **Low:** a `LoadOlder` deferred behind a running tail stayed pending through failed rebuilds. `begin_retire` took `owed` but left `deferred`, which `run_deferred_loads` then promoted to a queued load for an instance that never arrived. Fix: `begin_retire` drains the deferred loads along with `owed` and returns the distinct targets (at most `1 + MAX_DEFERRED`), and a rebuild answers each with `LoadEnded { error: Busy }`. Drained loads never start. Test: `review10g.rs::a_deferred_older_load_is_answered_by_a_stalled_rebuild`, which fails without the fix.
+  - Confirmed clean: the shown-window protection and its bound (an oversized message or tail is trimmed, possibly to an empty retained window), `shown`/`open` sync on every path, and owed loads at retirement, queued or running.
 - **Round 15 (re-check of task 6c, 2026-11-17).** All fixed in task 6d (section 13):
   - The incomplete-logout state was not durable: after a failed remote logout and a failed session delete, a restart signed the old account back in. A logout-pending marker must be recorded before any side effect, checked before the session, cache or client, fail closed when unreadable, and be cleared only after both deletions.
   - **High:** the UI kept account A's messages and draft after logout, so account B could see them under a shared peer id.

@@ -125,3 +125,48 @@ async fn a_running_older_load_abandoned_by_a_rebuild_is_answered_once() {
     assert!(older(&ev), "{ev:?}");
     h.stop().await;
 }
+
+/// Round 22 (re-check of task 10g): a `LoadOlder` deferred behind a running
+/// tail when the stream fails. Retirement used to answer only the owed
+/// load; the deferred one was promoted right after, queued for an instance
+/// that failing builds never deliver, and the UI stayed pending until a
+/// rebuild finally succeeded. Now retirement answers it with `Busy` before
+/// recovery.
+#[tokio::test(start_paused = true)]
+async fn a_deferred_older_load_is_answered_by_a_stalled_rebuild() {
+    let mut h = harness(FakeScript::demo(2, 200), None).await;
+    h.online().await;
+    open(&mut h, chat(1)).await;
+    open(&mut h, chat(2)).await;
+    // Chat 1's retained window refreshes its tail slowly on reopening.
+    h.fake.lead(Op::History, Duration::from_secs(10));
+    h.send(Command::OpenChat(chat(1))).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let before = h.fake.calls(Op::History);
+    h.send(Command::LoadOlder(chat(1))).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        h.fake.calls(Op::History),
+        before,
+        "deferred behind the tail"
+    );
+    for _ in 0..3 {
+        h.fake
+            .on_next_build(BuildFault::Fail(BackendError::Transient));
+    }
+    h.fake.stream_error(StreamError::Fatal).await;
+    let (ev, skipped) = h
+        .until(|e| ended(e) || matches!(e, Event::Connection(ConnState::Online)))
+        .await;
+    assert!(
+        matches!(
+            ev,
+            Event::LoadEnded {
+                error: Some(UserError::Busy),
+                ..
+            }
+        ),
+        "answered before recovery: {ev:?} after {skipped:?}"
+    );
+    h.stop().await;
+}

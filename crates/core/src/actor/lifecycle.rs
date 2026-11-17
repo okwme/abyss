@@ -488,9 +488,10 @@ impl<B: Backend> Actor<B> {
             return;
         };
         let after = self.after_for(reason);
-        if let Some((chat, dir)) = self.begin_retire() {
-            // The UI keeps its window across a rebuild: tell it the load it
-            // waits on is gone, so its backoff and Retry take over (round 20).
+        for (chat, dir) in self.begin_retire() {
+            // The UI keeps its window across a rebuild: tell it the loads it
+            // waits on are gone, so its backoff and Retry take over (rounds
+            // 20 and 22).
             self.history_ended(chat, dir, Some(UserError::Busy)).await;
         }
         self.life.phase = Phase::Retiring(after);
@@ -523,11 +524,13 @@ impl<B: Backend> Actor<B> {
 
     /// Rebuild step 1: stop admission and make every completion of the old
     /// instance stale. Parked permits stay parked until retirement completes.
-    /// Returns the load the UI waits on, which retirement abandons whether
-    /// it was queued or running (its late result is stale), if any. It is
-    /// taken here, so nothing answers it again (task 10g).
+    /// Returns the loads the UI waits on, which retirement abandons: the
+    /// owed one, queued or running (its late result is stale), and the
+    /// deferred ones, which could only queue for an instance that may never
+    /// come (round 22). Each is taken here, so nothing answers or starts it
+    /// again (task 10g). Distinct, at most `1 + MAX_DEFERRED`.
     #[must_use]
-    pub(super) fn begin_retire(&mut self) -> Option<(ChatId, HistoryDir)> {
+    pub(super) fn begin_retire(&mut self) -> Vec<(ChatId, HistoryDir)> {
         self.cgen = ClientGen(self.cgen.0 + 1);
         self.boot = None;
         self.life.timeouts.clear();
@@ -535,7 +538,15 @@ impl<B: Backend> Actor<B> {
         self.dialogs_busy = false;
         self.dialogs_queued = false;
         self.purge_queued();
-        self.owed.take().map(|o| (o.load.chat, o.dir))
+        let mut waiting = Vec::with_capacity(self.deferred.len().saturating_add(1));
+        let owed = self.owed.take().map(|o| (o.load.chat, o.dir));
+        let deferred = self.deferred.drain(..).map(|d| (d.chat, d.dir));
+        for target in owed.into_iter().chain(deferred) {
+            if !waiting.contains(&target) {
+                waiting.push(target);
+            }
+        }
+        waiting
     }
 
     async fn finish_retire(&mut self, retired: Retired, after: After) {
