@@ -1,19 +1,21 @@
-//! Census and exit-hook tests (rounds 23, 24, 27). Process exit and
+//! Census and exit-hook tests (rounds 23, 24, 27, 30). Process exit and
 //! `begin_exit` are one-way, so those run in a child process: this test
 //! binary, re-run on one test (`child`) with `CHILD` naming the scenario.
 //!
 //! The child reports progress as `CENSUS:<marker>` lines written straight to
-//! fd 1 (past libtest's capture). The parent starts timing at `ready`, so
-//! the child's start-up and the parent's scheduling are not measured. A
+//! fd 1 (past libtest's capture). A child that exits does so only after the
+//! parent has read `ready` and acknowledged it on the child's stdin; the
+//! parent times from that acknowledgement, so the child's start-up is not
+//! measured and its exit always is (round 30). A
 //! regression shows as a child that never exits (a persistently blocked
 //! condition), caught by a generous watchdog, not as a few seconds of
 //! difference.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{
@@ -42,6 +44,16 @@ static FORBID: AtomicBool = AtomicBool::new(false);
 /// The hook's drain panics with a payload whose destructor panics.
 static PANIC_IN_DRAIN: AtomicBool = AtomicBool::new(false);
 static DRAIN_STARTED: AtomicBool = AtomicBool::new(false);
+/// The next `enter` pauses between its reservation and its check.
+static PAUSE_IN_ENTER: AtomicBool = AtomicBool::new(false);
+/// An `enter` is paused there.
+static PAUSED: AtomicBool = AtomicBool::new(false);
+/// The paused `enter` may go on.
+static RESUME: AtomicBool = AtomicBool::new(false);
+/// How many times a drain has loaded `OPEN`.
+static POLLS: AtomicUsize = AtomicUsize::new(0);
+/// Bound on the 1 ms waits of the interleaving scenario.
+const MAX_WAITS: u32 = 60_000;
 
 /// The test binary's allocator: the system's, except that it ends the
 /// process with `ALLOCATED_IN_HOOK` when asked to allocate while
@@ -114,6 +126,31 @@ pub(super) fn drain_started() {
     }
 }
 
+/// Waits, in 1 ms steps, until `flag` is set.
+fn wait_for(flag: &AtomicBool) {
+    for _ in 0..MAX_WAITS {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("timed out waiting for a flag");
+}
+
+/// Called by `enter` between its reservation and its check of `EXITING`.
+/// When armed, pauses the first caller there until `RESUME`.
+pub(super) fn between_reserve_and_check() {
+    if PAUSE_IN_ENTER.swap(false, Ordering::SeqCst) {
+        PAUSED.store(true, Ordering::SeqCst);
+        wait_for(&RESUME);
+    }
+}
+
+/// Called by the exit drain right after each load of `OPEN`.
+pub(super) fn polled() {
+    POLLS.fetch_add(1, Ordering::SeqCst);
+}
+
 unsafe extern "C" {
     /// SQLCipher's default provider; `NULL` once `sqlcipher_extra_shutdown`
     /// has run (SQLCipher 4.20.0, `sqlcipher.c`).
@@ -152,7 +189,10 @@ struct Run {
     code: Option<i32>,
     /// Markers in the order reported.
     markers: Vec<String>,
-    /// From `ready` to exit.
+    /// From the parent's acknowledgement of `ready` to exit. A child that
+    /// exits waits for that acknowledgement first (round 30), so its exit,
+    /// hook included, lies inside this span however late the parent reads
+    /// `ready`.
     after_ready: Duration,
 }
 
@@ -161,39 +201,42 @@ fn run(scenario: &str) -> Run {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "cache::census::tests::child", "--test-threads=1"])
         .env(CHILD, scenario)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in std::io::BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             if let Some((_, marker)) = line.split_once("CENSUS:") {
-                let _ = tx.send((marker.to_owned(), Instant::now()));
+                let _ = tx.send(marker.to_owned());
             }
         }
     });
     let mut markers = Vec::new();
-    let mut ready = None;
-    while ready.is_none() {
-        match rx.recv_timeout(READY_WATCHDOG) {
-            Ok((marker, at)) => {
-                if marker == "ready" {
-                    ready = Some(at);
-                }
-                markers.push(marker);
-            }
-            Err(_) => break,
-        }
+    let mut ready = false;
+    while !ready {
+        let Ok(marker) = rx.recv_timeout(READY_WATCHDOG) else {
+            break;
+        };
+        ready = marker == "ready";
+        markers.push(marker);
     }
-    let start = ready.unwrap_or_else(Instant::now);
+    let start = Instant::now();
+    if ready {
+        // A child that never waits for it may be gone already.
+        let _ = stdin.write_all(b"go\n");
+    }
+    drop(stdin);
     let code = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status.code();
         }
-        if ready.is_none() || start.elapsed() > EXIT_WATCHDOG {
+        if !ready || start.elapsed() > EXIT_WATCHDOG {
             child.kill().unwrap();
             child.wait().unwrap();
             break None;
@@ -202,12 +245,20 @@ fn run(scenario: &str) -> Run {
     };
     let after_ready = start.elapsed();
     reader.join().unwrap();
-    markers.extend(rx.try_iter().map(|(marker, _)| marker));
+    markers.extend(rx.try_iter());
     Run {
         code,
         markers,
         after_ready,
     }
+}
+
+/// Child side: blocks until the parent acknowledges `ready`.
+fn wait_for_go() {
+    let mut byte = [0_u8; 1];
+    // SAFETY: reads at most one byte into the live buffer `byte`.
+    let n = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
+    assert_eq!(n, 1, "the parent acknowledged ready");
 }
 
 /// Holds a census entry on another thread for the rest of the process.
@@ -225,30 +276,48 @@ fn hold_an_entry_forever() {
 }
 
 /// Takes the census lock on another thread (once `after` returns), reports
-/// `held`, and keeps it for the rest of the process.
-fn hold_the_lock_forever(after: impl FnOnce() + Send + 'static) {
+/// `held`, then acknowledges on the returned channel while still holding
+/// it (round 30: the marker is written before anything can end the
+/// child), and keeps it for the rest of the process.
+fn hold_the_lock_forever(after: impl FnOnce() + Send + 'static) -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         after();
         let _state = super::lock();
         signal("held");
+        let _ = tx.send(());
         loop {
             std::thread::park();
         }
     });
+    rx
 }
 
-/// Returns once another thread holds the census lock.
-fn wait_until_the_lock_is_held() {
-    for _ in 0..100_000 {
-        if matches!(
-            super::STATE.try_lock(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ) {
-            return;
+/// The round 30 interleaving: an `enter` reserves, then pauses before its
+/// check; a drain stores `EXITING` and loads `OPEN` (at least once) in that
+/// gap; then the `enter` goes on. The drain must have seen the reservation,
+/// so it cannot have finished, and the `enter` must refuse. Then the drain
+/// finishes, since the refusal gave the count back.
+fn reserve_race_child() {
+    signal("ready");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    PAUSE_IN_ENTER.store(true, Ordering::SeqCst);
+    let entering = std::thread::spawn(move || Open::enter(&path).err());
+    wait_for(&PAUSED);
+    let draining = std::thread::spawn(super::drain_at_exit);
+    for _ in 0..MAX_WAITS {
+        if POLLS.load(Ordering::SeqCst) > 0 {
+            break;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    panic!("the lock was never taken");
+    assert!(POLLS.load(Ordering::SeqCst) > 0, "the drain polled");
+    assert!(!draining.is_finished(), "the drain saw the reservation");
+    RESUME.store(true, Ordering::SeqCst);
+    assert_eq!(entering.join().unwrap(), Some(Refused::Closing));
+    assert!(draining.join().unwrap(), "the drain finished");
+    assert!(census_empty(dir.path()));
 }
 
 /// Fills stderr (a pipe nobody reads) until a write would block, then makes
@@ -285,6 +354,9 @@ fn child() {
     if scenario == "closed" {
         return closed_child();
     }
+    if scenario == "reserve-race" {
+        return reserve_race_child();
+    }
     match scenario.as_str() {
         "order" => PROBE.store(true, Ordering::SeqCst),
         "idle" => GUARD_ARMED.store(true, Ordering::SeqCst),
@@ -303,17 +375,10 @@ fn child() {
         }
         "busy-locked" => {
             hold_an_entry_forever();
-            hold_the_lock_forever(|| {
-                while !DRAIN_STARTED.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            });
+            drop(hold_the_lock_forever(|| wait_for(&DRAIN_STARTED)));
         }
         "begin-exit-locked" => {
-            let (tx, rx) = std::sync::mpsc::channel();
-            hold_the_lock_forever(move || tx.send(()).unwrap());
-            rx.recv().unwrap();
-            wait_until_the_lock_is_held();
+            hold_the_lock_forever(|| {}).recv().unwrap();
             signal("ready");
             begin_exit();
             signal("begun");
@@ -324,6 +389,7 @@ fn child() {
         other => panic!("unknown scenario {other}"),
     }
     signal("ready");
+    wait_for_go();
     std::process::exit(0);
 }
 
@@ -404,6 +470,15 @@ fn begin_exit_does_not_wait_for_the_census_lock() {
     for marker in ["held", "ready", "begun"] {
         assert!(run.markers.iter().any(|m| m == marker), "{run:?}");
     }
+}
+
+/// Round 30, finding 1: an `enter` that reserved before the exit drain
+/// stored `EXITING` is counted by it, and refuses. With round 27's order
+/// (check, then count) the drain finishes in the gap and the `enter` is
+/// admitted uncounted.
+#[test]
+fn an_enter_racing_the_exit_drain_is_counted_or_refused() {
+    assert_eq!(run("reserve-race").code, Some(0));
 }
 
 /// Round 27: a panic inside the hook ends the process with

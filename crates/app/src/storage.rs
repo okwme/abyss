@@ -316,8 +316,7 @@ pub(crate) fn config(location: Result<CacheLocation, StorageError>) -> Option<Ca
         let dir = prepare(&l)?;
         #[cfg(feature = "fake")]
         if l.fake.is_some() {
-            // One fake cache per process; a second `set` cannot happen.
-            let _ = FAKE_RUN.set((l.parent(), dir.clone()));
+            start_fake_cleanup(l.parent(), dir.clone());
         }
         Ok(dir)
     });
@@ -333,23 +332,59 @@ pub(crate) fn config(location: Result<CacheLocation, StorageError>) -> Option<Ca
     }
 }
 
-/// This process's fake run directory and its cache directory, once the
-/// fake cache is configured.
+/// A cleanup request: the worker answers on it once it is done.
 #[cfg(feature = "fake")]
-static FAKE_RUN: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
-/// How long quit waits for the fake cache's workers before cleaning up
-/// (GPUI gives `on_app_quit` 200 ms).
+type CleanupDone = futures::channel::oneshot::Sender<()>;
+
+/// Wakes this process's fake cleanup worker, once the fake cache is
+/// configured (round 30).
+#[cfg(feature = "fake")]
+static FAKE_CLEANUP: std::sync::OnceLock<std::sync::mpsc::SyncSender<CleanupDone>> =
+    std::sync::OnceLock::new();
+/// How long the cleanup worker waits for the fake cache's workers before it
+/// gives up (GPUI gives `on_app_quit` 200 ms in all).
 #[cfg(feature = "fake")]
 const CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// At quit, after `begin_exit`: removes this run's fake cache directory
-/// once no worker has it open (round 29, finding 2). Best effort: a cache
-/// still open after [`CLEANUP_WAIT`] (an OS quit before core's ack) keeps
-/// the directory, which is never reused (each run creates its own).
+/// Starts the worker that removes this run's fake directory `run` at quit,
+/// once nothing has `cache` open (round 29, finding 2). It sleeps until
+/// [`request_fake_cleanup`]. Without it (no thread), the directory is kept,
+/// with a warning; it is never reused (each run creates its own).
 #[cfg(feature = "fake")]
-pub(crate) fn remove_fake_run() {
-    if let Some((run, cache)) = FAKE_RUN.get() {
-        remove_run(run, cache, CLEANUP_WAIT);
+pub(crate) fn start_fake_cleanup(run: PathBuf, cache: PathBuf) {
+    let (wake, requests) = std::sync::mpsc::sync_channel::<CleanupDone>(1);
+    let worker = std::thread::Builder::new()
+        .name("abyss-fake-cleanup".into())
+        .spawn(move || {
+            if let Ok(done) = requests.recv() {
+                remove_run(&run, &cache, CLEANUP_WAIT);
+                let _ = done.send(());
+            }
+        });
+    match worker {
+        // One fake cache per process; a second `set` cannot happen.
+        Ok(_) => drop(FAKE_CLEANUP.set(wake)),
+        Err(error) => tracing::warn!(%error, "no fake cleanup; the run directory is kept"),
+    }
+}
+
+/// At quit, after `begin_exit`: asks the cleanup worker to remove the fake
+/// run directory, and returns at once (round 30). The census wait, the
+/// removal and any warning happen on the worker, never on the quit thread:
+/// none of them is bounded in wall-clock time (a held census lock, a slow
+/// disk, a blocked stderr). The returned future resolves when the worker is
+/// done, or at once without a worker; GPUI awaits it within its own
+/// 200 ms quit bound. Best effort: whatever is left when the process ends
+/// stays, as before.
+#[cfg(feature = "fake")]
+pub(crate) fn request_fake_cleanup() -> impl std::future::Future<Output = ()> + 'static {
+    let (done, finished) = futures::channel::oneshot::channel();
+    if let Some(wake) = FAKE_CLEANUP.get() {
+        // Full or gone: an earlier request is in hand, or the worker died.
+        let _ = wake.try_send(done);
+    }
+    async move {
+        let _ = finished.await;
     }
 }
 

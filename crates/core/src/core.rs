@@ -124,15 +124,11 @@ impl ShutdownReport {
     };
 }
 
-/// Cancels core when the last half of a handle is dropped.
-#[derive(Debug)]
-struct StopOnDrop(CancellationToken);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
+/// The UI's side of core's stop requests (round 30). Core cancels when a
+/// request arrives, or when every handle half holding one is dropped (the
+/// channel closes): see [`stop_on_request`]. Asking never takes the
+/// cancellation token's lock on the UI thread.
+type StopRequests = mpsc::Sender<()>;
 
 /// The command half of a [`CoreHandle`].
 #[derive(Debug)]
@@ -140,18 +136,17 @@ pub struct CoreSender {
     cmd: mpsc::Sender<Stamped>,
     /// The account epoch the UI has seen (stamped on each command).
     epoch: EpochObserver,
-    cancel: CancellationToken,
+    stop: StopRequests,
     done: Option<oneshot::Receiver<ShutdownReport>>,
     /// Control plane: never queued behind UI commands.
     internal: mpsc::Sender<Internal>,
-    _stop: Arc<StopOnDrop>,
 }
 
 /// The event half of a [`CoreHandle`].
 #[derive(Debug)]
 pub struct CoreEvents {
     events: EventReceiver,
-    _stop: Arc<StopOnDrop>,
+    _stop: StopRequests,
 }
 
 /// The UI's connection to core. Dropping it (both halves, once split) stops
@@ -183,15 +178,21 @@ impl CoreSender {
     }
 
     /// Asks core to stop. The receiver resolves when the core thread is done
-    /// (`None` if called twice).
+    /// (`None` if called twice). Never blocks on core: see [`Self::cancel`].
     pub fn begin_shutdown(&mut self) -> Option<oneshot::Receiver<ShutdownReport>> {
-        self.cancel.cancel();
+        self.cancel();
         self.done.take()
     }
 
-    /// Stops core without waiting for its report.
+    /// Asks core to stop, without waiting for its report. Safe on the UI
+    /// thread during quit (round 30): a `try_send` into a one-slot channel,
+    /// so it never waits for capacity or for core. A request already queued,
+    /// or a core already gone, makes it a no-op. The token is cancelled on
+    /// a core runtime thread. Not lock-free: waking that thread takes
+    /// tokio's scheduler locks for a queue push and an unpark, held by
+    /// other threads only for the same O(1) steps.
     pub fn cancel(&self) {
-        self.cancel.cancel();
+        let _ = self.stop.try_send(());
     }
 }
 
@@ -332,6 +333,8 @@ fn start_with<B: Backend>(
     let (events, events_rx) = events::channel();
     let (done_tx, done_rx) = oneshot::channel();
     let cancel = CancellationToken::new();
+    let (stop, stop_rx) = mpsc::channel(1);
+    let stopper = stop_on_request(stop_rx, cancel.clone());
     let boot = Boot {
         backend,
         persist,
@@ -339,13 +342,16 @@ fn start_with<B: Backend>(
         events,
         commands,
         internal,
-        cancel: cancel.clone(),
+        cancel,
     };
     std::thread::Builder::new()
         .name("abyss-core".into())
         .spawn(move || {
             let cache_dir = boot.cache.as_ref().map(|c| c.dir.clone());
             let report = runtime.block_on(async move {
+                // First, so a stop asked for before anything else runs
+                // still cancels startup.
+                drop(tokio::spawn(stopper));
                 // Shutdown during startup (a stalled Keychain read or
                 // prompt): nothing was confirmed. The persistence worker is
                 // its own thread, so its stalled call stays off this path.
@@ -363,21 +369,28 @@ fn start_with<B: Backend>(
         })
         .map_err(StartError::Thread)?;
     let epoch = events_rx.observer();
-    let stop = Arc::new(StopOnDrop(cancel.clone()));
     Ok(CoreHandle {
         sender: CoreSender {
             cmd: cmd_tx,
             epoch,
-            cancel,
+            stop: stop.clone(),
             done: Some(done_rx),
             internal: internal_tx,
-            _stop: Arc::clone(&stop),
         },
         events: CoreEvents {
             events: events_rx,
             _stop: stop,
         },
     })
+}
+
+/// Cancels core on the first stop request, or once every [`StopRequests`]
+/// sender is dropped (the UI dropped its handle). Runs on core's runtime,
+/// so the token's lock and the wakeups of everything waiting on it stay off
+/// the UI thread (round 30).
+async fn stop_on_request(mut requests: mpsc::Receiver<()>, cancel: CancellationToken) {
+    let _ = requests.recv().await;
+    cancel.cancel();
 }
 
 /// [`prepare`], abandoned when shutdown starts first (review round 8): the

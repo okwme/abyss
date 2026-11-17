@@ -89,19 +89,12 @@ impl Root {
             this.update(cx, |root, cx| root.request_close(window, cx))
                 .unwrap_or(true)
         });
-        // Every quit passes here: after core's ack, the UI's timeout, and an
-        // OS-initiated quit. No cache opens from now on; the exit hook then
-        // drains what is open, or ends the process with `_exit` rather than
-        // let SQLCipher tear down under a live connection (plan section 13).
         let on_app_quit = cx.on_app_quit(|root: &mut Root, _| {
-            abyss_core::cache::begin_exit();
-            if let State::Running(session) = &root.state {
-                session.cancel_core();
-            }
-            // After `begin_exit`, so nothing reopens it.
-            #[cfg(feature = "fake")]
-            crate::storage::remove_fake_run();
-            async {}
+            quit_signals(&|| {
+                if let State::Running(session) = &root.state {
+                    session.cancel_core();
+                }
+            })
         });
         Self {
             state,
@@ -179,6 +172,33 @@ pub(crate) fn open(launch: Result<Launch, LaunchError>, cx: &mut App) -> gpui::R
         }
     });
     Ok(())
+}
+
+/// The body of the quit callback. Every quit passes here: after core's ack,
+/// the UI's timeout, and an OS-initiated quit. It only signals, and returns
+/// at once (round 30):
+/// - [`abyss_core::cache::begin_exit`], an atomic store: no cache opens
+///   from now on. The exit hook then drains what is open, or ends the
+///   process with `_exit` rather than let SQLCipher tear down under a live
+///   connection (plan section 13).
+/// - `cancel_core`, a `try_send` of a stop request; core cancels on its
+///   own runtime thread.
+/// - In fake runs, a `try_send` that wakes the cleanup worker (after
+///   `begin_exit`, so nothing reopens the directory). The returned future
+///   waits for it, bounded by GPUI.
+///
+/// No lock we own, no file system call, no census wait and no logging runs
+/// here. What GPUI does around it (dropping windows, flushing effects,
+/// waiting up to 200 ms for these futures, `exit`) allocates and takes
+/// its own locks, and is not bounded by us.
+fn quit_signals(cancel_core: &dyn Fn()) -> impl Future<Output = ()> + use<> {
+    abyss_core::cache::begin_exit();
+    cancel_core();
+    #[cfg(feature = "fake")]
+    let cleanup = crate::storage::request_fake_cleanup();
+    #[cfg(not(feature = "fake"))]
+    let cleanup = std::future::ready(());
+    cleanup
 }
 
 #[cfg(test)]

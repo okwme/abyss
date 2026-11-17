@@ -138,6 +138,7 @@ mod fake {
     use crate::shell::session::Started;
     use crate::ui::text_input;
 
+    mod quit;
     mod review10e;
 
     fn open(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {

@@ -1,6 +1,6 @@
 //! Which cache databases are open, by directory, and SQLCipher's lifetime
-//! around process exit (plan section 13, exit SIGSEGV fix; rounds 23, 24
-//! and 27).
+//! around process exit (plan section 13, exit SIGSEGV fix; rounds 23, 24,
+//! 27 and 30).
 //!
 //! SQLCipher tears down its global state (crypto provider, private heap) in
 //! an exit-time handler (`sqlcipher_atexit`, plus a `__mod_term_func`). A
@@ -29,14 +29,22 @@
 //!
 //! Process exit uses only two static atomics, [`EXITING`] and [`OPEN`]
 //! (round 27). Neither needs initializing or allocating, and neither can
-//! block. Their protocol (all `SeqCst`):
-//! - `enter` loads `EXITING` and, if it is clear, increments `OPEN`.
-//! - The exit hook stores `EXITING` and then loads `OPEN`.
+//! block. Their protocol (all `SeqCst`), each side a store then a load:
+//! - `enter` increments `OPEN` (a reservation), then loads `EXITING`. If
+//!   it is set, `enter` gives the reservation back and refuses, before
+//!   anything touches SQLCipher.
+//! - The exit hook stores `EXITING`, then loads `OPEN`.
 //!
-//! In any total order of those four operations, either `enter` sees
-//! `EXITING` (and refuses), or the hook sees the increment (and waits). The
-//! per-directory lists stay under the [`STATE`] mutex, which process exit
-//! never takes.
+//! `SeqCst` puts all four in one total order consistent with each thread's
+//! program order. If `enter`'s load sees `EXITING` clear, that load comes
+//! before the hook's store, so `enter`'s increment, earlier still, comes
+//! before the hook's load: the hook sees the count and waits for the entry.
+//! Otherwise `enter` sees `EXITING` and refuses. Round 27 had `enter` load
+//! first and increment after, which let the hook's store and load both fall
+//! between them: an uncounted entry (round 30). A refused reservation can
+//! make the hook poll once more; it is never counted for longer than
+//! `enter` holds it. The per-directory lists stay under the [`STATE`]
+//! mutex, which process exit never takes.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -75,8 +83,9 @@ static CLOSED: Condvar = Condvar::new();
 static INIT: OnceLock<Result<(), InitError>> = OnceLock::new();
 /// Process exit has begun: nothing is admitted any more. Never reset.
 static EXITING: AtomicBool = AtomicBool::new(false);
-/// Entries open in every directory: the sum of `State::open`. Changed only
-/// under `STATE`, read without it by the exit hook.
+/// Entries open in every directory (the sum of `State::open`), plus
+/// reservations `enter` has not yet kept or given back. Changed only under
+/// `STATE`, read without it by the exit hook.
 static OPEN: AtomicUsize = AtomicUsize::new(0);
 
 fn lock() -> MutexGuard<'static, State> {
@@ -164,6 +173,10 @@ impl Open {
     /// [`close_admission`] (same lock): after either, no entry is admitted.
     pub(crate) fn enter(dir: &Path) -> Result<Self, Refused> {
         let mut state = lock();
+        // Reserve before checking (round 30): see the module docs.
+        let reservation = Reservation::take();
+        #[cfg(test)]
+        tests::between_reserve_and_check();
         let closed = state.closed.iter().any(|(d, _)| d == dir);
         if EXITING.load(Ordering::SeqCst) || closed {
             return Err(Refused::Closing);
@@ -174,10 +187,32 @@ impl Open {
             None if full => return Err(Refused::Full),
             None => state.open.push((dir.to_path_buf(), 1)),
         }
-        OPEN.fetch_add(1, Ordering::SeqCst);
+        reservation.keep();
         Ok(Self {
             dir: dir.to_path_buf(),
         })
+    }
+}
+
+/// One count in [`OPEN`], taken before `enter` checks [`EXITING`]. Dropped
+/// on every path that refuses (or unwinds), which gives the count back;
+/// kept, it becomes the entry's, given back by `Open`'s drop.
+struct Reservation(());
+
+impl Reservation {
+    fn take() -> Self {
+        OPEN.fetch_add(1, Ordering::SeqCst);
+        Self(())
+    }
+
+    fn keep(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        OPEN.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -277,8 +312,25 @@ fn drain(mut state: MutexGuard<'static, State>, dir: Option<&Path>, deadline: In
 /// `timeout` passes. Whether they all closed. Never call it on an async
 /// runtime thread. Pair it with closed admission ([`close_admission`],
 /// [`begin_exit`]) when nothing may open after it returns.
+///
+/// `timeout` bounds the waiting, not the call: the deadline is set before
+/// the census lock is taken, but taking it, at the start and again after
+/// each condvar wait, has no bound (a thread holding it stalls this one).
+/// So never call it on a thread that must stay responsive: the UI thread,
+/// a quit callback, or the exit path (round 30). Those use atomics only.
 pub fn wait_closed(dir: Option<&Path>, timeout: Duration) -> bool {
-    drain(lock(), dir, Instant::now() + timeout)
+    let deadline = Instant::now() + timeout;
+    drain(lock(), dir, deadline)
+}
+
+/// Test support for the app's quit regression (round 30), fake builds
+/// only: takes the census lock on a thread that then ends, so the lock
+/// stays held for the rest of the process. Every later census call other
+/// than [`begin_exit`] and the exit hook blocks forever.
+#[cfg(feature = "fake")]
+pub fn leak_lock_for_tests() {
+    let leaker = std::thread::spawn(|| std::mem::forget(lock()));
+    let _ = leaker.join();
 }
 
 /// Closes admission and polls, bounded by [`EXIT_WAIT`], until every open
@@ -292,13 +344,21 @@ pub fn wait_closed(dir: Option<&Path>, timeout: Duration) -> bool {
 /// std's mutex may allocate on first use, round 27.) It returns no earlier
 /// than the deadline, and later only by how far one `sleep(POLL)` and the
 /// scheduler overshoot it.
+///
+/// It stores `EXITING` before its first load of `OPEN`, the order the
+/// proof in the module docs needs. Once a load sees zero, the census stays
+/// empty: any later `enter` reserves after that load, so its check comes
+/// after the store and refuses (round 30).
 fn drain_at_exit() -> bool {
     #[cfg(test)]
     tests::drain_started();
     let deadline = Instant::now() + EXIT_WAIT;
     begin_exit();
     for _ in 0..MAX_POLLS {
-        if OPEN.load(Ordering::SeqCst) == 0 {
+        let open = OPEN.load(Ordering::SeqCst);
+        #[cfg(test)]
+        tests::polled();
+        if open == 0 {
             return true;
         }
         if Instant::now() >= deadline {

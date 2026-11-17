@@ -23,6 +23,9 @@ use zeroize::Zeroizing;
 
 mod census;
 mod worker;
+#[cfg(feature = "fake")]
+#[doc(hidden)]
+pub use census::leak_lock_for_tests;
 pub use census::{EXIT_CACHE_BUSY, EXIT_WAIT, InitError, Refused, begin_exit, init, wait_closed};
 pub(crate) use census::{close_admission, hold};
 pub use db::{Binding, Cache, EraseError};
