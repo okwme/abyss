@@ -53,6 +53,82 @@ fn run_child(scenario: &str) -> Option<i32> {
         .code()
 }
 
+/// Runs `child` for `scenario` with its stderr piped and never read, and
+/// waits at most `limit`. Its exit status (`None` if it had to be killed)
+/// and how long it ran.
+fn run_child_bounded(scenario: &str, limit: Duration) -> (Option<i32>, Duration) {
+    let started = std::time::Instant::now();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "cache::census::tests::child", "--test-threads=1"])
+        .env(CHILD, scenario)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    while started.elapsed() < limit {
+        if let Some(status) = child.try_wait().unwrap() {
+            return (status.code(), started.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    (None, started.elapsed())
+}
+
+/// Holds a census entry on another thread for the rest of the process.
+fn hold_an_entry_forever() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let dir = tempfile::tempdir().unwrap();
+        let _entry = Open::enter(dir.path()).unwrap();
+        tx.send(()).unwrap();
+        loop {
+            std::thread::park();
+        }
+    });
+    rx.recv().unwrap();
+}
+
+/// Fills stderr (a pipe nobody reads) until a write would block, then makes
+/// it blocking again: from now on every stderr write blocks forever.
+fn fill_stderr() {
+    // SAFETY: reads fd 2's status flags.
+    let flags = unsafe { libc::fcntl(2, libc::F_GETFL) };
+    assert!(flags >= 0);
+    // SAFETY: sets fd 2 non-blocking, so the fill below stops when full.
+    assert!(unsafe { libc::fcntl(2, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0);
+    let junk = [b'x'; 4096];
+    let mut full = false;
+    for _ in 0..100_000 {
+        // SAFETY: `junk` is a live buffer of `junk.len()` bytes.
+        let n = unsafe { libc::write(2, junk.as_ptr().cast(), junk.len()) };
+        if n < 0 {
+            full = true;
+            break;
+        }
+    }
+    // SAFETY: restores fd 2's original (blocking) flags.
+    assert!(unsafe { libc::fcntl(2, libc::F_SETFL, flags) } >= 0);
+    assert!(full, "stderr is a pipe that filled up");
+}
+
+/// Once the exit hook has closed admission (it is waiting), takes the
+/// census lock and holds it for 6 s, twice `EXIT_WAIT`.
+fn hold_the_lock_once_the_hook_waits() {
+    std::thread::spawn(|| {
+        for _ in 0..1_000_000 {
+            let state = super::lock();
+            if state.exiting {
+                std::thread::sleep(Duration::from_secs(6));
+                return;
+            }
+            drop(state);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+}
+
 /// The child side. Does nothing unless run by `run_child`.
 #[test]
 fn child() {
@@ -88,6 +164,21 @@ fn child() {
             rx.recv().unwrap();
             std::process::exit(0);
         }
+        "busy-stderr" => {
+            // Logs go to stderr, as in the app.
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+            hold_an_entry_forever();
+            fill_stderr();
+            std::process::exit(0);
+        }
+        "busy-locked" => {
+            hold_an_entry_forever();
+            hold_the_lock_once_the_hook_waits();
+            std::process::exit(0);
+        }
         other => panic!("unknown scenario {other}"),
     }
 }
@@ -114,6 +205,31 @@ fn admission_is_closed_after_begin_exit() {
 #[test]
 fn exit_with_a_cache_still_open_skips_sqlcipher_teardown() {
     assert_eq!(run_child("busy"), Some(EXIT_CACHE_BUSY));
+}
+
+/// How long a timed-out exit may take: `EXIT_WAIT`, plus the child's own
+/// start-up and a margin.
+const EXIT_BOUND: Duration = Duration::from_millis(4_500);
+
+/// Round 24, finding 1: the timeout path must not log. With stderr a full
+/// pipe nobody reads, a log write before `_exit` blocks forever; the child
+/// still ends with `EXIT_CACHE_BUSY` within the bound.
+#[test]
+fn a_full_stderr_does_not_delay_the_exit_fallback() {
+    let (code, took) = run_child_bounded("busy-stderr", EXIT_BOUND + Duration::from_secs(3));
+    assert_eq!(code, Some(EXIT_CACHE_BUSY), "after {took:?}");
+    assert!(took < EXIT_BOUND, "took {took:?}");
+}
+
+/// Round 24, finding 2: the hook never blocks on the census lock. A thread
+/// that takes the lock once the hook is waiting and holds it for 6 s does
+/// not hold up the exit past `EXIT_WAIT` (a condvar wait would re-acquire
+/// the lock only after those 6 s).
+#[test]
+fn a_held_census_lock_does_not_delay_the_exit_fallback() {
+    let (code, took) = run_child_bounded("busy-locked", EXIT_BOUND + Duration::from_secs(4));
+    assert_eq!(code, Some(EXIT_CACHE_BUSY), "after {took:?}");
+    assert!(took < EXIT_BOUND, "took {took:?}");
 }
 
 fn census_empty(dir: &Path) -> bool {

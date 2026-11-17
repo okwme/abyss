@@ -50,3 +50,56 @@ async fn shutdown_closes_the_cache_while_retirement_still_runs() {
     // Admitted again (the key is not this cache's, so it cannot read it).
     assert!(matches!(after.await.unwrap(), Err(CacheError::WrongKey)));
 }
+
+/// Round 24 (the round 23 gap without a test): `erase_cache` keeps the
+/// cache's directory in the census from before the old cache closes until
+/// the new one is open, so a drain cannot finish in between. A sampler
+/// reads the census as fast as it can for the whole erase-and-reopen and
+/// must never see it empty. The gap it would see without the hold spans a
+/// worker join and a persistence round trip, so the sampler catches it
+/// reliably (and with the hold, it can never fail spuriously).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn erase_and_reopen_never_leave_the_census_empty() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use crate::actor::logout::{erase_cache, open_cache};
+    use crate::secret::MemoryStore;
+    use crate::session::PersistHandle;
+
+    let dir = CacheDir::new();
+    let persist = PersistHandle::spawn(MemoryStore::new()).unwrap();
+    let (handle, key) = open_cache(&persist, dir.path().to_path_buf())
+        .await
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let empty = Arc::new(AtomicUsize::new(0));
+    let sampler = {
+        let (stop, empty) = (Arc::clone(&stop), Arc::clone(&empty));
+        let path = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let mut looks = 0_u64;
+            while !stop.load(Ordering::SeqCst) && looks < 100_000_000 {
+                if wait_closed(Some(&path), Duration::ZERO) {
+                    empty.fetch_add(1, Ordering::SeqCst);
+                }
+                looks += 1;
+            }
+            looks
+        })
+    };
+    let (erased, reopened) =
+        erase_cache(&persist, Some(handle), dir.path().to_path_buf(), Some(key)).await;
+    stop.store(true, Ordering::SeqCst);
+    let looked = sampler.join().unwrap();
+    assert!(erased.is_ok());
+    let (handle, _key) = reopened.expect("a fresh cache for the next account");
+    assert!(looked > 0);
+    assert_eq!(
+        empty.load(Ordering::SeqCst),
+        0,
+        "the census drained between close and reopen"
+    );
+    handle.close().await.unwrap();
+}
