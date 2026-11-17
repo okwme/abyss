@@ -1,6 +1,8 @@
 //! Commands the UI sends to core and events core sends back.
 
-use crate::model::{ChatFolder, ChatId, ChatSummary, LocalId, Message, MsgId};
+use crate::model::{
+    ChatFolder, ChatId, ChatSummary, FolderEdit, LocalId, Message, MsgId, PeerFolder,
+};
 use crate::store::ViewGen;
 
 pub use crate::auth_types::{
@@ -59,6 +61,16 @@ pub enum Command {
     /// incoming messages; until the app sends it, every incoming message
     /// counts as unread and is cleared by `MarkRead`.
     ViewingTail(Option<ChatId>),
+    /// Moves a chat into or out of the archive. On success core applies the
+    /// move (`ChatBumped`); a failure is sent as `Error`.
+    SetPeerFolder {
+        chat: ChatId,
+        folder: PeerFolder,
+    },
+    /// Changes a chat folder. On success core fetches the folders again
+    /// (`ChatFolders`); a failure is sent as `Error`. A `Create` title that
+    /// [`crate::model::folder_title`] refuses is `Rejected` unsent.
+    EditChatFolder(FolderEdit),
     /// Signs out: remote `auth.logOut`, then local deletion of the session
     /// item and the cache (plan sections 5, 16). While signed out, it retries
     /// the local deletion only.
@@ -118,6 +130,12 @@ impl std::fmt::Debug for Command {
                 .field("max_id", max_id)
                 .finish(),
             Self::ViewingTail(c) => f.debug_tuple("ViewingTail").field(c).finish(),
+            Self::SetPeerFolder { chat, folder } => f
+                .debug_struct("SetPeerFolder")
+                .field("chat", chat)
+                .field("folder", folder)
+                .finish(),
+            Self::EditChatFolder(edit) => f.debug_tuple("EditChatFolder").field(edit).finish(),
             Self::Logout => f.write_str("Logout"),
             Self::SubmitCredentials { .. } => f.write_str("SubmitCredentials(<redacted>)"),
             Self::ForgetStoredCredentials => f.write_str("ForgetStoredCredentials"),

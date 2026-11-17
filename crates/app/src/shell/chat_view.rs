@@ -8,9 +8,9 @@ use std::time::Instant;
 use abyss_core::model::{Body, ChatKind, ChatSummary, Message, MsgId};
 use abyss_core::rich_text::RichText;
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, FontWeight, Hsla, Rgba,
-    SharedString, Stateful, StyledText, WeakEntity, Window, canvas, div, font, list, prelude::*,
-    px, transparent_black, uniform_list,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, FontWeight, Hsla,
+    MouseButton, MouseDownEvent, Rgba, SharedString, Stateful, StyledText, WeakEntity, Window,
+    canvas, div, font, list, prelude::*, px, transparent_black, uniform_list,
 };
 use jiff::tz::TimeZone;
 
@@ -188,6 +188,17 @@ fn folder_tabs(
             .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
                 root.with_session(|s, cx| s.show_chats(target, window, cx), cx);
             }))
+            .when_some(folder_id(target), |d, folder| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |root, ev: &MouseDownEvent, window, cx| {
+                        root.with_session(
+                            |s, cx| s.open_folder_menu(folder, ev.position, window, cx),
+                            cx,
+                        );
+                    }),
+                )
+            })
     });
     Some(
         div()
@@ -202,6 +213,14 @@ fn folder_tabs(
             .text_color(theme.text)
             .children(tabs),
     )
+}
+
+/// The chat folder a tab shows, if it is one.
+fn folder_id(shown: Shown) -> Option<i32> {
+    match shown {
+        Shown::Folder(id) => Some(id),
+        Shown::Main | Shown::Archive => None,
+    }
 }
 
 /// Leaves the archive for the main list.
@@ -369,6 +388,12 @@ impl ChatRow<'_> {
             .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
                 root.with_session(|s, cx| s.select_chat(id, window, cx), cx);
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |root, ev: &MouseDownEvent, window, cx| {
+                    root.with_session(|s, cx| s.open_chat_menu(id, ev.position, window, cx), cx);
+                }),
+            )
             .child(avatar(chat, ink))
             .child(
                 div()

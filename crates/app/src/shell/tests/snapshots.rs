@@ -247,7 +247,21 @@ fn folder(dir: &Path) -> Result<()> {
         root.with_session(|s, cx| s.show_chats(Shown::Folder(4), window, cx), cx);
     })?;
     shot.cx.run_until_parked();
-    shot.save(Mode::Day, "folder-day.png")
+    shot.save(Mode::Day, "folder-day.png")?;
+    // Right-click on the Work folder's pinned forum: in Work only.
+    let forum = ChatId {
+        kind: abyss_core::model::PeerKind::Channel,
+        id: 2,
+    };
+    shot.root.update(&mut shot.cx, |root, window, cx| {
+        root.with_session(
+            |s, cx| s.open_chat_menu(forum, point(px(160.), px(115.)), window, cx),
+            cx,
+        );
+    })?;
+    shot.cx.run_until_parked();
+    shot.save(Mode::Day, "menu-day.png")?;
+    shot.save(Mode::Night, "menu-night.png")
 }
 
 #[test]

@@ -37,7 +37,9 @@ fn call_error(outcome: &Outcome) -> Option<CallError> {
         | Outcome::History { res: Err(e), .. }
         | Outcome::Send { res: Err(e), .. }
         | Outcome::Read(Err(e))
-        | Outcome::ChatFolders(Err(e)) => Some(*e),
+        | Outcome::ChatFolders(Err(e))
+        | Outcome::SetPeerFolder { res: Err(e), .. }
+        | Outcome::EditChatFolder(Err(e)) => Some(*e),
         _ => None,
     }
 }
@@ -164,6 +166,15 @@ impl<B: Backend> Actor<B> {
             // Read marks are best effort; the next read covers a lost one.
             Outcome::Read(_) | Outcome::UpdatesEnded(StreamEnd::Cancelled) => {}
             Outcome::ChatFolders(res) => self.on_chat_folders(res).await,
+            Outcome::SetPeerFolder { chat, folder, res } => match res {
+                // Applied now; the echoed `updateFolderPeers` changes nothing.
+                Ok(()) => self.on_folders(vec![(chat, folder)]).await,
+                Err(e) => self.error(user_error(e)).await,
+            },
+            Outcome::EditChatFolder(res) => match res {
+                Ok(()) => self.load_folders(),
+                Err(e) => self.error(user_error(e)).await,
+            },
             Outcome::CacheChats(chats) => self.on_cache_chats(chats).await,
             Outcome::CacheHistory {
                 load,
@@ -709,7 +720,7 @@ impl<B: Backend> Actor<B> {
     /// Chats moved into or out of the archive: each listed one changes in
     /// place (`ChatBumped` without a newer message never moves a row), and
     /// the cached list follows, so a restart shows the same split.
-    async fn on_folders(&mut self, moves: Vec<(ChatId, PeerFolder)>) {
+    pub(super) async fn on_folders(&mut self, moves: Vec<(ChatId, PeerFolder)>) {
         let mut changed = Vec::new();
         for (chat, folder) in moves {
             if let Some(summary) = self.dialogs.set_folder(chat, folder) {

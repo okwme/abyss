@@ -36,7 +36,7 @@ pub use admission::MAX_CONCURRENT;
 use auth::AuthMachine;
 pub(crate) use binding::{Identity, provision_cache};
 use boot::Boot;
-use jobs::{CallCtx, Done, Job, Load, ReqId, TaskKind};
+use jobs::{CallCtx, Done, FolderJob, Job, Load, ReqId, TaskKind};
 use lifecycle::{Lifecycle, Live, LiveEvent, Phase, Reason};
 use loads::Deferred;
 pub(crate) use logout::CacheParts;
@@ -50,7 +50,7 @@ use crate::backend::{Backend, DialogsCursor, HistoryQuery, StreamItem};
 use crate::cache::CacheHandle;
 use crate::core::ShutdownReport;
 use crate::events::EventSender;
-use crate::model::{ChatId, MsgId};
+use crate::model::{ChatId, FolderEdit, MsgId};
 use crate::session::{PersistHandle, SessionSnapshot};
 use crate::store::{Dialogs, MAX_DIALOGS, ViewGen, Window, Windows};
 
@@ -84,6 +84,8 @@ fn account_scoped(cmd: &Command) -> bool {
             | Command::DiscardSend(_)
             | Command::MarkRead { .. }
             | Command::ViewingTail(_)
+            | Command::SetPeerFolder { .. }
+            | Command::EditChatFolder(_)
     )
 }
 
@@ -462,7 +464,16 @@ impl<B: Backend> Actor<B> {
     /// What a purged load owed the UI is left to the caller: retirement
     /// answers it, and a full bootstrap invalidates its view (task 10g).
     fn purge_queued(&mut self) {
-        let keep = |job: &Job| matches!(job, Job::Send { .. } | Job::Read { .. });
+        // Sends, read marks and folder changes are the user's intent: they
+        // run on the next instance.
+        let keep = |job: &Job| {
+            matches!(
+                job,
+                Job::Send { .. }
+                    | Job::Read { .. }
+                    | Job::Folders(FolderJob::SetPeerFolder { .. } | FolderJob::Edit(_))
+            )
+        };
         self.folders = FoldersLoad::Idle;
         let (kept, purged): (Vec<Job>, Vec<Job>) = self.queue.drain(..).partition(keep);
         self.queue = kept.into();
@@ -474,7 +485,7 @@ impl<B: Backend> Actor<B> {
                     self.release_history(load);
                     self.covers.fetch_ended(load.chat, load.req);
                 }
-                Job::Send { .. } | Job::Read { .. } | Job::ChatFolders => {}
+                Job::Send { .. } | Job::Read { .. } | Job::Folders(_) => {}
             }
         }
     }
@@ -523,6 +534,7 @@ impl<B: Backend> Actor<B> {
     async fn on_panic(&mut self, kind: Option<TaskKind>) {
         match kind {
             Some(TaskKind::ChatFolders) => self.folders = FoldersLoad::Idle,
+            Some(TaskKind::FolderWrite) => self.error(UserError::Internal).await,
             Some(TaskKind::Dialogs) => {
                 self.dialogs_busy = false;
                 self.load_ended(LoadTarget::Dialogs, Some(UserError::Internal))
@@ -605,6 +617,11 @@ impl<B: Backend> Actor<B> {
             Command::Window(state) => self.on_window(state).await,
             Command::MarkRead { chat, max_id } => self.mark_read(chat, max_id).await,
             Command::ViewingTail(chat) => self.viewing = chat,
+            Command::SetPeerFolder { chat, folder } => {
+                self.enqueue(Job::Folders(FolderJob::SetPeerFolder { chat, folder }))
+                    .await;
+            }
+            Command::EditChatFolder(edit) => self.edit_chat_folder(edit).await,
             Command::SubmitPhone(phone) => {
                 let phone = zeroize::Zeroizing::new(phone);
                 self.submit_phone(&phone).await;
@@ -633,11 +650,24 @@ impl<B: Backend> Actor<B> {
         match self.folders {
             FoldersLoad::Running | FoldersLoad::Again => self.folders = FoldersLoad::Again,
             FoldersLoad::Idle if self.queue.len() < MAX_QUEUED => {
-                self.queue.push_back(Job::ChatFolders);
+                self.queue.push_back(Job::Folders(FolderJob::Load));
                 self.folders = FoldersLoad::Running;
             }
             FoldersLoad::Idle => {}
         }
+    }
+
+    /// Queues a folder change; a new folder's title must be one Telegram
+    /// takes.
+    async fn edit_chat_folder(&mut self, edit: FolderEdit) {
+        let edit = match edit {
+            FolderEdit::Create { title, chat } => match crate::model::folder_title(&title) {
+                Some(title) => FolderEdit::Create { title, chat },
+                None => return self.error(UserError::Rejected).await,
+            },
+            other => other,
+        };
+        self.enqueue(Job::Folders(FolderJob::Edit(edit))).await;
     }
 
     async fn load_dialogs(&mut self) {

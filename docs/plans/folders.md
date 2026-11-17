@@ -82,17 +82,24 @@ The work is split so each part is reviewable and useful on its own:
 
 These are the first account-changing calls besides sending and read marks, so they stay narrow.
 
-**Commands.**
-- `SetFolder { chat, folder }` calls `folders.editPeerFolders`. On success core applies the move itself, without waiting for the echoed `updateFolderPeers`, which then changes nothing.
-- `EditChatFolder(FolderEdit)`, where `FolderEdit` is `AddChat { folder, chat }`, `RemoveChat { folder, chat }`, `Create { title, chat }` or `Delete { folder }`. It calls `messages.updateDialogFilter`.
+**Commands** (both account-scoped):
+- `SetPeerFolder { chat, folder }` calls `folders.editPeerFolders`. On success core applies the move itself (`on_folders`, the same path as `updateFolderPeers`), so the echoed update changes nothing.
+- `EditChatFolder(FolderEdit)`, where `FolderEdit` is `AddChat { folder, chat }`, `RemoveChat { folder, chat }`, `Create { title, chat }` or `Delete { folder }`. It calls `messages.updateDialogFilter`, and on success core refetches the folders.
+- A `Create` title must pass `model::folder_title`: sanitized, trimmed, 1 to 12 characters. Otherwise the command is answered `Rejected` and nothing is sent.
+- `Debug` of `FolderEdit` leaves the title out.
 
-**Round-tripping what abyss does not model.** The backend keeps the raw `dialogFilter` values from the last `getDialogFilters`. An edit changes only the peer lists or the title of that raw value and sends it back, so emoticons, colors, title entities and peers abyss could not map (or that lie beyond the dialog cap) are never dropped. An edit to a folder whose raw value is missing (not loaded yet) is refused with `NotFound`. Shared (chatlist) folders are read-only and refused, since editing them needs the `chatlists.*` calls. New folders get the smallest free id ≥ 2, and the title is limited to 12 characters, as Telegram requires.
+**Round-tripping what abyss does not model.** The backend keeps the raw `dialogFilter` values from the last `getDialogFilters`. `map::folders::edited`, a pure and tested function, changes only what the edit names and sends the rest back unchanged: emoticons, colors, title entities, other flags, and peers abyss could not map or that lie beyond the dialog cap.
+- `AddChat` drops the chat from the exclusions and adds it to the included chats, unless it is already named.
+- `RemoveChat` drops the chat from the pinned and included chats. If the folder has kind rules, the chat is also added to the exclusions, as Telegram Desktop does, so the rules don't take it back in.
+- `Create` takes the smallest free id from 2 to 255.
+- The answer is `Rejected` for a folder not fetched yet, a shared (chatlist) folder, or no free id. Shared folders need the `chatlists.*` calls.
+- The fake backend applies the same rules.
 
-**Retry class.** Edits are idempotent (they set state), so they use the `Read` retry class. An edit that fails shows a notice and leaves the UI unchanged until the server's update arrives.
+**Jobs.** Folder calls are `Job::Folders(FolderJob::{Load, SetPeerFolder, Edit})`. Both writes set state, so they are idempotent and use the `Read` retry class. Like sends and read marks, queued writes survive an instance rebuild, because they are the user's intent. A failure is sent as `Error`, and the UI changes only when core reports the change.
 
-**UI.**
-- Right-click a chat row for a small menu: Archive or Unarchive, then one toggle per editable folder, then "New folder with this chat…".
-- The new-folder name uses the existing `TextInput`.
-- Deleting a folder is a right-click on its tab, with a confirmation.
+**UI** (`shell/folder_menu.rs`):
+- Right-clicking a chat row opens a menu: Archive or Unarchive, then one ✓ toggle per regular folder, computed with `ChatFolder::contains`, then "New folder with this chat…". That last entry turns into a title field (`TextInput`, single line); Enter creates the folder.
+- Right-clicking a folder tab offers "Delete folder", which needs a second click. Shared folders say they can't be changed yet.
+- A backdrop closes the menu, and the menu is kept inside the window.
 
-**Out of scope.** Folder rules, reordering folders, shared folders and invite links.
+**Out of scope.** Editing folder rules, renaming or reordering folders, shared folders and invite links.

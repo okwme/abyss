@@ -22,8 +22,8 @@ use super::{
 use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
 use crate::credentials::{CredentialSlot, EnvResolution};
 use crate::model::{
-    Body, ChatFolder, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerFolder, PeerKind,
-    ThreadKey,
+    Body, ChatFolder, ChatId, ChatKind, ChatSummary, FolderEdit, FolderRules, Message, MsgId,
+    PeerFolder, PeerKind, ThreadKey,
 };
 use crate::rich_text::RichText;
 use crate::session::AbyssSession;
@@ -43,6 +43,8 @@ const MAX_LOG: usize = 4096;
 pub enum Op {
     Dialogs,
     ChatFolders,
+    SetPeerFolder,
+    EditChatFolder,
     History,
     Send,
     Read,
@@ -237,6 +239,56 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
         muted: false,
         folder: PeerFolder::Main,
     }
+}
+
+/// The server side of a folder edit, by the same rules as the real backend
+/// (`grammers::map::folders::edited`). `None` when it would be refused.
+fn fake_edit(folders: &mut Vec<ChatFolder>, edit: &FolderEdit) -> Option<()> {
+    let kind_rules = [
+        FolderRules::CONTACTS,
+        FolderRules::NON_CONTACTS,
+        FolderRules::GROUPS,
+        FolderRules::BROADCASTS,
+        FolderRules::BOTS,
+    ];
+    let regular =
+        |folders: &[ChatFolder], id: i32| folders.iter().position(|f| f.id == id && !f.shared);
+    match edit {
+        FolderEdit::AddChat { folder, chat } => {
+            let at = regular(folders, *folder)?;
+            let f = folders.get_mut(at)?;
+            f.exclude.retain(|c| c != chat);
+            if !f.pinned.contains(chat) && !f.include.contains(chat) {
+                f.include.push(*chat);
+            }
+        }
+        FolderEdit::RemoveChat { folder, chat } => {
+            let at = regular(folders, *folder)?;
+            let f = folders.get_mut(at)?;
+            f.pinned.retain(|c| c != chat);
+            f.include.retain(|c| c != chat);
+            if kind_rules.iter().any(|&r| f.rules.has(r)) && !f.exclude.contains(chat) {
+                f.exclude.push(*chat);
+            }
+        }
+        FolderEdit::Create { title, chat } => {
+            let id = (2..=255).find(|id| !folders.iter().any(|f| f.id == *id))?;
+            folders.push(ChatFolder {
+                id,
+                title: title.clone(),
+                rules: FolderRules::default(),
+                pinned: Vec::new(),
+                include: vec![*chat],
+                exclude: Vec::new(),
+                shared: false,
+            });
+        }
+        FolderEdit::Delete { folder } => {
+            let at = regular(folders, *folder)?;
+            folders.remove(at);
+        }
+    }
+    Some(())
 }
 
 pub fn text_message(chat: ChatId, id: i32, text: &str) -> Message {
@@ -579,6 +631,16 @@ impl FakeHandle {
         self.shared.with(|s| s.folders = folders);
     }
 
+    /// The server's chat folders.
+    pub fn folders(&self) -> Vec<ChatFolder> {
+        self.shared.with(|s| s.folders.clone())
+    }
+
+    /// The server's dialog list.
+    pub fn dialogs(&self) -> Vec<ChatSummary> {
+        self.shared.with(|s| s.dialogs.clone())
+    }
+
     /// Replaces a chat's server-side history (e.g. simulate deletions).
     pub fn set_history(&self, chat: ChatId, messages: Vec<Message>) {
         self.shared.with(|s| {
@@ -903,6 +965,23 @@ impl Client for FakeClient {
     async fn chat_folders(&self) -> Result<Vec<ChatFolder>, BackendError> {
         let _g = self.enter(Op::ChatFolders).await?;
         Ok(self.shared.with(|s| s.folders.clone()))
+    }
+
+    async fn set_peer_folder(&self, chat: ChatId, folder: PeerFolder) -> Result<(), BackendError> {
+        let _g = self.enter(Op::SetPeerFolder).await?;
+        self.shared.with(|s| {
+            if let Some(c) = s.dialogs.iter_mut().find(|c| c.id == chat) {
+                c.folder = folder;
+            }
+        });
+        Ok(())
+    }
+
+    async fn edit_chat_folder(&self, edit: FolderEdit) -> Result<(), BackendError> {
+        let _g = self.enter(Op::EditChatFolder).await?;
+        self.shared
+            .with(|s| fake_edit(&mut s.folders, &edit))
+            .ok_or(BackendError::Rejected)
     }
 
     async fn history(

@@ -201,6 +201,66 @@ impl ChatFolder {
     }
 }
 
+/// The longest chat folder title Telegram accepts, in characters.
+pub const MAX_FOLDER_TITLE: usize = 12;
+
+/// A change to the account's chat folders (folders plan, part C). Only
+/// regular folders can be changed; shared ones are read-only.
+#[derive(Clone, PartialEq, Eq)]
+pub enum FolderEdit {
+    /// Puts `chat` in the folder by name (and out of its exclusions).
+    AddChat {
+        folder: i32,
+        chat: ChatId,
+    },
+    /// Takes `chat` out of the folder: off its named chats, and onto its
+    /// exclusions when its rules would still take it in.
+    RemoveChat {
+        folder: i32,
+        chat: ChatId,
+    },
+    /// A new folder holding `chat`. `title` is sanitized and at most
+    /// [`MAX_FOLDER_TITLE`] characters.
+    Create {
+        title: String,
+        chat: ChatId,
+    },
+    Delete {
+        folder: i32,
+    },
+}
+
+impl std::fmt::Debug for FolderEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddChat { folder, chat } => f
+                .debug_struct("AddChat")
+                .field("folder", folder)
+                .field("chat", chat)
+                .finish(),
+            Self::RemoveChat { folder, chat } => f
+                .debug_struct("RemoveChat")
+                .field("folder", folder)
+                .field("chat", chat)
+                .finish(),
+            Self::Create { chat, .. } => f
+                .debug_struct("Create")
+                .field("chat", chat)
+                .finish_non_exhaustive(),
+            Self::Delete { folder } => f.debug_struct("Delete").field("folder", folder).finish(),
+        }
+    }
+}
+
+/// A folder title as Telegram takes it: sanitized, trimmed, non-empty and
+/// at most [`MAX_FOLDER_TITLE`] characters. `None` otherwise.
+pub fn folder_title(raw: &str) -> Option<String> {
+    let title = crate::sanitize::display_name(raw.trim());
+    let title = title.trim();
+    let n = title.chars().count();
+    (n > 0 && n <= MAX_FOLDER_TITLE).then(|| title.to_owned())
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Sender {
     pub id: ChatId,

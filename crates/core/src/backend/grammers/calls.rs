@@ -17,7 +17,7 @@ use super::invoke::{Invoke, RetryClass, call};
 use super::map::{self, Directory};
 use super::pins::Pins;
 use crate::backend::{BackendError, DialogsCursor, DialogsPage, HistoryPage, HistoryQuery};
-use crate::model::{ChatFolder, ChatId, MsgId};
+use crate::model::{ChatFolder, ChatId, FolderEdit, MsgId, PeerFolder};
 use crate::session::{AbyssSession, PinRequest, Pinned};
 
 /// Telegram's page size limit for dialogs and history.
@@ -138,6 +138,10 @@ pub(crate) struct Calls<I> {
     /// at all; a desired peer those make addressable is pinned inside the
     /// peer map (`session::PinRequest`), with no other lock taken.
     pins: Mutex<Pins>,
+    /// The raw folders of the last `messages.getDialogFilters`, which folder
+    /// edits start from (folders plan, part C). Never held across an
+    /// `.await`.
+    folders: Mutex<Vec<tl::enums::DialogFilter>>,
 }
 
 impl<I> std::fmt::Debug for Calls<I> {
@@ -222,6 +226,7 @@ impl<I: Invoke> Calls<I> {
             invoker,
             session,
             pins: Mutex::new(pins),
+            folders: Mutex::new(Vec::new()),
         }
     }
 
@@ -348,7 +353,84 @@ impl<I: Invoke> Calls<I> {
             .map_err(|e| fail(&e))?;
         let raw = map::folders::raw_folders(&resp).map_err(|map::Oversized| oversized())?;
         let self_id = self.session.snapshot().self_id().ok().flatten();
-        Ok(map::folders::chat_folders(raw, self_id))
+        let folders = map::folders::chat_folders(raw, self_id);
+        *self.raw_folders() = raw.to_vec();
+        Ok(folders)
+    }
+
+    fn raw_folders(&self) -> MutexGuard<'_, Vec<tl::enums::DialogFilter>> {
+        // A plain value: a panic cannot leave it half-written.
+        self.folders.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `folders.editPeerFolders` for one chat. Idempotent, so retried like
+    /// a read.
+    pub(crate) async fn set_peer_folder(
+        &self,
+        chat: ChatId,
+        folder: PeerFolder,
+    ) -> Result<(), BackendError> {
+        let (peer, _in_flight) = self.resolve_used(chat).await?;
+        let folder_id = match folder {
+            PeerFolder::Main => 0,
+            PeerFolder::Archive => map::folders::ARCHIVE,
+        };
+        let request = tl::functions::folders::EditPeerFolders {
+            folder_peers: vec![tl::enums::InputFolderPeer::Peer(
+                tl::types::InputFolderPeer { peer, folder_id },
+            )],
+        };
+        call(&self.invoker, RetryClass::Read, &request)
+            .await
+            .map(drop)
+            .map_err(|e| fail(&e))
+    }
+
+    /// `messages.updateDialogFilter` made from the raw folders last
+    /// fetched. It sets a whole folder, so it is retried like a read. The
+    /// raw copy is updated on success (core refetches anyway).
+    pub(crate) async fn edit_chat_folder(&self, edit: FolderEdit) -> Result<(), BackendError> {
+        let chat = match &edit {
+            FolderEdit::AddChat { chat, .. }
+            | FolderEdit::RemoveChat { chat, .. }
+            | FolderEdit::Create { chat, .. } => Some(*chat),
+            FolderEdit::Delete { .. } => None,
+        };
+        let (peer, _in_flight) = match chat {
+            Some(chat) => {
+                let (peer, guard) = self.resolve_used(chat).await?;
+                (Some(peer), Some(guard))
+            }
+            None => (None, None),
+        };
+        let self_id = self.session.snapshot().self_id().ok().flatten();
+        let (id, filter) = {
+            let raw = self.raw_folders();
+            map::folders::edited(&raw, &edit, peer, self_id).map_err(|e| {
+                tracing::debug!(?e, "folder edit refused");
+                BackendError::Rejected
+            })?
+        };
+        let request = tl::functions::messages::UpdateDialogFilter {
+            id,
+            filter: filter.clone(),
+        };
+        call(&self.invoker, RetryClass::Read, &request)
+            .await
+            .map_err(|e| fail(&e))?;
+        let mut raw = self.raw_folders();
+        let at = raw.iter().position(|f| map::folders::raw_id(f) == Some(id));
+        match (at, filter) {
+            (Some(at), Some(f)) => {
+                if let Some(slot) = raw.get_mut(at) {
+                    *slot = f;
+                }
+            }
+            (Some(at), None) => drop(raw.remove(at)),
+            (None, Some(f)) => raw.push(f),
+            (None, None) => {}
+        }
+        Ok(())
     }
 
     pub(crate) async fn history(

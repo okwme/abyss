@@ -15,7 +15,9 @@ use crate::backend::{
     StreamItem, UpdateStream,
 };
 use crate::cache::CacheHandle;
-use crate::model::{ChatFolder, ChatId, ChatSummary, LocalId, Message, MsgId};
+use crate::model::{
+    ChatFolder, ChatId, ChatSummary, FolderEdit, LocalId, Message, MsgId, PeerFolder,
+};
 use crate::store::ViewGen;
 
 /// Messages per history page (server and cache).
@@ -73,8 +75,18 @@ pub(super) enum Job {
         chat: ChatId,
         max_id: MsgId,
     },
-    /// The chat folders (folders plan, part B).
-    ChatFolders,
+    Folders(FolderJob),
+}
+
+/// Archive and chat folder calls (folders plan, parts B and C).
+#[derive(Debug)]
+pub(super) enum FolderJob {
+    /// Load the chat folders.
+    Load,
+    /// Archive or unarchive a chat.
+    SetPeerFolder { chat: ChatId, folder: PeerFolder },
+    /// Change a chat folder.
+    Edit(FolderEdit),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +141,12 @@ pub(super) enum Outcome {
     },
     Read(CallResult<()>),
     ChatFolders(CallResult<Vec<ChatFolder>>),
+    SetPeerFolder {
+        chat: ChatId,
+        folder: PeerFolder,
+        res: CallResult<()>,
+    },
+    EditChatFolder(CallResult<()>),
     CacheChats(Option<Vec<ChatSummary>>),
     CacheHistory {
         load: Load,
@@ -157,6 +175,8 @@ pub(super) enum TaskKind {
     Send(LocalId),
     Read,
     ChatFolders,
+    /// An archive move or a folder change.
+    FolderWrite,
     CacheChats,
     Updates,
     /// A login call (task 6b), for panic handling.
@@ -291,10 +311,35 @@ pub(super) fn job_future<C: Client>(
             let fut = admitted.run(call, Outcome::Read);
             (TaskKind::Read, Box::pin(fut))
         }
-        Job::ChatFolders => {
+        Job::Folders(job) => folder_future(client, admitted, job),
+    }
+}
+
+/// The future for an admitted [`FolderJob`], plus its kind.
+fn folder_future<C: Client>(
+    client: Arc<C>,
+    admitted: Admitted,
+    job: FolderJob,
+) -> (TaskKind, DoneFuture) {
+    match job {
+        FolderJob::Load => {
             let call = async move { client.chat_folders().await };
             let fut = admitted.run(call, Outcome::ChatFolders);
             (TaskKind::ChatFolders, Box::pin(fut))
+        }
+        FolderJob::SetPeerFolder { chat, folder } => {
+            let call = async move { client.set_peer_folder(chat, folder).await };
+            let fut = admitted.run(call, move |res| Outcome::SetPeerFolder {
+                chat,
+                folder,
+                res,
+            });
+            (TaskKind::FolderWrite, Box::pin(fut))
+        }
+        FolderJob::Edit(edit) => {
+            let call = async move { client.edit_chat_folder(edit).await };
+            let fut = admitted.run(call, Outcome::EditChatFolder);
+            (TaskKind::FolderWrite, Box::pin(fut))
         }
     }
 }

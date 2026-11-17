@@ -114,6 +114,10 @@ pub(crate) struct Session {
     /// `CredentialItem`): a failure shows Retry.
     pub(super) cred_item: CredentialItem,
     pub(super) composer: Entity<TextInput>,
+    /// A new chat folder's title (`folder_menu`).
+    pub(super) folder_name: Entity<TextInput>,
+    /// The open archive/folder menu, if any (`folder_menu`).
+    pub(super) menu: Option<super::folder_menu::Menu>,
     /// Chat list, open chat and pending sends (`crate::chat`, `shell::chats`).
     pub(super) shell: ChatShell,
     pub(super) conn: Option<ConnState>,
@@ -123,7 +127,7 @@ pub(crate) struct Session {
     _pump: Task<()>,
     #[cfg(feature = "fake")]
     fake: Option<abyss_core::backend::fake::FakeHandle>,
-    _subscriptions: [Subscription; 6],
+    _subscriptions: [Subscription; 7],
     _chat_wiring: [Subscription; 2],
 }
 
@@ -133,6 +137,7 @@ impl Session {
         let phone = text_input(Limits::PHONE, copy::PHONE_PLACEHOLDER, cx);
         let code = text_input(Limits::CODE, copy::CODE_PLACEHOLDER, cx);
         let composer = text_input(Limits::COMPOSER, copy::COMPOSER_PLACEHOLDER, cx);
+        let (folder_name, folder_sub) = super::folder_menu::title_field(window, cx);
         let password = cx.new(|cx| PasswordInput::new(window, cx));
         let api_id = text_input(Limits::API_ID, copy::onboarding::API_ID_PLACEHOLDER, cx);
         let api_hash = cx.new(|cx| PasswordInput::api_hash(window, cx));
@@ -160,6 +165,7 @@ impl Session {
                     root.with_session(|s, cx| s.submit_message(window, cx), cx);
                 },
             ),
+            folder_sub,
         ];
         let pump = spawn_pump(started.events, window, cx);
         let shell = ChatShell::default();
@@ -178,6 +184,8 @@ impl Session {
             source: None,
             cred_item: CredentialItem::Settled,
             composer,
+            folder_name,
+            menu: None,
             shell,
             conn: None,
             notice: None,
@@ -289,6 +297,9 @@ impl Session {
         self.shell.reset();
         self.composer
             .update(cx, |input, cx| input.clear(window, cx));
+        self.folder_name
+            .update(cx, |input, cx| input.clear(window, cx));
+        self.menu = None;
         self.logout_prompt = false;
     }
 

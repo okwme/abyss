@@ -1286,3 +1286,120 @@ fn muted_follows_mute_until_and_contacts_their_flag() {
     assert_eq!(out.chats[0].kind, ChatKind::Private { contact: true });
     assert_eq!(out.chats[1].kind, ChatKind::Private { contact: false });
 }
+
+// --- chat folder edits ---
+
+fn edit_raw() -> Vec<tl::enums::DialogFilter> {
+    let mut work = raw_folder(2, "Work");
+    work.groups = true;
+    work.emoticon = Some("💼".into());
+    work.pinned_peers = vec![input_user(7)];
+    // A peer abyss cannot map is sent back unchanged.
+    work.include_peers = vec![input_user(8), tl::enums::InputPeer::Empty];
+    work.exclude_peers = vec![input_user(9)];
+    let shared = tl::enums::DialogFilter::Chatlist(tl::types::DialogFilterChatlist {
+        has_my_invites: false,
+        title_noanimate: false,
+        id: 3,
+        title: text("Shared"),
+        emoticon: None,
+        color: None,
+        pinned_peers: vec![],
+        include_peers: vec![],
+    });
+    vec![
+        tl::enums::DialogFilter::Default,
+        tl::enums::DialogFilter::Filter(work),
+        shared,
+    ]
+}
+
+fn filter_of(f: Option<tl::enums::DialogFilter>) -> tl::types::DialogFilter {
+    match f {
+        Some(tl::enums::DialogFilter::Filter(f)) => f,
+        other => panic!("not a regular folder: {:?}", other.is_some()),
+    }
+}
+
+fn user_ids(peers: &[tl::enums::InputPeer]) -> Vec<Option<i64>> {
+    peers
+        .iter()
+        .map(|p| match p {
+            tl::enums::InputPeer::User(u) => Some(u.user_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn adding_a_chat_names_it_and_keeps_everything_else() {
+    use crate::backend::grammers::map::folders::edited;
+    use crate::model::FolderEdit;
+    let raw = edit_raw();
+    let add = |chat| FolderEdit::AddChat { folder: 2, chat };
+    let (id, f) = edited(&raw, &add(uid(9)), Some(input_user(9)), None).unwrap();
+    let f = filter_of(f);
+    assert_eq!(id, 2);
+    assert!(f.exclude_peers.is_empty(), "no longer excluded");
+    assert_eq!(user_ids(&f.include_peers), [Some(8), None, Some(9)]);
+    assert_eq!(f.emoticon.as_deref(), Some("💼"));
+    assert!(f.groups);
+    // Already named (pinned): nothing added.
+    let (_, f) = edited(&raw, &add(uid(7)), Some(input_user(7)), None).unwrap();
+    assert_eq!(filter_of(f).include_peers.len(), 2);
+}
+
+#[test]
+fn removing_a_chat_excludes_it_when_rules_would_take_it_in() {
+    use crate::backend::grammers::map::folders::edited;
+    use crate::model::FolderEdit;
+    let raw = edit_raw();
+    let remove = |chat| FolderEdit::RemoveChat { folder: 2, chat };
+    let (_, f) = edited(&raw, &remove(uid(7)), Some(input_user(7)), None).unwrap();
+    let f = filter_of(f);
+    assert!(f.pinned_peers.is_empty());
+    assert_eq!(
+        user_ids(&f.exclude_peers),
+        [Some(9), Some(7)],
+        "groups rule set"
+    );
+    let (_, f) = edited(&raw, &remove(uid(8)), Some(input_user(8)), None).unwrap();
+    assert_eq!(user_ids(&filter_of(f).include_peers), [None]);
+}
+
+#[test]
+fn creating_and_deleting_folders() {
+    use crate::backend::grammers::map::folders::{EditError, edited};
+    use crate::model::FolderEdit;
+    let raw = edit_raw();
+    let create = FolderEdit::Create {
+        title: "New".into(),
+        chat: uid(5),
+    };
+    let (id, f) = edited(&raw, &create, Some(input_user(5)), None).unwrap();
+    assert_eq!(id, 4, "the smallest free id from 2");
+    let f = filter_of(f);
+    assert_eq!(user_ids(&f.include_peers), [Some(5)]);
+    assert!(!f.groups && !f.contacts);
+    assert_eq!(
+        edited(&raw, &FolderEdit::Delete { folder: 2 }, None, None),
+        Ok((2, None))
+    );
+    let shared = FolderEdit::AddChat {
+        folder: 3,
+        chat: uid(5),
+    };
+    assert_eq!(
+        edited(&raw, &shared, Some(input_user(5)), None),
+        Err(EditError::Shared)
+    );
+    assert_eq!(
+        edited(&raw, &FolderEdit::Delete { folder: 9 }, None, None),
+        Err(EditError::Unknown)
+    );
+    assert_eq!(
+        edited(&[], &FolderEdit::Delete { folder: 2 }, None, None),
+        Err(EditError::Unknown),
+        "nothing fetched yet"
+    );
+}

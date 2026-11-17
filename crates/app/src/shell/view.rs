@@ -175,6 +175,11 @@ fn session_body(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) ->
         .children(credential)
         .children(logout)
         .children(confirm)
+        .children(
+            (live && session.auth == AuthView::SignedIn)
+                .then(|| super::folder_menu::menu_overlay(session, theme, cx))
+                .flatten(),
+        )
         .children(session.notice.clone().map(|text| toast(text, theme)))
         .into_any_element()
 }

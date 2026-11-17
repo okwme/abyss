@@ -27,7 +27,7 @@ pub use seed::{MAX_CARRIED_PEERS, Seed, SessionSeed, SessionSnapshot};
 
 use crate::api::{CodeDelivery, CredentialError, NextDelivery, PasswordBuf};
 pub use crate::credentials::CredentialSlot;
-use crate::model::{ChatFolder, ChatId, ChatSummary, Message, MsgId, PeerFolder};
+use crate::model::{ChatFolder, ChatId, ChatSummary, FolderEdit, Message, MsgId, PeerFolder};
 
 /// Opaque position in the dialogs list, produced by the backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,6 +293,23 @@ pub trait Client: Send + Sync + 'static {
     /// The account's chat folders (`messages.getDialogFilters`), in server
     /// order, without the "All chats" position.
     fn chat_folders(&self) -> impl Future<Output = Result<Vec<ChatFolder>, BackendError>> + Send;
+
+    /// Moves `chat` into or out of the archive (`folders.editPeerFolders`).
+    /// Idempotent: setting the folder a chat is in changes nothing.
+    fn set_peer_folder(
+        &self,
+        chat: ChatId,
+        folder: PeerFolder,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send;
+
+    /// Changes a chat folder (`messages.updateDialogFilter`), starting from
+    /// the folders last fetched by [`Client::chat_folders`]: what abyss does
+    /// not model is sent back unchanged. `Rejected` for a folder not
+    /// fetched, a shared one, or no free folder id.
+    fn edit_chat_folder(
+        &self,
+        edit: FolderEdit,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send;
 
     fn history(
         &self,

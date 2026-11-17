@@ -50,7 +50,7 @@ use super::{
     PasswordChallenge, Seed, SessionSeed, SessionSnapshot, SignIn,
 };
 use crate::api::{ApiCredentials, PasswordBuf};
-use crate::model::{ChatFolder, ChatId, MsgId};
+use crate::model::{ChatFolder, ChatId, FolderEdit, MsgId, PeerFolder};
 use crate::session::{AbyssSession, PersistHandle};
 use calls::Calls;
 
@@ -272,6 +272,14 @@ impl Client for GrammersClient {
 
     async fn chat_folders(&self) -> Result<Vec<ChatFolder>, BackendError> {
         self.calls.chat_folders().await
+    }
+
+    async fn set_peer_folder(&self, chat: ChatId, folder: PeerFolder) -> Result<(), BackendError> {
+        self.calls.set_peer_folder(chat, folder).await
+    }
+
+    async fn edit_chat_folder(&self, edit: FolderEdit) -> Result<(), BackendError> {
+        self.calls.edit_chat_folder(edit).await
     }
 
     async fn history(
