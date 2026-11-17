@@ -29,6 +29,14 @@ pub(crate) const DISCARD: &str = "Discard";
 /// A send core refused and holds nothing for (task 6j).
 pub(crate) const RETURNED: &str = "Not sent and not kept";
 pub(crate) const PUT_BACK: &str = "Put back in the box";
+/// Core stopped before confirming a send (task 6k): it may have been sent.
+pub(crate) const STRANDED: &str = "Unknown: abyss stopped before confirming. It may have been sent, so check before sending it again.";
+/// Core stopped with this send failed: it was not sent.
+pub(crate) const STRANDED_UNSENT: &str = "Not sent: abyss stopped before it could be retried.";
+pub(crate) const COPY_TEXT: &str = "Copy text";
+pub(crate) const TEXT_COPIED: &str = "Text copied.";
+/// Put back from a chat other than the send's.
+pub(crate) const OTHER_CHAT: &str = "Open the chat this message was for to put it back.";
 pub(crate) const DISMISS: &str = "Dismiss";
 /// Put back while the message box has text.
 pub(crate) const BOX_NOT_EMPTY: &str =
@@ -108,6 +116,8 @@ pub(crate) fn byte_size(bytes: u64) -> String {
 pub(crate) fn send_label(echo: &Echo, now: Instant) -> SharedString {
     match echo.phase {
         Phase::Returned => return RETURNED.into(),
+        Phase::Stranded if echo.state == SendState::Failed => return STRANDED_UNSENT.into(),
+        Phase::Stranded => return STRANDED.into(),
         Phase::Discarding => return "Discarding…".into(),
         Phase::Submitted | Phase::Kept => {}
     }

@@ -251,9 +251,13 @@ impl Session {
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
+        let from = self.shell.selected();
         let opened = self.drive(OnRefusal::Notice, window, cx, |s, admit| {
             s.select(chat, admit)
         });
+        if opened.is_some() && from != Some(chat) {
+            self.swap_draft(from, chat, window, cx);
+        }
         if opened.is_some() && self.auth == AuthView::SignedIn {
             window.focus(&self.composer.focus_handle(cx), cx);
         }
@@ -309,18 +313,47 @@ impl Session {
         cx.notify();
     }
 
+    /// The open chat changed from `from` to `to` (task 6k): the box's text
+    /// stays `from`'s draft, and `to`'s draft comes back.
+    fn swap_draft(
+        &mut self,
+        from: Option<ChatId>,
+        to: ChatId,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        let text = self.composer.update(cx, |c, cx| c.take_text(window, cx));
+        if let Some(from) = from {
+            self.shell.stash_draft(from, text);
+        }
+        if let Some(draft) = self.shell.take_draft(to) {
+            let placed = self
+                .composer
+                .update(cx, |c, cx| c.put_text(&draft, window, cx));
+            debug_assert!(placed, "the box was emptied above");
+        }
+    }
+
     /// Puts a refused send's text back into the message box, which must be
-    /// empty (nothing typed there is ever overwritten). The echo shows in
-    /// its own chat only, so the box belongs to that chat.
+    /// empty (nothing typed there is ever overwritten), and only while the
+    /// send's own chat is open: the box belongs to it.
     pub(super) fn put_back(
         &mut self,
         local_id: LocalId,
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
-        let Some(text) = self.shell.returned_text(local_id).map(str::to_owned) else {
+        let Some((chat, text)) = self
+            .shell
+            .returned(local_id)
+            .map(|(chat, text)| (chat, text.to_owned()))
+        else {
             return;
         };
+        if self.shell.selected() != Some(chat) {
+            self.show_notice(chat_copy::OTHER_CHAT.into(), window, cx);
+            return;
+        }
         let placed = self
             .composer
             .update(cx, |c, cx| c.put_text(&text, window, cx));
@@ -334,7 +367,28 @@ impl Session {
         cx.notify();
     }
 
-    /// Drops a refused send's text (the user chose to).
+    /// Copies a stranded send's text (core stopped before confirming it).
+    pub(super) fn copy_stranded(
+        &mut self,
+        local_id: LocalId,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        let Some(text) = self.shell.stranded_text(local_id).map(str::to_owned) else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.show_notice(chat_copy::TEXT_COPIED.into(), window, cx);
+    }
+
+    /// Core's event stream closed while it ran: pending echoes are
+    /// stranded with their text (task 6k).
+    pub(super) fn core_stopped(&mut self, cx: &mut Context<'_, Root>) {
+        self.shell.core_stopped();
+        cx.notify();
+    }
+
+    /// Drops a refused or stranded send's text (the user chose to).
     pub(super) fn dismiss_returned(&mut self, local_id: LocalId, cx: &mut Context<'_, Root>) {
         drop(self.shell.take_returned(local_id));
         cx.notify();

@@ -73,13 +73,18 @@ impl ChatShell {
         if text.trim().is_empty() || self.echoes.is_full() {
             return Ok(None);
         }
+        // Fail closed rather than reuse an id core may still hold: at one
+        // send per microsecond, a u64 lasts over 500,000 years.
+        let Some(next) = self.next_local.checked_add(1) else {
+            return Ok(None);
+        };
         let local_id = LocalId(self.next_local);
         admit(Command::SendText {
             chat,
             text: text.to_owned(),
             local_id,
         })?;
-        self.next_local = self.next_local.wrapping_add(1);
+        self.next_local = next;
         let pushed = self
             .echoes
             .push(Echo::new(local_id, chat, text.to_owned(), now));
@@ -116,20 +121,48 @@ impl ChatShell {
         Ok(())
     }
 
-    /// Takes the text of a send core refused (`SendRefused`) out of its
-    /// echo, for the composer or to drop. `None`: no such returned echo.
+    /// Takes the text of a send core refused (`SendRefused`) or that core
+    /// stopped before answering out of its echo, for the composer or to
+    /// drop. `None`: no such echo.
     pub(crate) fn take_returned(&mut self, local_id: LocalId) -> Option<String> {
         let echo = self.echoes.take_returned(local_id)?;
         self.sync_echoes();
         Some(echo.text)
     }
 
-    /// The text of a returned echo, if `local_id` is one.
-    pub(crate) fn returned_text(&self, local_id: LocalId) -> Option<&str> {
+    /// The chat and text of a returned echo, if `local_id` is one.
+    pub(crate) fn returned(&self, local_id: LocalId) -> Option<(ChatId, &str)> {
         self.echoes
             .get(local_id)
             .filter(|e| e.is_returned())
+            .map(|e| (e.chat, e.text.as_str()))
+    }
+
+    /// The text of a stranded echo (core stopped), for Copy.
+    pub(crate) fn stranded_text(&self, local_id: LocalId) -> Option<&str> {
+        self.echoes
+            .get(local_id)
+            .filter(|e| e.is_stranded())
             .map(|e| e.text.as_str())
+    }
+
+    /// Core's event stream closed while it ran (task 6k): every echo still
+    /// waiting on an answer is stranded, its text kept.
+    pub(crate) fn core_stopped(&mut self) {
+        if self.echoes.strand() {
+            self.remeasure_echoes();
+        }
+    }
+
+    /// Stashes the composer's text as `chat`'s draft (an empty one clears
+    /// it).
+    pub(crate) fn stash_draft(&mut self, chat: ChatId, text: String) {
+        self.drafts.stash(chat, text);
+    }
+
+    /// Takes `chat`'s stashed draft.
+    pub(crate) fn take_draft(&mut self, chat: ChatId) -> Option<String> {
+        self.drafts.take(chat)
     }
 
     /// Back to the live tail from far up the history: core reopens the chat

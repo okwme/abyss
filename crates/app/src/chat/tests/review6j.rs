@@ -93,7 +93,7 @@ fn a_refused_send_keeps_its_text_for_the_box() {
     // Late state events cannot revive it.
     set(&mut shell, local_id, SendState::Failed);
     assert!(shell.echoes().get(local_id).unwrap().is_returned());
-    assert_eq!(shell.returned_text(local_id), Some("keep me"));
+    assert_eq!(shell.returned(local_id), Some((CHAT, "keep me")));
     assert_eq!(shell.take_returned(local_id).as_deref(), Some("keep me"));
     assert_eq!(shell.echoes().count(CHAT), 0);
     assert_eq!(shell.take_returned(local_id), None);

@@ -8,6 +8,7 @@ mod commands;
 pub(crate) mod copy;
 #[cfg(feature = "fake")]
 pub(crate) mod demo;
+pub(crate) mod drafts;
 pub(crate) mod format;
 pub(crate) mod list;
 pub(crate) mod messages;
@@ -66,6 +67,9 @@ pub(crate) struct ChatShell {
     read_sent: Option<MsgId>,
     /// The chat core was last told shows its live tail (`ViewingTail`).
     viewing: Option<ChatId>,
+    /// Composer text of chats not open (task 6k): the box belongs to the
+    /// open chat.
+    drafts: drafts::Drafts,
     next_local: u64,
     /// Whether the window is active, as the OS last said. Reads and the
     /// live tail follow this at once, whatever core was told.
@@ -124,6 +128,7 @@ impl Default for ChatShell {
             revealed: HashSet::new(),
             read_sent: None,
             viewing: None,
+            drafts: drafts::Drafts::default(),
             next_local: 1,
             active: WindowState::Active,
             focus_sent: WindowState::Active,

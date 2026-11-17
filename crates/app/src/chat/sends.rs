@@ -36,6 +36,10 @@ pub(crate) enum Phase {
     /// Core holds nothing for it (`SendRefused`): its text exists only
     /// here, offered back to the composer, never for Retry.
     Returned,
+    /// Core stopped before it answered or resolved the send (its event
+    /// stream closed, task 6k): the fate is unknown unless its last state
+    /// says otherwise. Its text is kept for Copy, never for Retry.
+    Stranded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +84,20 @@ impl Echo {
     /// Text core refused, offered back to the composer or dismissed.
     pub(crate) fn is_returned(&self) -> bool {
         self.phase == Phase::Returned
+    }
+
+    /// Text left when core stopped, offered for Copy or dismissed.
+    pub(crate) fn is_stranded(&self) -> bool {
+        self.phase == Phase::Stranded
+    }
+
+    /// The server has the message (`Sent`, `SentUnconfirmed`): no later
+    /// answer may offer its text for sending again.
+    fn delivered(&self) -> bool {
+        matches!(
+            self.state,
+            SendState::Sent { .. } | SendState::SentUnconfirmed
+        )
     }
 
     /// Whole seconds until core resends a flood-waiting send, rounded up.
@@ -186,10 +204,16 @@ impl Echoes {
 
     /// Core holds nothing for this send (`SendRefused`): its text stays
     /// here as [`Phase::Returned`]; a discard waiting on it is done.
-    /// Returns its chat.
+    /// Returns its chat. A send the server already has keeps its state
+    /// (task 6k): a Retry queued before a late confirmation is answered
+    /// `SendRefused` once core has dropped the sent entry, and that answer
+    /// is older than the confirmation it follows.
     pub(crate) fn refused(&mut self, local_id: LocalId) -> Option<ChatId> {
         let at = self.list.iter().position(|e| e.local_id == local_id)?;
         let echo = self.list.get_mut(at)?;
+        if echo.delivered() {
+            return None;
+        }
         let chat = echo.chat;
         match echo.phase {
             Phase::Discarding => drop(self.list.remove(at)),
@@ -197,8 +221,29 @@ impl Echoes {
                 echo.phase = Phase::Returned;
                 echo.resend_at = None;
             }
+            Phase::Stranded => {}
         }
         Some(chat)
+    }
+
+    /// Core's event stream closed while it ran (task 6k): no answer will
+    /// come. Every echo still waiting on core (a submission, a discard, a
+    /// send not delivered) is stranded with its last state; delivered and
+    /// returned ones stay. Returns whether any changed.
+    pub(crate) fn strand(&mut self) -> bool {
+        let mut changed = false;
+        for echo in &mut self.list {
+            let waiting = matches!(
+                echo.phase,
+                Phase::Submitted | Phase::Kept | Phase::Discarding
+            );
+            if waiting && !echo.delivered() {
+                echo.phase = Phase::Stranded;
+                echo.resend_at = None;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Core's queue took a discard: the echo (and its slot) stays until
@@ -231,13 +276,12 @@ impl Echoes {
         self.set_state(local_id, state, now)
     }
 
-    /// Takes a returned echo out (the user put its text back or dismissed
-    /// it).
+    /// Takes a returned or stranded echo out (the user put its text back
+    /// or dismissed it). Core holds nothing for either.
     pub(crate) fn take_returned(&mut self, local_id: LocalId) -> Option<Echo> {
-        let at = self
-            .list
-            .iter()
-            .position(|e| e.local_id == local_id && e.phase == Phase::Returned)?;
+        let at = self.list.iter().position(|e| {
+            e.local_id == local_id && matches!(e.phase, Phase::Returned | Phase::Stranded)
+        })?;
         Some(self.list.remove(at))
     }
 

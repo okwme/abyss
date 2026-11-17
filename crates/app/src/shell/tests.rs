@@ -743,6 +743,170 @@ mod fake {
         assert_eq!(read(&root, cx, |s| s.shell.row_count()), 0);
     }
 
+    /// Signed in with two chats listed and chat `id` open.
+    fn chats_open(
+        cx: &mut TestAppContext,
+        id: i64,
+    ) -> (Entity<Root>, &mut VisualTestContext, Harness) {
+        let (root, cx, harness) = open(cx);
+        sign_in(&root, cx, &harness);
+        let script = FakeScript::demo(2, 0);
+        harness
+            .events
+            .unbounded_send(Event::DialogsReset(script.dialogs))
+            .unwrap();
+        cx.run_until_parked();
+        select(&root, cx, id);
+        (root, cx, harness)
+    }
+
+    fn select(root: &Entity<Root>, cx: &mut VisualTestContext, id: i64) {
+        let chat = ChatId {
+            kind: PeerKind::User,
+            id,
+        };
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_chat(chat, window, cx), cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn composer_text(root: &Entity<Root>, cx: &mut VisualTestContext) -> String {
+        root.read_with(cx, |root, cx| match &root.state {
+            State::Running(s) => s.composer.read(cx).text().to_owned(),
+            State::Failed(_) => String::new(),
+        })
+    }
+
+    /// Enter with `text` in the box; returns the send's id.
+    fn submit_text(
+        cx: &mut VisualTestContext,
+        harness: &Harness,
+        text: &str,
+    ) -> abyss_core::model::LocalId {
+        cx.simulate_input(text);
+        cx.simulate_keystrokes("enter");
+        match harness.sent.borrow().commands.last() {
+            Some(Command::SendText { local_id, .. }) => *local_id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Task 6k, finding 3: the box belongs to the open chat. Text put back
+    /// in chat 1 stays chat 1's draft when chat 2 opens, so Enter in chat 2
+    /// sends nothing of it; it is back when chat 1 opens again.
+    #[gpui::test]
+    fn put_back_text_never_follows_the_box_into_another_chat(cx: &mut TestAppContext) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let local_id = submit_text(cx, &harness, "for chat 1");
+        harness
+            .events
+            .unbounded_send(Event::SendRefused { local_id })
+            .unwrap();
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.put_back(local_id, window, cx), cx);
+        });
+        assert_eq!(composer_text(&root, cx), "for chat 1");
+        select(&root, cx, 2);
+        assert_eq!(composer_text(&root, cx), "", "chat 2 has its own box");
+        let from = harness.sent.borrow().commands.len();
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("for chat 2");
+        cx.simulate_keystrokes("enter");
+        let sent = commands_since(&harness, from);
+        assert!(
+            sent.iter()
+                .all(|c| !c.contains("chat: ChatId { kind: User, id: 1 }")),
+            "{sent:?}"
+        );
+        assert!(
+            matches!(
+                harness.sent.borrow().commands.last(),
+                Some(Command::SendText { text, chat, .. }) if text == "for chat 2" && chat.id == 2
+            ),
+            "chat 2's own text went to chat 2"
+        );
+        select(&root, cx, 1);
+        assert_eq!(
+            composer_text(&root, cx),
+            "for chat 1",
+            "chat 1's draft is back"
+        );
+    }
+
+    /// Task 6k, finding 3: Put back from another chat than the send's is
+    /// refused (the echo shows only in its chat; this guards the call).
+    #[gpui::test]
+    fn put_back_needs_the_sends_own_chat_open(cx: &mut TestAppContext) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let local_id = submit_text(cx, &harness, "for chat 1");
+        harness
+            .events
+            .unbounded_send(Event::SendRefused { local_id })
+            .unwrap();
+        cx.run_until_parked();
+        select(&root, cx, 2);
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.put_back(local_id, window, cx), cx);
+        });
+        assert_eq!(composer_text(&root, cx), "");
+        assert_eq!(
+            read(&root, cx, |s| s.notice.clone()),
+            Some(crate::chat::copy::OTHER_CHAT.into())
+        );
+    }
+
+    /// Task 6k, finding 2: core's event stream closes while it runs (an
+    /// actor panic drops its event sender) with a submission and a discard
+    /// unanswered. Both are stranded with their text: the submission is
+    /// "unknown", never "not sent"; the discard keeps its last state.
+    #[gpui::test]
+    fn a_core_stop_strands_unanswered_sends_with_their_text(cx: &mut TestAppContext) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let discarding = submit_text(cx, &harness, "old");
+        for event in [
+            Event::SendAdmitted {
+                local_id: discarding,
+            },
+            Event::SendState {
+                local_id: discarding,
+                state: abyss_core::api::SendState::FloodWait { seconds: 30 },
+            },
+        ] {
+            harness.events.unbounded_send(event).unwrap();
+        }
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.discard_send(discarding, window, cx), cx);
+        });
+        let submitted = submit_text(cx, &harness, "new");
+        harness.events.close_channel();
+        cx.run_until_parked();
+        let mut echo = |id: abyss_core::model::LocalId| {
+            read(&root, cx, |s| s.shell.echoes().get(id).cloned()).unwrap()
+        };
+        let new = echo(submitted);
+        assert!(new.is_stranded() && !new.can_retry() && new.text == "new");
+        assert_eq!(
+            crate::chat::copy::send_label(&new, std::time::Instant::now()),
+            crate::chat::copy::STRANDED
+        );
+        let old = echo(discarding);
+        assert!(old.is_stranded() && !old.can_discard());
+        assert_eq!(
+            old.state,
+            abyss_core::api::SendState::FloodWait { seconds: 30 }
+        );
+        assert_eq!(
+            read(&root, cx, |s| s
+                .shell
+                .stranded_text(submitted)
+                .map(str::to_owned)),
+            Some("new".to_owned())
+        );
+    }
+
     fn commands_since(harness: &Harness, from: usize) -> Vec<String> {
         harness
             .sent

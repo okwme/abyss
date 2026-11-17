@@ -586,10 +586,23 @@ fn echo_row(e: &Echo, cx: &mut Context<'_, Root>) -> AnyElement {
             pill(("dismiss", local_id.0), copy::DISMISS).on_click(dismiss),
         ]
     });
+    let stranded = e.is_stranded().then(|| {
+        let copy_text = cx.listener(move |root, _: &ClickEvent, window, cx| {
+            root.with_session(|s, cx| s.copy_stranded(local_id, window, cx), cx);
+        });
+        let dismiss = cx.listener(move |root, _: &ClickEvent, _, cx| {
+            root.with_session(|s, cx| s.dismiss_returned(local_id, cx), cx);
+        });
+        [
+            pill(("copy-text", local_id.0), copy::COPY_TEXT).on_click(copy_text),
+            pill(("dismiss", local_id.0), copy::DISMISS).on_click(dismiss),
+        ]
+    });
     let status = status
         .children(retry)
         .children(discard)
-        .children(returned.into_iter().flatten());
+        .children(returned.into_iter().flatten())
+        .children(stranded.into_iter().flatten());
     let text = rich::plain(&e.text, &fonts(), &palette());
     let body = StyledText::new(text.text).with_runs(text.runs);
     in_bubble(

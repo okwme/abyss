@@ -420,6 +420,11 @@ Messages carry no `random_id` (`api.tl:128`). The only correlation is `updateMes
   - They are **not** tied to `ViewGen` or `ClientGen`. Closing the chat, evicting its window or rebuilding the client never cancels or drops a send. `ViewGen` only decides whether a chat window currently *shows* the echo.
   - Entries leave the table on `Sent`, on a user discard, or when a `SentUnconfirmed` echo is cleared by reconcile.
   - Admission and discards are acknowledged per `LocalId` (task 6j): `SendAdmitted` or `SendRefused` for every `SendText`, and `SendDiscarded` or `DiscardRefused` for every `DiscardSend`. The UI changes send capacity only on these answers, and counts every echo toward its cap (the same 288 as core's table).
+  - Exceptions to "every command is answered" (task 6k):
+    - **Shutdown:** once the app quits, core's last events may never be applied; nothing outlives the window.
+    - **Epoch reset:** a command made for an earlier account epoch is dropped unanswered; the UI already cleared that account's echoes and drafts.
+    - **Core stop:** if core's event stream closes while it runs (an actor panic), no answer comes. The UI strands every echo still waiting (unknown fate, text kept for Copy, never Retry).
+    - **Superseded answer:** the stream is ordered, so an answer reflects core's state when it ran. The one answer that can be older than state the UI already shows is a `SendRefused` for a Retry queued before a late confirmation; it never changes a delivered echo.
 - **States:**
 
   ```rust
@@ -1027,6 +1032,23 @@ Open items:
 5. **Revocation after a failed marker (LOW).** Also fixed by the overlay: the screen is derived from the gate's current trigger, which a revocation escalates to `Server`, so "Stay signed in" goes. Test: `revocation_after_a_failed_marker_takes_stay_signed_in_away`. It was not run against the pre-overlay gate, which predates the other round 25 changes.
 - Also: the Fragment allowlist stays on `fragment.com`, with a comment that subdomains and the path format are unverified. `docs/connecting.md` now describes "Logging out" during the marker write, and says an unreadable record loads no session, opens no cache and deletes nothing.
 
+**Task 6k status (2026-11-17): round 34 re-check of task 6j, offline against the fake.** Each regression test fails with its fix disabled in place (checked one fix at a time). Tests are in `crates/app/src/chat/tests/review6k.rs`, `chat/drafts.rs` and `shell/tests.rs`. Of `shell/mod.rs`, only `core_stopped` changed (one call); `on_app_quit`, `storage.rs` and `cache/census.rs` were not touched.
+1. **A refused Retry after a late confirmation offered sent text again (P2).** `Echoes::refused` no longer changes an echo the server already has (`Sent`, `SentUnconfirmed`). The `SendRefused` answering a Retry queued before the confirmation is older than the confirmation, so the delivered state stands, and Put back (a resend with a new `random_id`) is never offered. That is the only answer that can supersede newer state: core answers each command at the moment it runs, and the event stream is ordered. Test: `a_refused_retry_after_a_late_confirmation_never_offers_the_text_again` (`Sent` and `SentUnconfirmed`).
+2. **A core stop stranded unanswered echoes (P2).** When core's event stream closes while it runs (`Root::core_stopped`, not during a shutdown), every echo still waiting on core (`Submitted`, `Discarding`, or `Kept` and not delivered) becomes `Phase::Stranded` and keeps its last state and text. The label stays honest about uncertainty:
+   - a send whose fate is unknown reads "Unknown: abyss stopped before confirming. It may have been sent, so check before sending it again.";
+   - a `Failed` one reads "Not sent: abyss stopped before it could be retried."
+   It offers Copy text and Dismiss, never Retry. Delivered and returned echoes stay as they were. Tests:
+   - `a_core_stop_strands_unanswered_sends_with_their_text`: the stream closes, as an actor panic closes it, with a submission and a discard of a flood-waiting send pending; both are stranded, and the discard keeps `FloodWait`;
+   - `a_core_stop_strands_only_what_waits_on_core`.
+3. **Put-back text followed the box into another chat (P2).** The box now belongs to the open chat. Switching chats stashes its text as the old chat's draft and restores the new chat's (`chat::drafts`). There is at most one draft per chat and at most `MAX_DRAFTS` (64); past that, the one stashed longest ago goes. Drafts are cleared with the account (`ChatShell::reset`), and no draft text reaches `Debug`. Put back also checks that the send's own chat is open. Tests:
+   - `put_back_text_never_follows_the_box_into_another_chat`: put back in chat 1, open chat 2, press Enter; nothing of chat 1's goes to chat 2, and the draft is back in chat 1;
+   - `put_back_needs_the_sends_own_chat_open`;
+   - `drafts::one_draft_per_chat_bounded`.
+- Also:
+  - `next_local` is allocated with `checked_add`; it fails closed (nothing sent, the box keeps its text) instead of wrapping onto an id core may hold.
+  - The stale "never take an ordinary send's slot" comment on `MAX_KEPT_SENDS` now describes the round-33 fallback.
+  - The 6j audit carries Astra's partial verdicts.
+
 **Task 6j status (2026-11-17): round 33 re-check of task 6i, offline against the fake.** Both findings had one cause: the UI changed send capacity before core accepted the change. The contract is fixed rather than the cases. Each regression test fails with its fix disabled in place (checked one fix at a time). Core tests are in `crates/core/src/actor/tests/review6j.rs`. App tests are in `crates/app/src/chat/tests/review6j.rs` and `shell/tests.rs::a_refused_send_is_put_back_into_an_empty_box`. No exit-safety file was touched (`shell/mod.rs`, `storage.rs`, `cache/census.rs`), and the 10f areas only gained the new event arms and echo phases.
 - **The contract.** Send admission and discards get correlated answers:
   - Core answers every `SendText` with `Event::SendAdmitted { local_id }` (it keeps the send: dispatched, or kept `Failed` for Retry; this comes before any `SendState`) or `Event::SendRefused { local_id }` (it holds nothing; the reason comes first as `Error`). This covers sends refused while signed out or behind a logout too.
@@ -1049,10 +1071,10 @@ Open items:
    - app `a_discard_keeps_its_slot_until_core_answers` (288 echoes, Discard of the flood-waiting one, then an immediate new submission: refused for room; after `DiscardRefused` the echo shows `Sending` and there is still no room; a second Discard frees the slot only on `SendDiscarded`);
    - `every_discard_is_answered` and `unanswered_submissions_count_toward_the_cap`.
 - **Audit of optimistic UI changes to send state.**
-  - Composer cleared when the `SendText` is queued: reconciled. The text stays in the `Submitted` echo until `SendAdmitted`/`SendRefused`, and comes back on refusal.
+  - Composer cleared when the `SendText` is queued: reconciled. The text stays in the `Submitted` echo until `SendAdmitted`/`SendRefused`, and comes back on refusal. **Round 34: partial.** Text put back stayed in the one shared box and could be sent to another chat; fixed in 6k with per-chat drafts.
   - Echo pushed when the `SendText` is queued: harmless. It counts toward the cap before core answers, which errs on the safe side.
-  - Retry flips the echo to "Sending…" when it is queued: reconciled. Core answers every retry with the send's state (`answer_unrun_retry` behind an overlay or when a retry cannot run), or `SendRefused`.
-  - Discard: no longer optimistic (`Discarding` until answered).
+  - Retry flips the echo to "Sending…" when it is queued: reconciled. Core answers every retry with the send's state (`answer_unrun_retry` behind an overlay or when a retry cannot run), or `SendRefused`. **Round 34: partial.** A `SendRefused` answering a Retry queued before a late confirmation turned a delivered echo into returned text; fixed in 6k.
+  - Discard: no longer optimistic (`Discarding` until answered). **Round 34: partial.** An answer never came if core stopped; fixed in 6k (stranded).
   - Flood-wait countdown (`resend_at`): display only. Every `SendState` resets it.
   - The oldest `SentUnconfirmed` echo gives way at the cap: harmless. Core's table no longer holds that send (it moved to the unconfirmed list), and the server has the message.
   - Sent/unconfirmed echoes leave on core's history evidence (`resolve`, `Reconciled`, `SendsCovered`): harmless. Core's table no longer holds them.
@@ -1443,6 +1465,12 @@ Open items:
   - **High:** the UI kept account A's messages and draft after logout, so account B could see them under a shared peer id.
   - **High:** commands queued behind Logout (sends included) could act for the next account. Reject account-scoped commands during logout and while signed out, quarantine the cache at teardown, and tag commands with an account generation.
   - **Medium:** a cache re-binding could lose its only completion notification: it reported before returning, and the actor checked `is_finished()`.
+
+- **Round 34 (re-check of task 6j, 2026-11-17).** GPT-6 Astra: the acknowledgement contract holds for rebuild, teardown, the epoch fence and a full command channel. Three P2s remained. All fixed in task 6k (section 13, Task 6k status):
+  - **P2:** a Retry queued for an `Unknown` send, then a late confirmation, then `SendRefused`: the refusal turned the delivered echo into returned text, and Put back would send it again. A refusal no longer changes a delivered echo.
+  - **P2:** an unexpected core stop left `Submitted` and `Discarding` echoes waiting forever. They are now stranded with their text and an honest "unknown" label, and the exceptions to "every command is answered" are in section 9.
+  - **P2:** text put back in one chat followed the shared box into another and could be sent there. Drafts are now per chat, and Put back needs the send's own chat open.
+  - Also: `next_local` is checked, a stale comment is fixed, and the 6j audit is corrected (partial verdicts).
 
 - **Round 33 (re-check of task 6i, 2026-11-17).** GPT-6 Astra: the watchdog and hold-expiry fixes are sound. Two medium findings remain, both because the UI changed send capacity before core accepted the change. The contract is fixed in task 6j (section 13, Task 6j status):
   - **Medium:** `hold_send` checked only the kept slots, so a send made behind a just-confirmed logout, with 255 ordinary and 32 kept sends held, was refused with no record, leaving an orphan `Failed` echo whose Retry was `NotFound`. Send admission is now acknowledged (`SendAdmitted`/`SendRefused`), core keeps a send while its table has room, and refused text stays in the UI for the box.

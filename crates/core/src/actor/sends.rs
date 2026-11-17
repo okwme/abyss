@@ -38,7 +38,9 @@ pub(super) const MAX_PENDING_SENDS: usize = 256;
 /// Maximum sends kept `Failed` for Retry without being sent: refused
 /// behind a logout (review round 31), or past [`MAX_PENDING_SENDS`] (round
 /// 32: the UI already cleared its composer, so the text must stay
-/// retryable). Counted apart so they never take an ordinary send's slot.
+/// retryable). A new send takes one only when the ordinary slots are full,
+/// and a refusal behind a logout takes an ordinary slot only when these are
+/// full (round 33), so core keeps a send while its whole table has room.
 /// The table holds at most `MAX_PENDING_SENDS + MAX_KEPT_SENDS`, the UI's
 /// echo cap.
 pub(super) const MAX_KEPT_SENDS: usize = 32;

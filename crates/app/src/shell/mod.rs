@@ -146,6 +146,7 @@ impl EventSink for Root {
             && session.closing == Closing::Open
         {
             tracing::error!("core stopped unexpectedly");
+            session.core_stopped(cx);
             session.show_notice(crate::ui::copy::CORE_STOPPED.into(), window, cx);
         }
     }
