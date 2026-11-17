@@ -22,11 +22,12 @@ use super::jobs::{self, CallError, Done, Outcome, TaskKind};
 use super::logout::LocalDone;
 use super::{Actor, admission::MAX_CONCURRENT};
 use crate::api::{
-    ClientGen, ConnState, Event, LogoutStatus, RemoteLogout, StorageError, UserError,
+    ClientGen, ConnState, Event, HistoryDir, LogoutStatus, RemoteLogout, StorageError, UserError,
 };
 use crate::backend::{
     Backend, BackendError, Instance, InstanceControl, Seed, SessionSeed, SessionSnapshot,
 };
+use crate::model::ChatId;
 
 /// First rebuild delay; doubles per attempt.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -487,7 +488,11 @@ impl<B: Backend> Actor<B> {
             return;
         };
         let after = self.after_for(reason);
-        self.begin_retire();
+        if let Some((chat, dir)) = self.begin_retire() {
+            // The UI keeps its window across a rebuild: tell it the load it
+            // waits on is gone, so its backoff and Retry take over (round 20).
+            self.history_ended(chat, dir, Some(UserError::Busy)).await;
+        }
         self.life.phase = Phase::Retiring(after);
         if after == After::Rebuild {
             let (attempt, delay) = self.life.backoff.next(Instant::now());
@@ -518,14 +523,16 @@ impl<B: Backend> Actor<B> {
 
     /// Rebuild step 1: stop admission and make every completion of the old
     /// instance stale. Parked permits stay parked until retirement completes.
-    pub(super) fn begin_retire(&mut self) {
+    /// Returns the queued load the UI waits on that was dropped, if any.
+    #[must_use]
+    pub(super) fn begin_retire(&mut self) -> Option<(ChatId, HistoryDir)> {
         self.cgen = ClientGen(self.cgen.0 + 1);
         self.boot = None;
         self.life.timeouts.clear();
         self.history_busy.clear();
         self.dialogs_busy = false;
         self.dialogs_queued = false;
-        self.purge_queued();
+        self.purge_queued()
     }
 
     async fn finish_retire(&mut self, retired: Retired, after: After) {
@@ -668,7 +675,8 @@ impl<B: Backend> Actor<B> {
         let Some(live) = self.live.take() else {
             return;
         };
-        self.begin_retire();
+        // Signed out: no chat is open, so no load is waited on.
+        let _ = self.begin_retire();
         self.life.phase = Phase::Retiring(After::Rebuild);
         self.life.pending_delay = Duration::ZERO;
         let shutdown = self.cancel.clone();

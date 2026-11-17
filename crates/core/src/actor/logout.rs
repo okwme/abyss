@@ -285,7 +285,8 @@ impl<B: Backend> Actor<B> {
             Phase::Booting | Phase::Live | Phase::Halted | Phase::SignedOut => {}
         }
         let live = self.live.take();
-        self.begin_retire();
+        // The account's data and the UI's views are reset below.
+        let _ = self.begin_retire();
         self.auth.abort_task();
         // Teardown begins: a new account epoch (commands the UI made before
         // it are refused), and the cache is never read again (round 15, C).
@@ -462,6 +463,9 @@ impl<B: Backend> Actor<B> {
         self.windows = crate::store::Windows::default();
         self.open = None;
         self.viewing = None;
+        // Loads of the old account's views owe the UI nothing (round 20).
+        self.owed = None;
+        self.deferred.clear();
         self.reads.clear();
         self.sends = super::sends::PendingSends::default();
         self.queue.clear();

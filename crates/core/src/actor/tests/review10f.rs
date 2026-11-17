@@ -257,3 +257,67 @@ async fn a_stale_absorbed_fetch_leaves_nothing_behind() {
     assert!(!rest.iter().any(|e| ended(e) || older(e)), "{rest:?}");
     h.stop().await;
 }
+
+/// Round 20 (re-check of task 10f), finding 1: a `LoadOlder` in flight when
+/// the user logs out. Logout drops the open chat and its windows; the load
+/// it owed the UI must go with them, or the actor's invariant check fails
+/// and core stops in the middle of the logout.
+#[tokio::test(start_paused = true)]
+async fn logout_with_an_older_load_in_flight_completes() {
+    let mut h = harness(FakeScript::demo(2, 200), None).await;
+    open(&mut h).await;
+    h.fake.lead(Op::History, Duration::from_secs(10));
+    h.send(Command::LoadOlder(chat(1))).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    h.send(Command::Logout).await;
+    h.auth(|s| matches!(s, crate::api::AuthState::LoggedOut { .. }))
+        .await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    // Core still runs: it answers a command after the old load ended.
+    h.send(Command::LoadDialogs).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    h.stop().await;
+}
+
+/// Round 20, finding 2: a `LoadOlder` queued behind sixteen hanging calls
+/// when the instance is rebuilt. The purge used to drop it silently, so the
+/// UI, which keeps its window across a rebuild, stayed pending until some
+/// later bootstrap invalidated the chat. Now it gets `LoadEnded(Busy)`.
+#[tokio::test(start_paused = true)]
+async fn a_queued_older_load_purged_by_a_rebuild_is_answered() {
+    let mut h = harness(FakeScript::demo(2, 200), None).await;
+    open(&mut h).await;
+    let max = crate::actor::MAX_CONCURRENT;
+    for _ in 0..max {
+        h.fake.inject(Op::Read, Fault::Hang);
+    }
+    for i in 0..max {
+        let id = i64::try_from(i).unwrap() + 10;
+        h.send(Command::MarkRead {
+            chat: chat(id),
+            max_id: MsgId(1),
+        })
+        .await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(h.fake.calls(Op::Read), max);
+    let before = h.fake.calls(Op::History);
+    h.send(Command::LoadOlder(chat(1))).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.fake.calls(Op::History), before, "queued behind the reads");
+    h.fake
+        .stream_error(crate::backend::StreamError::Fatal)
+        .await;
+    let (ev, _) = h.until(ended).await;
+    assert!(
+        matches!(
+            ev,
+            Event::LoadEnded {
+                error: Some(UserError::Busy),
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    h.stop().await;
+}

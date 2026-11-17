@@ -229,7 +229,8 @@ impl<B: Backend> Actor<B> {
 
     async fn start_snapshots(&mut self, kind: BootKind) {
         if kind == BootKind::Full {
-            self.purge_queued();
+            // Every window is invalidated below, which ends the UI's loads.
+            let _ = self.purge_queued();
             // Deferred loads were for windows that are invalidated now.
             self.deferred.clear();
             self.owed = None;

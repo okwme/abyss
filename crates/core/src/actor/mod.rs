@@ -416,7 +416,10 @@ impl<B: Backend> Actor<B> {
 
     /// Drops queued snapshot and history loads (their views are going away) and
     /// dialogs loads; sends and read marks stay queued for the next instance.
-    fn purge_queued(&mut self) {
+    /// Returns the purged load the UI still waits on, if any: the caller
+    /// answers it unless the view is invalidated right after (round 20).
+    fn purge_queued(&mut self) -> Option<(ChatId, HistoryDir)> {
+        let mut owed = None;
         let keep = |job: &Job| matches!(job, Job::Send { .. } | Job::Read { .. });
         let (kept, purged): (Vec<Job>, Vec<Job>) = self.queue.drain(..).partition(keep);
         self.queue = kept.into();
@@ -424,14 +427,17 @@ impl<B: Backend> Actor<B> {
         for job in purged {
             match job {
                 Job::Dialogs { .. } => self.dialogs_busy = false,
-                Job::History { load, .. } => {
+                Job::History { load, dir, .. } => {
                     self.release_history(load);
                     self.covers.fetch_ended(load.chat, load.req);
-                    self.take_owed(load);
+                    if self.take_owed(load).is_some() {
+                        owed = Some((load.chat, dir));
+                    }
                 }
                 Job::Send { .. } | Job::Read { .. } => {}
             }
         }
+        owed
     }
 
     async fn on_internal(&mut self, msg: Internal) {

@@ -1195,6 +1195,12 @@ Open items:
   - Optional: a characterization test for anchor restore when the anchor was deleted.
   - Deviation: fix 4 schedules a wake-up instead of making the gap per chat. That is simpler, and it keeps the shell-wide bound, which also covers the dialogs list.
 
+- **Round 20 (re-check of task 10f, 2026-11-17).** Fixed by the coordinator (tests at the end of `actor/tests/review10f.rs`):
+  - **Medium:** logout with a `LoadOlder` in flight tripped the owed-load invariant and stopped core mid-logout. `begin_retire` purged only queued obligations, and `reset_account_data` then dropped the open chat. Fix: `reset_account_data` clears `owed` and the deferred loads with the account's views.
+  - **Low (pre-existing):** a user load queued behind occupied permits was purged at retirement without `LoadEnded`. The UI keeps its window across a rebuild, so it stayed pending while recovery stalled. Fix: `purge_queued` and `begin_retire` return the purged owed load, and a rebuild answers it with `LoadEnded { error: Busy }`. Logout and the full bootstrap stay silent, because they reset or invalidate the UI's views right after.
+  - Confirmed clean: the restart budget, exact acknowledgement, bounded focus retries, the scheduled gap wake, a single owed slot (the second direction is deferred), timer composition, and test hooks gated behind the fake feature.
+  - Open: a filtered core test run (`review10f`, the `a_cached_older_page…` test) sometimes ends with SIGSEGV at process exit after every test passed. It predates 10f's follow-up, and the full suite exits 0. Investigating as its own track.
+
 - **Round 15 (re-check of task 6c, 2026-11-17).** All fixed in task 6d (section 13):
   - The incomplete-logout state was not durable: after a failed remote logout and a failed session delete, a restart signed the old account back in. A logout-pending marker must be recorded before any side effect, checked before the session, cache or client, fail closed when unreadable, and be cleared only after both deletions.
   - **High:** the UI kept account A's messages and draft after logout, so account B could see them under a shared peer id.
