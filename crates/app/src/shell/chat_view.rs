@@ -8,9 +8,9 @@ use std::time::Instant;
 use abyss_core::model::{Body, ChatKind, ChatSummary, Message, MsgId};
 use abyss_core::rich_text::RichText;
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, Hsla, Rgba, SharedString,
-    Stateful, StyledText, WeakEntity, Window, canvas, div, font, list, prelude::*, px,
-    transparent_black, uniform_list,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, FontWeight, Hsla, Rgba,
+    SharedString, Stateful, StyledText, WeakEntity, Window, canvas, div, font, list, prelude::*,
+    px, transparent_black, uniform_list,
 };
 use jiff::tz::TimeZone;
 
@@ -27,6 +27,8 @@ use crate::ui::theme::{self, Depth, Theme, Themes};
 const CHAT_ROW_HEIGHT: f32 = 56.;
 const SIDEBAR_WIDTH: f32 = 300.;
 const BUBBLE_MAX_WIDTH: f32 = 560.;
+/// Strength of the ink wash behind a bubble's sender band.
+const HEADER_WASH: f32 = 0.06;
 
 fn fonts() -> Fonts {
     Fonts {
@@ -516,19 +518,46 @@ impl Side {
     }
 }
 
-/// A message bubble, right-aligned for outgoing messages.
-fn in_bubble(side: Side, theme: &Theme, content: Vec<AnyElement>) -> AnyElement {
-    let inner = div()
-        .max_w(px(BUBBLE_MAX_WIDTH))
+/// A message bubble, right-aligned for outgoing messages. A `header` (the
+/// sender, in groups) sits on its own tinted band above the body, set off by
+/// a hairline, so who spoke never blends into what was said.
+fn in_bubble(
+    side: Side,
+    theme: &Theme,
+    header: Option<AnyElement>,
+    content: Vec<AnyElement>,
+) -> AnyElement {
+    let ink = side.ink(theme);
+    let band = header.map(|h| {
+        div()
+            .w_full()
+            .px_3()
+            .pt_2()
+            .pb_1p5()
+            // GPUI clips children to a rectangle, not the bubble's rounded
+            // corners, so the band rounds its own top to match.
+            .rounded_t(px(theme::RADIUS))
+            .bg(theme::faded(ink, HEADER_WASH))
+            .border_b_1()
+            .border_color(theme::line(ink))
+            .child(h)
+    });
+    let body = div()
         .px_3()
         .py_2()
-        .rounded(px(theme::RADIUS))
-        .bg(side.fill(theme))
-        .text_color(side.ink(theme))
         .flex()
         .flex_col()
         .gap_1()
         .children(content);
+    let inner = div()
+        .max_w(px(BUBBLE_MAX_WIDTH))
+        .rounded(px(theme::RADIUS))
+        .bg(side.fill(theme))
+        .text_color(ink)
+        .flex()
+        .flex_col()
+        .children(band)
+        .child(body);
     let row = div().w_full().flex();
     let row = if side == Side::Outgoing {
         row.justify_end()
@@ -621,6 +650,8 @@ impl RowCtx {
                 div()
                     .text_sm()
                     .font_family(theme::NAME_FONT)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .truncate()
                     .child(s.name.clone())
                     .into_any_element()
             });
@@ -630,12 +661,11 @@ impl RowCtx {
         } else {
             time.to_string()
         };
-        let mut content: Vec<AnyElement> = Vec::with_capacity(4);
-        content.extend(sender);
+        let mut content: Vec<AnyElement> = Vec::with_capacity(3);
         content.extend(reply.map(|r| reply_quote(r, ink).into_any_element()));
         content.push(body);
         content.push(muted(footer).text_xs().into_any_element());
-        in_bubble(side, &self.theme, content)
+        in_bubble(side, &self.theme, sender, content)
     }
 
     /// Formatted text: a link click copies its target (links never open), a
@@ -714,6 +744,7 @@ fn echo_row(e: &Echo, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     in_bubble(
         Side::Outgoing,
         theme,
+        None,
         vec![body.into_any_element(), status.into_any_element()],
     )
 }
