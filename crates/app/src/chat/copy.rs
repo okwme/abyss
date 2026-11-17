@@ -34,6 +34,10 @@ pub(crate) const STRANDED: &str = "Unknown: abyss stopped before confirming. It 
 /// Core stopped with this send failed: it was not sent.
 pub(crate) const STRANDED_UNSENT: &str = "Not sent: abyss stopped before it could be retried.";
 pub(crate) const COPY_TEXT: &str = "Copy text";
+/// A chat switch refused because a draft would need a slot past the bound.
+pub(crate) const TOO_MANY_DRAFTS: &str = "Too many unsent drafts: send or clear one first.";
+/// Enter while core is stopped.
+pub(crate) const CORE_STOPPED_COPY: &str = "abyss stopped: copy anything you need, then restart.";
 pub(crate) const TEXT_COPIED: &str = "Text copied.";
 /// Put back from a chat other than the send's.
 pub(crate) const OTHER_CHAT: &str = "Open the chat this message was for to put it back.";

@@ -70,6 +70,8 @@ pub(crate) struct ChatShell {
     /// Composer text of chats not open (task 6k): the box belongs to the
     /// open chat.
     drafts: drafts::Drafts,
+    /// Whether core still runs; stopped, nothing is asked of it (task 6l).
+    core: CoreState,
     next_local: u64,
     /// Whether the window is active, as the OS last said. Reads and the
     /// live tail follow this at once, whatever core was told.
@@ -107,6 +109,14 @@ struct RetryTimer {
     task: Option<Task<()>>,
 }
 
+/// Whether core runs, as the event stream says (task 6l).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreState {
+    Running,
+    /// Its event stream closed while it ran.
+    Stopped,
+}
+
 /// Whether a flood-wait countdown ticker runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Countdown {
@@ -129,6 +139,7 @@ impl Default for ChatShell {
             read_sent: None,
             viewing: None,
             drafts: drafts::Drafts::default(),
+            core: CoreState::Running,
             next_local: 1,
             active: WindowState::Active,
             focus_sent: WindowState::Active,
@@ -165,6 +176,7 @@ impl ChatShell {
     /// counter, so a stale event for an old send never matches a new one.
     pub(crate) fn reset(&mut self) {
         let fresh = Self {
+            core: self.core,
             next_local: self.next_local,
             active: self.active,
             focus_sent: self.focus_sent,

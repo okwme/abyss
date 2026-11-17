@@ -7,8 +7,9 @@ use std::collections::VecDeque;
 
 use abyss_core::model::ChatId;
 
-/// Drafts kept at once. Past it the draft stashed longest ago goes: a
-/// bound on memory, far above how many chats a person drafts in at once.
+/// Drafts kept at once: a bound on memory, far above how many chats a
+/// person drafts in at once. A draft is never dropped to make room (task
+/// 6l): a switch that would need a slot past the bound is refused.
 pub(crate) const MAX_DRAFTS: usize = 64;
 
 #[derive(Default)]
@@ -28,17 +29,33 @@ impl std::fmt::Debug for Drafts {
 
 impl Drafts {
     /// Keeps `text` as `chat`'s draft, replacing an older one; an empty
-    /// text clears it.
-    pub(crate) fn stash(&mut self, chat: ChatId, text: String) {
+    /// text clears it. Full: `Err` hands the text back, nothing dropped.
+    pub(crate) fn stash(&mut self, chat: ChatId, text: String) -> Result<(), String> {
         self.list.retain(|(c, _)| *c != chat);
         if text.is_empty() {
-            return;
+            return Ok(());
         }
         if self.list.len() >= MAX_DRAFTS {
-            drop(self.list.pop_front());
+            return Err(text);
         }
         self.list.push_back((chat, text));
         debug_assert!(self.list.len() <= MAX_DRAFTS);
+        Ok(())
+    }
+
+    /// Whether switching from `from` (its box holding `text`) to `to` can
+    /// keep every draft: `to`'s draft leaves first (freeing its slot), and
+    /// `from`'s replaces its own; an empty box stashes nothing.
+    pub(crate) fn can_switch(&self, from: ChatId, to: ChatId, text: &str) -> bool {
+        if text.is_empty() {
+            return true;
+        }
+        let freed = self
+            .list
+            .iter()
+            .filter(|(c, _)| *c == from || *c == to)
+            .count();
+        self.list.len() - freed < MAX_DRAFTS
     }
 
     /// Takes `chat`'s draft out.
@@ -62,19 +79,46 @@ mod tests {
     }
 
     #[test]
-    fn one_draft_per_chat_bounded() {
+    fn one_draft_per_chat_bounded_and_never_dropped() {
         let mut d = Drafts::default();
-        d.stash(chat(1), "a".into());
-        d.stash(chat(1), "a2".into());
-        d.stash(chat(2), String::new());
+        d.stash(chat(1), "a".into()).unwrap();
+        d.stash(chat(1), "a2".into()).unwrap();
+        d.stash(chat(2), String::new()).unwrap();
         assert_eq!(d.take(chat(2)), None, "empty clears");
         assert_eq!(d.take(chat(1)).as_deref(), Some("a2"));
         assert_eq!(d.take(chat(1)), None, "taken");
-        for n in 0..=i64::try_from(MAX_DRAFTS).unwrap() {
-            d.stash(chat(n), format!("t{n}"));
+        let max = i64::try_from(MAX_DRAFTS).unwrap();
+        for n in 0..max {
+            d.stash(chat(n), format!("t{n}")).unwrap();
         }
-        assert_eq!(d.take(chat(0)), None, "oldest went at the bound");
-        assert_eq!(d.take(chat(1)).as_deref(), Some("t1"));
+        assert_eq!(d.stash(chat(max), "new".into()), Err("new".to_owned()));
+        assert_eq!(d.take(chat(0)).as_deref(), Some("t0"), "nothing dropped");
         assert!(!format!("{d:?}").contains("t2"), "no text in Debug");
+    }
+
+    #[test]
+    fn a_switch_needs_a_slot_only_for_new_text() {
+        let mut d = Drafts::default();
+        let max = i64::try_from(MAX_DRAFTS).unwrap();
+        for n in 0..max {
+            d.stash(chat(n), format!("t{n}")).unwrap();
+        }
+        let outside = chat(max);
+        assert!(
+            d.can_switch(outside, chat(0), "x"),
+            "the destination's slot frees"
+        );
+        assert!(
+            d.can_switch(chat(1), chat(max + 1), "x"),
+            "replaces its own"
+        );
+        assert!(
+            !d.can_switch(outside, chat(max + 1), "x"),
+            "needs a new slot"
+        );
+        assert!(
+            d.can_switch(outside, chat(max + 1), ""),
+            "an empty box stashes nothing"
+        );
     }
 }

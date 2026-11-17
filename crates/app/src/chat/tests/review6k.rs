@@ -1,5 +1,6 @@
 //! Regression tests for review round 34 (re-check of task 6j), task 6k,
-//! the chat shell's half. Each fails on the 6j code. Findings 2 and 3 (a
+//! the chat shell's half, and round 35 (task 6l) finding 3. Each fails on
+//! the code before its fix. Findings 2 and 3 (a
 //! core stop, per-chat drafts) are in `shell/tests.rs`.
 
 use super::*;
@@ -56,4 +57,34 @@ fn a_core_stop_strands_only_what_waits_on_core() {
         crate::chat::copy::STRANDED_UNSENT
     );
     assert_eq!(shell.take_returned(failed).as_deref(), Some("failed"));
+}
+
+/// Task 6l, finding 3: a Discard is queued for an `Unknown` send, a late
+/// confirmation arrives, then core stops before the discard's answer. No
+/// echo stays "Discarding…": a delivered one is kept, shows its delivered
+/// state, and offers neither Retry nor Put back.
+#[test]
+fn a_core_stop_finalizes_a_delivered_echo_left_discarding() {
+    for confirmed in [
+        SendState::Sent { id: MsgId(101) },
+        SendState::SentUnconfirmed,
+    ] {
+        let mut core = Core::default();
+        let mut shell = open(&mut core);
+        let id = send(&mut shell, &mut core, "once");
+        set(&mut shell, id, SendState::Unknown { attempts: 3 });
+        shell.discard(id, &mut core.admit()).unwrap();
+        set(&mut shell, id, confirmed);
+        shell.core_stopped();
+        let echo = shell.echoes().get(id).unwrap();
+        assert_eq!(echo.phase, crate::chat::sends::Phase::Kept, "{confirmed:?}");
+        assert_eq!(echo.state, confirmed);
+        assert!(!echo.can_retry() && !echo.can_discard() && !echo.is_returned());
+        assert_ne!(
+            crate::chat::copy::send_label(echo, now()),
+            "Discarding…",
+            "{confirmed:?}"
+        );
+        assert_eq!(shell.returned(id), None);
+    }
 }

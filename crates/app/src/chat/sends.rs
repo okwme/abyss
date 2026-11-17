@@ -227,22 +227,32 @@ impl Echoes {
     }
 
     /// Core's event stream closed while it ran (task 6k): no answer will
-    /// come. Every echo still waiting on core (a submission, a discard, a
-    /// send not delivered) is stranded with its last state; delivered and
-    /// returned ones stay. Returns whether any changed.
+    /// come, so every pending phase is finalized (task 6l) and none stays
+    /// `Submitted` or `Discarding`. A delivered echo is `Kept` (it shows
+    /// its delivered state, with no Retry or Put back); any other echo
+    /// still waiting on core is stranded with its last state; returned and
+    /// stranded ones stay. Returns whether any changed.
     pub(crate) fn strand(&mut self) -> bool {
         let mut changed = false;
         for echo in &mut self.list {
-            let waiting = matches!(
-                echo.phase,
-                Phase::Submitted | Phase::Kept | Phase::Discarding
-            );
-            if waiting && !echo.delivered() {
-                echo.phase = Phase::Stranded;
+            let next = match echo.phase {
+                Phase::Returned | Phase::Stranded => continue,
+                Phase::Submitted | Phase::Kept | Phase::Discarding if echo.delivered() => {
+                    Phase::Kept
+                }
+                Phase::Submitted | Phase::Kept | Phase::Discarding => Phase::Stranded,
+            };
+            if next != echo.phase {
+                echo.phase = next;
                 echo.resend_at = None;
                 changed = true;
             }
         }
+        debug_assert!(
+            self.list
+                .iter()
+                .all(|e| !matches!(e.phase, Phase::Submitted | Phase::Discarding))
+        );
         changed
     }
 

@@ -907,6 +907,139 @@ mod fake {
         );
     }
 
+    fn user(id: i64) -> ChatId {
+        ChatId {
+            kind: PeerKind::User,
+            id,
+        }
+    }
+
+    /// Chat 1 open with `typed` in the box, and a draft stashed for each of
+    /// chats 2..=65 (the bound), oldest first.
+    fn drafts_at_the_bound<'a>(
+        cx: &'a mut TestAppContext,
+        typed: &str,
+    ) -> (Entity<Root>, &'a mut VisualTestContext, Harness) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let max = i64::try_from(crate::chat::drafts::MAX_DRAFTS).unwrap();
+        root.update_in(cx, |root, _, cx| {
+            root.with_session(
+                |s, _| {
+                    for id in 2..=max + 1 {
+                        s.shell.stash_draft(user(id), format!("t{id}")).unwrap();
+                    }
+                },
+                cx,
+            );
+        });
+        cx.simulate_input(typed);
+        (root, cx, harness)
+    }
+
+    fn selected(root: &Entity<Root>, cx: &mut VisualTestContext) -> Option<ChatId> {
+        read(root, cx, |s| s.shell.selected())
+    }
+
+    /// Task 6l, finding 1: at the bound, switching to the chat with the
+    /// oldest draft frees its slot first, so the box's text is kept and the
+    /// destination's draft comes back: nothing is lost.
+    #[gpui::test]
+    fn switching_to_the_oldest_draft_at_the_bound_loses_nothing(cx: &mut TestAppContext) {
+        let (root, cx, _harness) = drafts_at_the_bound(cx, "typed in 1");
+        select(&root, cx, 2);
+        assert_eq!(selected(&root, cx), Some(user(2)));
+        assert_eq!(composer_text(&root, cx), "t2");
+        let max = i64::try_from(crate::chat::drafts::MAX_DRAFTS).unwrap();
+        root.update_in(cx, |root, _, cx| {
+            root.with_session(
+                |s, _| {
+                    assert_eq!(s.shell.take_draft(user(1)).as_deref(), Some("typed in 1"));
+                    for id in 3..=max + 1 {
+                        let draft = s.shell.take_draft(user(id));
+                        assert_eq!(draft, Some(format!("t{id}")), "chat {id}");
+                    }
+                },
+                cx,
+            );
+        });
+    }
+
+    /// Task 6l, finding 1: at the bound, a switch whose box text needs a
+    /// new slot is refused with a notice; the open chat and its text stay.
+    #[gpui::test]
+    fn a_switch_needing_a_slot_past_the_bound_is_refused(cx: &mut TestAppContext) {
+        let (root, cx, harness) = drafts_at_the_bound(cx, "typed in 1");
+        let from = harness.sent.borrow().commands.len();
+        select(&root, cx, 99);
+        assert_eq!(selected(&root, cx), Some(user(1)));
+        assert_eq!(composer_text(&root, cx), "typed in 1");
+        assert_eq!(
+            read(&root, cx, |s| s.notice.clone()),
+            Some(crate::chat::copy::TOO_MANY_DRAFTS.into())
+        );
+        assert!(commands_since(&harness, from).is_empty(), "no OpenChat");
+    }
+
+    /// Task 6l, finding 1: an empty box stashes nothing, so it switches
+    /// freely at the bound.
+    #[gpui::test]
+    fn an_empty_box_switches_freely_at_the_bound(cx: &mut TestAppContext) {
+        let (root, cx, _harness) = drafts_at_the_bound(cx, "");
+        select(&root, cx, 99);
+        assert_eq!(selected(&root, cx), Some(user(99)));
+        assert_eq!(composer_text(&root, cx), "");
+    }
+
+    /// Core stopped with chat 1 holding `pending` (a send core never
+    /// answered, if any) and the draft "draft in 1", while chat 2 is open.
+    /// Reopening chat 1 is local: its stranded echo and draft are there, no
+    /// command is issued, and Enter sends nothing.
+    fn reopen_after_core_stop(cx: &mut TestAppContext, pending: Option<&str>) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let local_id = pending.map(|text| submit_text(cx, &harness, text));
+        cx.simulate_input("draft in 1");
+        select(&root, cx, 2);
+        harness.events.close_channel();
+        cx.run_until_parked();
+        let from = harness.sent.borrow().commands.len();
+        select(&root, cx, 1);
+        assert_eq!(selected(&root, cx), Some(user(1)), "local navigation");
+        assert_eq!(composer_text(&root, cx), "draft in 1");
+        if let Some(id) = local_id {
+            let stranded = read(&root, cx, |s| s.shell.stranded_text(id).map(str::to_owned));
+            assert_eq!(stranded.as_deref(), pending, "Copy reaches it");
+            assert_eq!(
+                read(&root, cx, |s| s.shell.row_count()),
+                1,
+                "its echo shows"
+            );
+        }
+        cx.simulate_keystrokes("enter");
+        assert!(
+            commands_since(&harness, from).is_empty(),
+            "nothing asked of core"
+        );
+        assert_eq!(composer_text(&root, cx), "draft in 1", "nothing sent");
+        assert_eq!(
+            read(&root, cx, |s| s.notice.clone()),
+            Some(crate::chat::copy::CORE_STOPPED_COPY.into())
+        );
+    }
+
+    /// Task 6l, finding 2.
+    #[gpui::test]
+    fn after_a_core_stop_another_chats_stranded_send_and_draft_stay_reachable(
+        cx: &mut TestAppContext,
+    ) {
+        reopen_after_core_stop(cx, Some("pending in 1"));
+    }
+
+    /// Task 6l, finding 2, with a draft only.
+    #[gpui::test]
+    fn after_a_core_stop_another_chats_draft_stays_reachable(cx: &mut TestAppContext) {
+        reopen_after_core_stop(cx, None);
+    }
+
     fn commands_since(harness: &Harness, from: usize) -> Vec<String> {
         harness
             .sent

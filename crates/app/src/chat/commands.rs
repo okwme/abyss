@@ -10,13 +10,13 @@ use abyss_core::api::{Command, HistoryDir, UserError, WindowState};
 use abyss_core::model::{ChatId, LocalId};
 use gpui::FollowMode;
 
-use super::ChatShell;
 use super::messages::MessageWindow;
 use super::retry::AUTO_RESTART_GAP;
 use super::sends::Echo;
 #[cfg(test)]
 use super::sends::Echoes;
 use super::viewport::Seen;
+use super::{ChatShell, CoreState};
 
 /// Core did not take a command: its queue is full, or it is gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +35,11 @@ impl ChatShell {
         if self.selected == Some(chat) {
             return Ok(());
         }
-        admit(Command::OpenChat(chat))?;
+        // Core stopped (task 6l): local only, so the chat's stranded
+        // echoes and draft stay reachable; nothing is asked of core.
+        if self.core == CoreState::Running {
+            admit(Command::OpenChat(chat))?;
+        }
         self.selected = Some(chat);
         self.window = Some(MessageWindow::new(chat));
         self.revealed.clear();
@@ -51,6 +55,9 @@ impl ChatShell {
     /// Where a composer submission would go: `Ok(None)` when nothing is open
     /// or the chat is read-only, `Busy` when the send table is full.
     pub(crate) fn send_target(&self) -> Result<Option<ChatId>, UserError> {
+        if self.core == CoreState::Stopped {
+            return Ok(None);
+        }
         let Some(chat) = self.selected_chat().filter(|c| c.can_send) else {
             return Ok(None);
         };
@@ -148,16 +155,31 @@ impl ChatShell {
 
     /// Core's event stream closed while it ran (task 6k): every echo still
     /// waiting on an answer is stranded, its text kept.
+    /// From then on nothing is asked of core: selecting a chat is local
+    /// (task 6l) and nothing can be sent.
     pub(crate) fn core_stopped(&mut self) {
+        self.core = CoreState::Stopped;
         if self.echoes.strand() {
             self.remeasure_echoes();
         }
     }
 
+    /// Whether core stopped while it ran ([`Self::core_stopped`]).
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.core == CoreState::Stopped
+    }
+
     /// Stashes the composer's text as `chat`'s draft (an empty one clears
-    /// it).
-    pub(crate) fn stash_draft(&mut self, chat: ChatId, text: String) {
-        self.drafts.stash(chat, text);
+    /// it). Full: `Err` hands the text back; see [`Self::can_switch`].
+    pub(crate) fn stash_draft(&mut self, chat: ChatId, text: String) -> Result<(), String> {
+        self.drafts.stash(chat, text)
+    }
+
+    /// Whether the open chat can change to `to` without losing a draft:
+    /// the box's `text` needs a slot unless it is empty or the slots free.
+    pub(crate) fn can_switch(&self, to: ChatId, text: &str) -> bool {
+        self.selected
+            .is_none_or(|from| self.drafts.can_switch(from, to, text))
     }
 
     /// Takes `chat`'s stashed draft.
@@ -190,7 +212,7 @@ impl ChatShell {
         now: Instant,
         admit: Admit<'_>,
     ) -> Result<(), Refused> {
-        if !self.list.wants_more(now) {
+        if !self.list.wants_more(now) || self.core == CoreState::Stopped {
             return Ok(());
         }
         match admit(Command::LoadDialogs) {
@@ -219,6 +241,10 @@ impl ChatShell {
         now: Instant,
         admit: Admit<'_>,
     ) -> Result<(), Refused> {
+        if self.core == CoreState::Stopped {
+            // Nothing to ask of core, so no retry to schedule (task 6l).
+            return Ok(());
+        }
         let focus = if self.focus_out_of_sync() && self.focus_retry.ready(now) {
             self.sync_focus(now, admit)
         } else {

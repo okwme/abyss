@@ -423,7 +423,7 @@ Messages carry no `random_id` (`api.tl:128`). The only correlation is `updateMes
   - Exceptions to "every command is answered" (task 6k):
     - **Shutdown:** once the app quits, core's last events may never be applied; nothing outlives the window.
     - **Epoch reset:** a command made for an earlier account epoch is dropped unanswered; the UI already cleared that account's echoes and drafts.
-    - **Core stop:** if core's event stream closes while it runs (an actor panic), no answer comes. The UI strands every echo still waiting (unknown fate, text kept for Copy, never Retry).
+    - **Core stop:** if core's event stream closes while it runs (an actor panic), no answer comes. The UI finalizes every pending echo: a delivered one is kept; any other is stranded (unknown fate, text kept for Copy, never Retry). From then on chat selection is local and nothing is sent (task 6l).
     - **Superseded answer:** the stream is ordered, so an answer reflects core's state when it ran. The one answer that can be older than state the UI already shows is a `SendRefused` for a Retry queued before a late confirmation; it never changes a delivered echo.
 - **States:**
 
@@ -1032,6 +1032,20 @@ Open items:
 5. **Revocation after a failed marker (LOW).** Also fixed by the overlay: the screen is derived from the gate's current trigger, which a revocation escalates to `Server`, so "Stay signed in" goes. Test: `revocation_after_a_failed_marker_takes_stay_signed_in_away`. It was not run against the pre-overlay gate, which predates the other round 25 changes.
 - Also: the Fragment allowlist stays on `fragment.com`, with a comment that subdomains and the path format are unverified. `docs/connecting.md` now describes "Logging out" during the marker write, and says an unreadable record loads no session, opens no cache and deletes nothing.
 
+**Task 6l status (2026-11-17): round 35 re-check of task 6k, offline against the fake.** Each regression test fails with its fix disabled in place (checked one fix at a time). Tests are in `crates/app/src/shell/tests.rs`, `chat/drafts.rs` and `chat/tests/review6k.rs`. Exit-safety files and core were not touched.
+1. **Draft eviction destroyed unsent text (P2).** A draft is never dropped now.
+   - `Drafts::stash` hands the text back when full instead of evicting.
+   - The switch is transactional: `select_chat` first checks `Drafts::can_switch` (the destination's draft leaves, freeing its slot; the outgoing chat replaces its own; an empty box stashes nothing). `swap_draft` then takes the destination's draft out before stashing the box.
+   - A switch that would still need a slot past `MAX_DRAFTS` is refused with "Too many unsent drafts: send or clear one first." The open chat and the box's text stay, and no `OpenChat` is sent.
+   - Should the stash fail anyway, the text stays in the box.
+   - Tests: `switching_to_the_oldest_draft_at_the_bound_loses_nothing`, `a_switch_needing_a_slot_past_the_bound_is_refused`, `an_empty_box_switches_freely_at_the_bound`, and the `drafts` unit tests.
+2. **After a core stop, other chats' recovery text was unreachable (P2).** The chat shell records the stop (`CoreState::Stopped`).
+   - Selecting a chat is then local: no `OpenChat`. It shows the chat's header, its stranded echoes (Copy, Dismiss) and its draft in the box. Only the open chat's window is ever retained, so another chat shows no messages.
+   - Nothing is asked of core: `drive` refuses every command locally, and frame commands and dialogs pages stop, so no retry spins.
+   - Enter sends nothing and shows "abyss stopped: copy anything you need, then restart."
+   - Tests: `after_a_core_stop_another_chats_stranded_send_and_draft_stay_reachable` and `after_a_core_stop_another_chats_draft_stays_reachable`. Each leaves the item in chat 1, opens chat 2, stops core, then reopens chat 1: Copy reaches the text, the draft is in the box, and no command is issued, even on Enter.
+3. **A delivered echo stayed "Discarding…" after a core stop (P2).** `Echoes::strand` now finalizes every pending phase. A delivered echo (`Sent`, `SentUnconfirmed`) in any pending phase becomes `Kept` and shows its delivered state, with no Retry or Put back. Any other pending echo is stranded. A `debug_assert` checks that no echo stays `Submitted` or `Discarding`. Test: `a_core_stop_finalizes_a_delivered_echo_left_discarding` (Discard queued for an `Unknown` send, late `Sent`/`SentUnconfirmed`, core stops).
+
 **Task 6k status (2026-11-17): round 34 re-check of task 6j, offline against the fake.** Each regression test fails with its fix disabled in place (checked one fix at a time). Tests are in `crates/app/src/chat/tests/review6k.rs`, `chat/drafts.rs` and `shell/tests.rs`. Of `shell/mod.rs`, only `core_stopped` changed (one call); `on_app_quit`, `storage.rs` and `cache/census.rs` were not touched.
 1. **A refused Retry after a late confirmation offered sent text again (P2).** `Echoes::refused` no longer changes an echo the server already has (`Sent`, `SentUnconfirmed`). The `SendRefused` answering a Retry queued before the confirmation is older than the confirmation, so the delivered state stands, and Put back (a resend with a new `random_id`) is never offered. That is the only answer that can supersede newer state: core answers each command at the moment it runs, and the event stream is ordered. Test: `a_refused_retry_after_a_late_confirmation_never_offers_the_text_again` (`Sent` and `SentUnconfirmed`).
 2. **A core stop stranded unanswered echoes (P2).** When core's event stream closes while it runs (`Root::core_stopped`, not during a shutdown), every echo still waiting on core (`Submitted`, `Discarding`, or `Kept` and not delivered) becomes `Phase::Stranded` and keeps its last state and text. The label stays honest about uncertainty:
@@ -1044,6 +1058,7 @@ Open items:
    - `put_back_text_never_follows_the_box_into_another_chat`: put back in chat 1, open chat 2, press Enter; nothing of chat 1's goes to chat 2, and the draft is back in chat 1;
    - `put_back_needs_the_sends_own_chat_open`;
    - `drafts::one_draft_per_chat_bounded`.
+   - **Round 35:** eviction at the bound was replaced by a refused switch (task 6l).
 - Also:
   - `next_local` is allocated with `checked_add`; it fails closed (nothing sent, the box keeps its text) instead of wrapping onto an id core may hold.
   - The stale "never take an ordinary send's slot" comment on `MAX_KEPT_SENDS` now describes the round-33 fallback.
@@ -1465,6 +1480,11 @@ Open items:
   - **High:** the UI kept account A's messages and draft after logout, so account B could see them under a shared peer id.
   - **High:** commands queued behind Logout (sends included) could act for the next account. Reject account-scoped commands during logout and while signed out, quarantine the cache at teardown, and tag commands with an account generation.
   - **Medium:** a cache re-binding could lose its only completion notification: it reported before returning, and the actor checked `is_finished()`.
+
+- **Round 35 (re-check of task 6k, 2026-11-17).** GPT-6 Astra confirmed the delivered-refusal guard, checked allocation, the capacity comment, the audit verdicts, draft redaction and clearing, the shutdown exclusion, and stranded echoes counting toward 288 with Retry disabled. Three P2s remained. All fixed in task 6l (section 13, Task 6l status):
+  - **P2:** draft eviction silently destroyed unsent text. At the bound, switching to the chat with the oldest draft evicted that very draft. Drafts are never dropped now: the switch is transactional and refused when it would need a slot past the bound.
+  - **P2:** after a core stop, reopening another chat needed `OpenChat` admission, so its stranded echoes and draft were unreachable. Selection is local once core stopped, and nothing can be sent.
+  - **P2:** a delivered echo left "Discarding…" when core stopped stayed so. Stranding finalizes every pending phase.
 
 - **Round 34 (re-check of task 6j, 2026-11-17).** GPT-6 Astra: the acknowledgement contract holds for rebuild, teardown, the epoch fence and a full command channel. Three P2s remained. All fixed in task 6k (section 13, Task 6k status):
   - **P2:** a Retry queued for an `Unknown` send, then a late confirmation, then `SendRefused`: the refusal turned the delivered echo into returned text, and Put back would send it again. A refusal no longer changes a delivered echo.

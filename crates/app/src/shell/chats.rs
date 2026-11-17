@@ -83,7 +83,14 @@ impl Session {
     ) -> Option<R> {
         let offered = self.shell.retry_offered();
         let core = &self.core;
-        let mut admit = |cmd: Command| admit(core, cmd);
+        // Core stopped (task 6l): nothing is asked of it.
+        let stopped = self.shell.is_stopped();
+        let mut admit = |cmd: Command| {
+            if stopped {
+                return Err(Refused::Closed);
+            }
+            admit(core, cmd)
+        };
         let out = match f(&mut self.shell, &mut admit) {
             Ok(r) => Some(r),
             Err(refused) => {
@@ -252,6 +259,14 @@ impl Session {
         cx: &mut Context<'_, Root>,
     ) {
         let from = self.shell.selected();
+        if from != Some(chat) {
+            let text = self.composer.read(cx).text().to_owned();
+            if !self.shell.can_switch(chat, &text) {
+                // Never drop a draft (task 6l): the chat and its text stay.
+                self.show_notice(chat_copy::TOO_MANY_DRAFTS.into(), window, cx);
+                return;
+            }
+        }
         let opened = self.drive(OnRefusal::Notice, window, cx, |s, admit| {
             s.select(chat, admit)
         });
@@ -268,6 +283,10 @@ impl Session {
     /// admitted the send, together with its echo.
     pub(super) fn submit_message(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         if self.auth != AuthView::SignedIn {
+            return;
+        }
+        if self.shell.is_stopped() {
+            self.show_notice(chat_copy::CORE_STOPPED_COPY.into(), window, cx);
             return;
         }
         let chat = match self.shell.send_target() {
@@ -314,7 +333,9 @@ impl Session {
     }
 
     /// The open chat changed from `from` to `to` (task 6k): the box's text
-    /// stays `from`'s draft, and `to`'s draft comes back.
+    /// stays `from`'s draft, and `to`'s draft comes back. Transactional
+    /// (task 6l): `to`'s draft leaves first, freeing its slot, and
+    /// `select_chat` checked there is room, so no draft is dropped.
     fn swap_draft(
         &mut self,
         from: Option<ChatId>,
@@ -322,14 +343,25 @@ impl Session {
         window: &mut Window,
         cx: &mut Context<'_, Root>,
     ) {
+        let incoming = self.shell.take_draft(to);
         let text = self.composer.update(cx, |c, cx| c.take_text(window, cx));
-        if let Some(from) = from {
-            self.shell.stash_draft(from, text);
-        }
-        if let Some(draft) = self.shell.take_draft(to) {
+        let kept = from.map_or(Ok(()), |from| self.shell.stash_draft(from, text));
+        debug_assert!(kept.is_ok(), "room was checked before the switch");
+        // Checked above; should it fail, the text stays in the box rather
+        // than be lost (the incoming draft then stays stashed).
+        let restore = match (kept, incoming) {
+            (Err(text), incoming) => {
+                if let Some(draft) = incoming {
+                    drop(self.shell.stash_draft(to, draft));
+                }
+                text
+            }
+            (Ok(()), incoming) => incoming.unwrap_or_default(),
+        };
+        if !restore.is_empty() {
             let placed = self
                 .composer
-                .update(cx, |c, cx| c.put_text(&draft, window, cx));
+                .update(cx, |c, cx| c.put_text(&restore, window, cx));
             debug_assert!(placed, "the box was emptied above");
         }
     }
