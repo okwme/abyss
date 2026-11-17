@@ -6,7 +6,7 @@
 
 use super::review6g::{logout_stalled, settled, stay_signed_in};
 use super::{Harness, chat, harness};
-use crate::actor::sends::{MAX_HELD_SENDS, MAX_PENDING_SENDS};
+use crate::actor::sends::{MAX_KEPT_SENDS, MAX_PENDING_SENDS};
 use crate::api::{AuthState, Command, Event, SendState, UserError};
 use crate::backend::fake::FakeScript;
 use crate::model::LocalId;
@@ -57,7 +57,7 @@ async fn refused_sends_never_take_the_ordinary_send_slots() {
         "a held send was not kept: {ev:?}"
     );
     // Past the held bound: no record, so its Retry is answered as unknown.
-    let past = u64::try_from(MAX_HELD_SENDS).unwrap() + 1;
+    let past = u64::try_from(MAX_KEPT_SENDS).unwrap() + 1;
     h.send(Command::RetrySend(LocalId(past))).await;
     let (ev, seen) = h.until(settled(LocalId(past))).await;
     assert!(matches!(

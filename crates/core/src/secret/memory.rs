@@ -93,6 +93,9 @@ struct Faults {
     held_items: AtomicU8,
     /// Items an operation is blocked on by [`FaultControl::hold_item`].
     entered_items: AtomicU8,
+    /// Operations on these items never answer (until released): unlike a
+    /// hold, the clock gate stays shut.
+    stalled_items: AtomicU8,
     gate: ClockGate,
     calls: AtomicU64,
     held: Mutex<bool>,
@@ -178,11 +181,23 @@ impl FaultControl {
         self.0.held_items.fetch_or(item_bit(item), Ordering::SeqCst);
     }
 
-    /// Ends [`Self::hold`] and every [`Self::hold_item`].
+    /// Blocks every subsequent operation on `item` until [`Self::release`]
+    /// (at most 10 s) while the paused clock stays held: a store operation
+    /// that never answers, which only a wall-clock bound ends (review round
+    /// 32).
+    pub fn stall_item(&self, item: SecretItem) {
+        self.0
+            .stalled_items
+            .fetch_or(item_bit(item), Ordering::SeqCst);
+    }
+
+    /// Ends [`Self::hold`], every [`Self::hold_item`] and
+    /// [`Self::stall_item`].
     pub fn release(&self) {
         if let Ok(mut held) = self.0.held.lock() {
             *held = false;
             self.0.held_items.store(0, Ordering::SeqCst);
+            self.0.stalled_items.store(0, Ordering::SeqCst);
             self.0.entered_items.store(0, Ordering::SeqCst);
         }
         self.0.gate.released();
@@ -199,8 +214,18 @@ impl FaultControl {
         self.0.gate.clone()
     }
 
+    /// Waits while `item` is stalled (bounded like [`Self::hold`]).
+    fn stall(&self, item: SecretItem) {
+        let bit = item_bit(item);
+        let stalled = |_: &mut bool| self.0.stalled_items.load(Ordering::SeqCst) & bit != 0;
+        if let Ok(guard) = self.0.held.lock() {
+            let _ = self.0.released.wait_timeout_while(guard, MAX_HOLD, stalled);
+        }
+    }
+
     /// Waits while `item` is held (bounded like [`Self::hold`]).
     fn wait_item(&self, item: SecretItem) {
+        self.stall(item);
         let bit = item_bit(item);
         let held = |_: &mut bool| self.0.held_items.load(Ordering::SeqCst) & bit != 0;
         if let Ok(guard) = self.0.held.lock() {

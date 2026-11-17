@@ -10,8 +10,11 @@ use abyss_core::api::SendState;
 use abyss_core::model::{ChatId, LocalId, MsgId};
 
 /// Same bound as core's whole pending-send table (256 ordinary sends plus 32
-/// held behind a logout, review round 31): an echo exists only while core
-/// may still report on its send, and none core keeps is ever dropped. A
+/// kept `Failed` for Retry: refused behind a logout, or past the ordinary
+/// bound, review rounds 31 and 32): an echo exists only while core may
+/// still report on its send, and none core keeps is ever dropped. Core
+/// admits every send the UI does, so a cleared composer's text always stays
+/// retryable. A
 /// `SentUnconfirmed` echo (the server has the message; only its id is
 /// unknown) gives way to a new send at the cap.
 pub(crate) const MAX_ECHOES: usize = 256 + 32;

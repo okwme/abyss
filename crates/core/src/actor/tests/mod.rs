@@ -25,6 +25,8 @@ mod review6e;
 mod review6f;
 mod review6g;
 mod review6h;
+mod review6i;
+mod watchdog;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,10 +50,9 @@ use crate::secret::{FaultControl, FaultyStore, MemoryStore, SecretItem, SecretSt
 use crate::session::{PersistHandle, signed_in_blob};
 
 const WAIT: Duration = Duration::from_secs(600);
-/// Wall-clock bound of one wait, whatever the test's clock does.
+/// Wall-clock bound of one wait, whatever the test's clock does (a
+/// [`watchdog::Watchdog`] thread enforces it).
 const REAL_WAIT: Duration = Duration::from_secs(120);
-/// How often a wait checks [`REAL_WAIT`] (test clock).
-const WAIT_SLICE: Duration = Duration::from_millis(250);
 
 struct Harness {
     cmd: mpsc::Sender<Stamped>,
@@ -65,6 +66,7 @@ struct Harness {
     /// Shares storage with the persistence worker's store.
     store: MemoryStore,
     faults: FaultControl,
+    watchdog: watchdog::Watchdog,
 }
 
 fn chat(id: i64) -> ChatId {
@@ -174,9 +176,8 @@ fn startup_faults(setup: &Setup, faults: &FaultControl) {
     }
 }
 
-async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness {
-    let store = prepare_store(&setup);
-    let unreadable = matches!(setup.session, StoredSession::Unreadable);
+/// Writes the stored API credential item, if the setup has one.
+fn store_creds(setup: &Setup, store: &MemoryStore) {
     if let Some(creds) = &setup.stored_creds {
         store
             .set(
@@ -185,6 +186,12 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
             )
             .unwrap();
     }
+}
+
+async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness {
+    let store = prepare_store(&setup);
+    let unreadable = matches!(setup.session, StoredSession::Unreadable);
+    store_creds(&setup, &store);
     let (wrapped, faults) = FaultyStore::new(store.clone());
     startup_faults(&setup, &faults);
     let persist = PersistHandle::spawn(wrapped).unwrap();
@@ -234,6 +241,7 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
 
     let permits = actor.admission.probe();
     let join = tokio::spawn(actor.run(channels));
+    let watchdog = watchdog::Watchdog::new(faults.clock_gate(), REAL_WAIT);
     Harness {
         cmd,
         internal,
@@ -244,6 +252,7 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
         join,
         store,
         faults,
+        watchdog,
     }
 }
 
@@ -257,23 +266,27 @@ impl Harness {
 
     /// Waits for an event matching `pred`, returning it and everything skipped.
     /// Bounded twice: [`WAIT`] on the test's clock (paused tests advance it
-    /// freely) and [`REAL_WAIT`] of wall time, so a hang fails the test with
-    /// the events seen instead of stalling the run.
+    /// freely) and the watchdog's wall-time bound, which holds even while the
+    /// store's clock gate keeps a paused clock still (review round 32), so a
+    /// hang fails the test with the events seen instead of stalling the run.
     async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> (Event, Vec<Event>) {
         let mut skipped = Vec::new();
-        let started = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + WAIT;
+        let fired = self.watchdog.fired();
+        let _armed = self.watchdog.arm();
         loop {
-            assert!(
-                started.elapsed() < REAL_WAIT && tokio::time::Instant::now() < deadline,
-                "timed out waiting for an event; seen: {skipped:?}"
-            );
-            // Cancel-safe: an event is never lost between slices.
-            match tokio::time::timeout(WAIT_SLICE, self.events.recv()).await {
+            let next = tokio::select! {
+                biased;
+                () = fired.cancelled() => {
+                    panic!("wall-clock watchdog fired waiting for an event; seen: {skipped:?}")
+                }
+                next = tokio::time::timeout_at(deadline, self.events.recv()) => next,
+            };
+            match next {
                 Ok(Some(ev)) if pred(&ev) => return (ev, skipped),
                 Ok(Some(ev)) => skipped.push(ev),
                 Ok(None) => panic!("actor stopped; seen: {skipped:?}"),
-                Err(_) => {}
+                Err(elapsed) => panic!("{elapsed} waiting for an event; seen: {skipped:?}"),
             }
         }
     }
@@ -296,16 +309,16 @@ impl Harness {
         std::iter::from_fn(|| self.events.try_recv()).collect()
     }
 
-    /// Shuts the actor down; fails after [`REAL_WAIT`] of wall time rather
-    /// than hang (review round 28).
+    /// Shuts the actor down; fails past the watchdog's wall-time bound
+    /// rather than hang (review rounds 28 and 32).
     async fn stop(mut self) -> ShutdownReport {
         self.cancel.cancel();
-        let started = std::time::Instant::now();
-        loop {
-            assert!(started.elapsed() < REAL_WAIT, "the actor did not shut down");
-            if let Ok(report) = tokio::time::timeout(WAIT_SLICE, &mut self.join).await {
-                return report.unwrap();
-            }
+        let fired = self.watchdog.fired();
+        let _armed = self.watchdog.arm();
+        tokio::select! {
+            biased;
+            () = fired.cancelled() => panic!("the actor did not shut down"),
+            report = &mut self.join => report.unwrap(),
         }
     }
 

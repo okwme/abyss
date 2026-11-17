@@ -35,10 +35,13 @@ use crate::model::{ChatId, LocalId, MsgId};
 /// Maximum ordinary sends tracked at once (in flight, failed, waiting or
 /// unknown).
 pub(super) const MAX_PENDING_SENDS: usize = 256;
-/// Maximum sends held behind a logout (refused, kept `Failed` for Retry),
-/// counted apart so they never take an ordinary send's slot (review round
-/// 31). The table holds at most `MAX_PENDING_SENDS + MAX_HELD_SENDS`.
-pub(super) const MAX_HELD_SENDS: usize = 32;
+/// Maximum sends kept `Failed` for Retry without being sent: refused
+/// behind a logout (review round 31), or past [`MAX_PENDING_SENDS`] (round
+/// 32: the UI already cleared its composer, so the text must stay
+/// retryable). Counted apart so they never take an ordinary send's slot.
+/// The table holds at most `MAX_PENDING_SENDS + MAX_KEPT_SENDS`, the UI's
+/// echo cap.
+pub(super) const MAX_KEPT_SENDS: usize = 32;
 /// Automatic retries after a transient failure or time-out, before `Unknown`.
 /// The cap counts across rebuilds.
 pub(super) const AUTO_RETRIES: u8 = 2;
@@ -51,8 +54,8 @@ pub(super) const MAX_SEND_CHARS: usize = 4096;
 enum Slot {
     /// Sent now: [`MAX_PENDING_SENDS`].
     Ordinary,
-    /// Refused behind a logout and kept: [`MAX_HELD_SENDS`].
-    Held,
+    /// Kept `Failed`, unsent, for Retry: [`MAX_KEPT_SENDS`].
+    Kept,
 }
 
 /// `SentUnconfirmed` sends remembered for a late stream `updateMessageID`.
@@ -87,7 +90,7 @@ struct Pending {
     /// The newest id of `chat` core knew when the user sent it: the
     /// server's id for the send is higher.
     floor: Option<MsgId>,
-    /// Which capacity it counts against; a held send becomes ordinary when
+    /// Which capacity it counts against; a kept send becomes ordinary when
     /// its Retry is admitted.
     slot: Slot,
 }
@@ -134,7 +137,7 @@ impl PendingSends {
         let used = self.map.values().filter(|p| p.slot == slot).count();
         let cap = match slot {
             Slot::Ordinary => MAX_PENDING_SENDS,
-            Slot::Held => MAX_HELD_SENDS,
+            Slot::Kept => MAX_KEPT_SENDS,
         };
         used < cap
     }
@@ -303,9 +306,16 @@ impl<B: Backend> Actor<B> {
         self.emit(Event::SendState { local_id, state }).await;
     }
 
+    /// A new send. Past the ordinary bound it is kept `Failed` (`Busy`)
+    /// rather than dropped, so Retry sends it once a slot frees.
     pub(super) async fn send_text(&mut self, chat: ChatId, text: String, local_id: LocalId) {
-        if self.admit_send(chat, text, local_id, Slot::Ordinary).await {
-            self.dispatch_send(local_id).await;
+        match self.admit_send(chat, text, local_id, Slot::Ordinary).await {
+            Some(Slot::Ordinary) => self.dispatch_send(local_id).await,
+            Some(Slot::Kept) => {
+                self.error(UserError::Busy).await;
+                self.send_state(local_id, SendState::Failed).await;
+            }
+            None => {}
         }
     }
 
@@ -313,41 +323,46 @@ impl<B: Backend> Actor<B> {
     /// 28): validated and kept `Failed`, never dispatched, so Retry sends
     /// it after "Stay signed in".
     pub(super) async fn hold_send(&mut self, chat: ChatId, text: String, local_id: LocalId) {
-        if !self.admit_send(chat, text, local_id, Slot::Held).await {
-            return;
+        if self
+            .admit_send(chat, text, local_id, Slot::Kept)
+            .await
+            .is_some()
+        {
+            self.send_state(local_id, SendState::Failed).await;
         }
-        if let Some(p) = self.sends.map.get_mut(&local_id) {
-            p.state = SendState::Failed;
-        }
-        self.send_state(local_id, SendState::Failed).await;
     }
 
-    /// Validates a new send and enters it in the (bounded) table as
-    /// `Sending`, undispatched. `false`: refused, and answered.
+    /// Validates a new send and enters it in the (bounded) table,
+    /// undispatched: in `want`'s slot, or an ordinary send past its bound
+    /// in a kept one. An ordinary send enters `Sending`, a kept one
+    /// `Failed`. `None`: refused, and answered.
     async fn admit_send(
         &mut self,
         chat: ChatId,
         text: String,
         local_id: LocalId,
-        slot: Slot,
-    ) -> bool {
+        want: Slot,
+    ) -> Option<Slot> {
         if self.sends.map.contains_key(&local_id) {
             self.error(UserError::Busy).await;
-            return false;
+            return None;
         }
-        let refused = if !self.sends.has_room(slot) {
+        let slot = [want, Slot::Kept]
+            .into_iter()
+            .find(|s| self.sends.has_room(*s));
+        let refused = if slot.is_none() {
             Some(UserError::Busy)
         } else if !sendable(&text) {
             Some(UserError::Rejected)
         } else {
             None
         };
-        let random_id = match (refused, random_id()) {
-            (None, Some(id)) => id,
-            (refused, _) => {
+        let (slot, random_id) = match (refused, slot, random_id()) {
+            (None, Some(slot), Some(id)) => (slot, id),
+            (refused, _, _) => {
                 self.error(refused.unwrap_or(UserError::Internal)).await;
                 self.send_state(local_id, SendState::Failed).await;
-                return false;
+                return None;
             }
         };
         // `None` sorts below every id: the newest of what is known.
@@ -362,21 +377,24 @@ impl<B: Backend> Actor<B> {
             flood_waits: 0,
             auto_until: Instant::now() + AUTO_RETRY_WINDOW,
             last_flood: 0,
-            state: SendState::Sending,
+            state: match slot {
+                Slot::Ordinary => SendState::Sending,
+                Slot::Kept => SendState::Failed,
+            },
             in_flight: false,
             retry_at: None,
             floor,
             slot,
         };
         self.sends.insert(local_id, pending);
-        debug_assert!(self.sends.map.len() <= MAX_PENDING_SENDS + MAX_HELD_SENDS);
-        true
+        debug_assert!(self.sends.map.len() <= MAX_PENDING_SENDS + MAX_KEPT_SENDS);
+        Some(slot)
     }
 
     /// Retries a failed or unknown send with its original `random_id`.
     /// Every retry is answered with a state, as the UI shows "Sending"
-    /// once it was queued (`answer_unrun_retry`). A held send needs an
-    /// ordinary slot to go; without one it stays held.
+    /// once it was queued (`answer_unrun_retry`). A kept send needs an
+    /// ordinary slot to go; without one it stays kept.
     pub(super) async fn retry_send(&mut self, local_id: LocalId) {
         let Some(p) = self.sends.map.get(&local_id) else {
             return self.answer_unrun_retry(local_id).await;
