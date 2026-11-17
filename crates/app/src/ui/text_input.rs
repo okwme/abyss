@@ -164,6 +164,25 @@ impl TextInput {
         self.buffer.text().to_owned()
     }
 
+    /// Fills an empty field with `text`, whole. Returns whether it did:
+    /// never over typed text, and never clipped.
+    pub(crate) fn put_text(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if !self.buffer.text().is_empty() {
+            return false;
+        }
+        if self.buffer.replace(None, text) == Fit::Clipped {
+            drop(self.buffer.take());
+            return false;
+        }
+        self.after_edit(Fit::Whole, window, cx);
+        true
+    }
+
     /// Takes the text, leaving the field empty.
     pub(crate) fn take_text(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> String {
         let text = self.buffer.take();

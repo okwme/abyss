@@ -15,6 +15,7 @@ use super::Root;
 use super::auth::AuthView;
 use super::bridge::SharedCore;
 use super::session::Session;
+use crate::chat::copy as chat_copy;
 use crate::chat::{ChatShell, Refused, format};
 use crate::ui::copy;
 
@@ -305,6 +306,37 @@ impl Session {
         self.drive(OnRefusal::Notice, window, cx, |s, admit| {
             s.discard(local_id, admit)
         });
+        cx.notify();
+    }
+
+    /// Puts a refused send's text back into the message box, which must be
+    /// empty (nothing typed there is ever overwritten). The echo shows in
+    /// its own chat only, so the box belongs to that chat.
+    pub(super) fn put_back(
+        &mut self,
+        local_id: LocalId,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        let Some(text) = self.shell.returned_text(local_id).map(str::to_owned) else {
+            return;
+        };
+        let placed = self
+            .composer
+            .update(cx, |c, cx| c.put_text(&text, window, cx));
+        if placed {
+            drop(self.shell.take_returned(local_id));
+            self.show_notice(chat_copy::PUT_BACK_DONE.into(), window, cx);
+            window.focus(&self.composer.focus_handle(cx), cx);
+        } else {
+            self.show_notice(chat_copy::BOX_NOT_EMPTY.into(), window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Drops a refused send's text (the user chose to).
+    pub(super) fn dismiss_returned(&mut self, local_id: LocalId, cx: &mut Context<'_, Root>) {
+        drop(self.shell.take_returned(local_id));
         cx.notify();
     }
 

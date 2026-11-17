@@ -2,7 +2,13 @@
 //! takes their place (plan section 9). Core owns the outcome (the pending-send
 //! table, `random_id`, retries); this only shows it and offers Retry and
 //! Discard where core accepts them. Every change that follows a command is
-//! made only after core admitted the command (`ChatShell`).
+//! made only after core admitted the command (`ChatShell`), and every change
+//! of what core keeps only on core's correlated answer (task 6j, [`Phase`]).
+//!
+//! One capacity rule: every echo counts toward [`MAX_ECHOES`], whatever its
+//! phase (a submission core has not answered, a discard it has not
+//! answered, text it refused). Core's table never holds a send the UI has no
+//! echo for, so it never holds more than the UI counts.
 
 use std::time::{Duration, Instant};
 
@@ -10,14 +16,27 @@ use abyss_core::api::SendState;
 use abyss_core::model::{ChatId, LocalId, MsgId};
 
 /// Same bound as core's whole pending-send table (256 ordinary sends plus 32
-/// kept `Failed` for Retry: refused behind a logout, or past the ordinary
-/// bound, review rounds 31 and 32): an echo exists only while core may
-/// still report on its send, and none core keeps is ever dropped. Core
-/// admits every send the UI does, so a cleared composer's text always stays
-/// retryable. A
-/// `SentUnconfirmed` echo (the server has the message; only its id is
-/// unknown) gives way to a new send at the cap.
+/// kept `Failed` for Retry, review rounds 31 to 33). No echo core keeps is
+/// ever dropped, and core keeps every send while its table has room, so a
+/// send the UI admits is kept unless core says otherwise (`SendRefused`,
+/// then the text stays here as [`Phase::Returned`]). A `SentUnconfirmed`
+/// echo (the server has the message; only its id is unknown, and core's
+/// table no longer holds it) gives way to a new send at the cap.
 pub(crate) const MAX_ECHOES: usize = 256 + 32;
+
+/// Where an echo stands with core (task 6j).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// `SendText` queued; core has not said whether it keeps the send.
+    Submitted,
+    /// Core keeps the send (`SendAdmitted`).
+    Kept,
+    /// `DiscardSend` queued; core has not answered. Still counted.
+    Discarding,
+    /// Core holds nothing for it (`SendRefused`): its text exists only
+    /// here, offered back to the composer, never for Retry.
+    Returned,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Echo {
@@ -27,6 +46,7 @@ pub(crate) struct Echo {
     pub(crate) state: SendState,
     /// Unix seconds when the user sent it.
     pub(crate) date: i64,
+    pub(crate) phase: Phase,
     /// When core resends a flood-waiting send (`SendState::FloodWait`).
     resend_at: Option<Instant>,
 }
@@ -39,19 +59,27 @@ impl Echo {
             text,
             state: SendState::Sending,
             date,
+            phase: Phase::Submitted,
             resend_at: None,
         }
     }
 
-    /// Retry is offered only where core accepts it.
+    /// Retry is offered only where core accepts it: a send core keeps.
     pub(crate) fn can_retry(&self) -> bool {
-        matches!(self.state, SendState::Failed | SendState::Unknown { .. })
+        self.phase == Phase::Kept
+            && matches!(self.state, SendState::Failed | SendState::Unknown { .. })
     }
 
     /// Discard is offered only where core accepts it: also while a send
     /// waits out a flood wait.
     pub(crate) fn can_discard(&self) -> bool {
-        self.can_retry() || matches!(self.state, SendState::FloodWait { .. })
+        self.can_retry()
+            || (self.phase == Phase::Kept && matches!(self.state, SendState::FloodWait { .. }))
+    }
+
+    /// Text core refused, offered back to the composer or dismissed.
+    pub(crate) fn is_returned(&self) -> bool {
+        self.phase == Phase::Returned
     }
 
     /// Whole seconds until core resends a flood-waiting send, rounded up.
@@ -72,8 +100,8 @@ pub(crate) struct Echoes {
 pub(crate) struct Full;
 
 impl Echoes {
-    /// Whether a new send has no room: the table is at its cap and no
-    /// `SentUnconfirmed` echo can give way.
+    /// Whether a new send has no room: the table is at its cap (echoes of
+    /// every phase count) and no `SentUnconfirmed` echo can give way.
     pub(crate) fn is_full(&self) -> bool {
         self.list.len() >= MAX_ECHOES && self.oldest_unconfirmed().is_none()
     }
@@ -119,7 +147,10 @@ impl Echoes {
         state: SendState,
         now: Instant,
     ) -> Option<ChatId> {
-        let echo = self.list.iter_mut().find(|e| e.local_id == local_id)?;
+        let echo = self
+            .list
+            .iter_mut()
+            .find(|e| e.local_id == local_id && e.phase != Phase::Returned)?;
         echo.state = state;
         echo.resend_at = match state {
             SendState::FloodWait { seconds } => {
@@ -130,18 +161,84 @@ impl Echoes {
         Some(echo.chat)
     }
 
-    /// Core admitted a retry with the original `random_id`: shows
-    /// "Sending…" until core reports the real state.
+    fn find_mut(&mut self, local_id: LocalId, phase: Phase) -> Option<&mut Echo> {
+        self.list
+            .iter_mut()
+            .find(|e| e.local_id == local_id && e.phase == phase)
+    }
+
+    /// Core's queue took a retry with the original `random_id`: shows
+    /// "Sending…" until core answers it (it answers every retry: the
+    /// send's state, or `SendRefused`).
     pub(crate) fn retried(&mut self, local_id: LocalId) {
-        if let Some(echo) = self.list.iter_mut().find(|e| e.local_id == local_id) {
+        if let Some(echo) = self.find_mut(local_id, Phase::Kept) {
             echo.state = SendState::Sending;
             echo.resend_at = None;
         }
     }
 
-    /// Core admitted a discard: the send leaves its table, the echo goes.
-    pub(crate) fn discarded(&mut self, local_id: LocalId) {
-        self.list.retain(|e| e.local_id != local_id);
+    /// Core keeps a submitted send (`SendAdmitted`). Returns its chat.
+    pub(crate) fn admitted(&mut self, local_id: LocalId) -> Option<ChatId> {
+        let echo = self.find_mut(local_id, Phase::Submitted)?;
+        echo.phase = Phase::Kept;
+        Some(echo.chat)
+    }
+
+    /// Core holds nothing for this send (`SendRefused`): its text stays
+    /// here as [`Phase::Returned`]; a discard waiting on it is done.
+    /// Returns its chat.
+    pub(crate) fn refused(&mut self, local_id: LocalId) -> Option<ChatId> {
+        let at = self.list.iter().position(|e| e.local_id == local_id)?;
+        let echo = self.list.get_mut(at)?;
+        let chat = echo.chat;
+        match echo.phase {
+            Phase::Discarding => drop(self.list.remove(at)),
+            Phase::Submitted | Phase::Kept | Phase::Returned => {
+                echo.phase = Phase::Returned;
+                echo.resend_at = None;
+            }
+        }
+        Some(chat)
+    }
+
+    /// Core's queue took a discard: the echo (and its slot) stays until
+    /// core answers.
+    pub(crate) fn discarding(&mut self, local_id: LocalId) {
+        if let Some(echo) = self.find_mut(local_id, Phase::Kept) {
+            echo.phase = Phase::Discarding;
+        }
+    }
+
+    /// Core discarded the send (`SendDiscarded`): the echo goes. Returns
+    /// its chat.
+    pub(crate) fn discarded(&mut self, local_id: LocalId) -> Option<ChatId> {
+        let at = self
+            .list
+            .iter()
+            .position(|e| e.local_id == local_id && e.phase != Phase::Returned)?;
+        Some(self.list.remove(at).chat)
+    }
+
+    /// Core refused a discard and keeps the send in `state`
+    /// (`DiscardRefused`). Returns its chat.
+    pub(crate) fn discard_refused(
+        &mut self,
+        local_id: LocalId,
+        state: SendState,
+        now: Instant,
+    ) -> Option<ChatId> {
+        self.find_mut(local_id, Phase::Discarding)?.phase = Phase::Kept;
+        self.set_state(local_id, state, now)
+    }
+
+    /// Takes a returned echo out (the user put its text back or dismissed
+    /// it).
+    pub(crate) fn take_returned(&mut self, local_id: LocalId) -> Option<Echo> {
+        let at = self
+            .list
+            .iter()
+            .position(|e| e.local_id == local_id && e.phase == Phase::Returned)?;
+        Some(self.list.remove(at))
     }
 
     /// Drops sent echoes of `chat` whose server copy is now shown. Returns
@@ -223,6 +320,14 @@ mod tests {
     fn retry_and_discard_only_where_core_accepts_them() {
         let mut e = Echoes::default();
         e.push(echo(1, A)).unwrap();
+        set(&mut e, 1, SendState::Failed);
+        let get = |e: &Echoes| e.get(LocalId(1)).unwrap().clone();
+        assert!(
+            !get(&e).can_retry() && !get(&e).can_discard(),
+            "core has not said it keeps the send"
+        );
+        assert_eq!(e.admitted(LocalId(1)), Some(A));
+        set(&mut e, 1, SendState::Sending);
         let get = |e: &Echoes| e.get(LocalId(1)).unwrap().clone();
         assert!(!get(&e).can_retry(), "in flight");
         assert!(!get(&e).can_discard(), "in flight");
@@ -239,6 +344,14 @@ mod tests {
         assert!(!e.any_waiting());
         e.retried(LocalId(1));
         assert_eq!(states(&e, A), [SendState::Sending]);
+        set(&mut e, 1, SendState::Failed);
+        e.discarding(LocalId(1));
+        assert!(!get(&e).can_retry() && !get(&e).can_discard(), "discarding");
+        assert_eq!(
+            e.count(A),
+            1,
+            "a discard core has not answered keeps its slot"
+        );
         e.discarded(LocalId(1));
         assert_eq!(e.count(A), 0);
         assert_eq!(

@@ -553,7 +553,7 @@ impl RowCtx {
 }
 
 /// An own send without a server copy yet: its state, and Retry and Discard
-/// where core accepts them.
+/// where core accepts them; text core refused offers Put back and Dismiss.
 fn echo_row(e: &Echo, cx: &mut Context<'_, Root>) -> AnyElement {
     let local_id = e.local_id;
     let status = div()
@@ -574,7 +574,22 @@ fn echo_row(e: &Echo, cx: &mut Context<'_, Root>) -> AnyElement {
         });
         pill(("discard", local_id.0), copy::DISCARD).on_click(discard)
     });
-    let status = status.children(retry).children(discard);
+    let returned = e.is_returned().then(|| {
+        let put_back = cx.listener(move |root, _: &ClickEvent, window, cx| {
+            root.with_session(|s, cx| s.put_back(local_id, window, cx), cx);
+        });
+        let dismiss = cx.listener(move |root, _: &ClickEvent, _, cx| {
+            root.with_session(|s, cx| s.dismiss_returned(local_id, cx), cx);
+        });
+        [
+            pill(("put-back", local_id.0), copy::PUT_BACK).on_click(put_back),
+            pill(("dismiss", local_id.0), copy::DISMISS).on_click(dismiss),
+        ]
+    });
+    let status = status
+        .children(retry)
+        .children(discard)
+        .children(returned.into_iter().flatten());
     let text = rich::plain(&e.text, &fonts(), &palette());
     let body = StyledText::new(text.text).with_runs(text.runs);
     in_bubble(

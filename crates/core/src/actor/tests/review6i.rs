@@ -13,9 +13,10 @@ use crate::backend::fake::{FakeScript, Fault, Op};
 use crate::model::LocalId;
 use crate::secret::SecretItem;
 
-/// Sends `LocalId(id)`; returns the state it settles in and whether
-/// `Error(Busy)` came before it.
-async fn send_settles(h: &mut Harness, id: u64) -> (SendState, bool) {
+/// Sends `LocalId(id)`; returns the state it settles in (`None`: core
+/// refused it and holds nothing, `SendRefused`) and whether `Error(Busy)`
+/// came before it.
+async fn send_settles(h: &mut Harness, id: u64) -> (Option<SendState>, bool) {
     h.send(Command::SendText {
         chat: chat(1),
         text: format!("m{id}"),
@@ -26,19 +27,19 @@ async fn send_settles(h: &mut Harness, id: u64) -> (SendState, bool) {
 }
 
 /// Retries `LocalId(id)`; as [`send_settles`].
-async fn retry_settles(h: &mut Harness, id: u64) -> (SendState, bool) {
+async fn retry_settles(h: &mut Harness, id: u64) -> (Option<SendState>, bool) {
     h.send(Command::RetrySend(LocalId(id))).await;
     settles(h, id).await
 }
 
-async fn settles(h: &mut Harness, id: u64) -> (SendState, bool) {
+async fn settles(h: &mut Harness, id: u64) -> (Option<SendState>, bool) {
     let (ev, seen) = h.until(settled(LocalId(id))).await;
     let busy = seen
         .iter()
         .any(|e| matches!(e, Event::Error(UserError::Busy)));
     match ev {
-        Event::SendState { state, .. } => (state, busy),
-        _ => unreachable!(),
+        Event::SendState { state, .. } => (Some(state), busy),
+        _ => (None, busy),
     }
 }
 
@@ -51,13 +52,13 @@ async fn fill_ordinary_with_failures(h: &mut Harness) -> u64 {
             .inject(Op::Send, Fault::Error(BackendError::Rejected));
     }
     for id in 1..=full {
-        assert_eq!(send_settles(h, id).await, (SendState::Failed, false));
+        assert_eq!(send_settles(h, id).await, (Some(SendState::Failed), false));
     }
     full
 }
 
-fn sent(state: SendState) -> bool {
-    matches!(state, SendState::Sent { .. })
+fn sent(state: Option<SendState>) -> bool {
+    matches!(state, Some(SendState::Sent { .. }))
 }
 
 /// Finding 1, the exact sequence: 256 failed ordinary sends fill the
@@ -69,7 +70,10 @@ async fn a_send_past_the_ordinary_bound_is_kept_for_retry() {
     let mut h = harness(FakeScript::demo(1, 1), None).await;
     h.online().await;
     let next = fill_ordinary_with_failures(&mut h).await + 1;
-    assert_eq!(send_settles(&mut h, next).await, (SendState::Failed, true));
+    assert_eq!(
+        send_settles(&mut h, next).await,
+        (Some(SendState::Failed), true)
+    );
     h.send(Command::DiscardSend(LocalId(1))).await;
     let (state, busy) = retry_settles(&mut h, next).await;
     assert!(sent(state) && !busy, "{state:?}, busy: {busy}");
@@ -90,10 +94,13 @@ async fn both_bounds_full_keep_every_admitted_send_retryable() {
     logout_stalled(&mut h).await;
     let kept = u64::try_from(MAX_KEPT_SENDS).unwrap();
     for id in full + 1..=full + kept {
-        assert_eq!(send_settles(&mut h, id).await, (SendState::Failed, false));
+        assert_eq!(
+            send_settles(&mut h, id).await,
+            (Some(SendState::Failed), false)
+        );
     }
     let past = full + kept + 1;
-    assert_eq!(send_settles(&mut h, past).await, (SendState::Failed, true));
+    assert_eq!(send_settles(&mut h, past).await, (None, true));
     stay_signed_in(&mut h).await;
     let first_kept = full + 1;
     // Busy, and still kept: a second Retry is answered `Failed` again,
@@ -101,11 +108,11 @@ async fn both_bounds_full_keep_every_admitted_send_retryable() {
     for _ in 0..2 {
         assert_eq!(
             retry_settles(&mut h, first_kept).await,
-            (SendState::Failed, true)
+            (Some(SendState::Failed), true)
         );
     }
     let fresh = past + 1;
-    assert_eq!(send_settles(&mut h, fresh).await, (SendState::Failed, true));
+    assert_eq!(send_settles(&mut h, fresh).await, (None, true));
     for unknown in [past, fresh] {
         h.send(Command::RetrySend(LocalId(unknown))).await;
         let (_, seen) = h.until(settled(LocalId(unknown))).await;

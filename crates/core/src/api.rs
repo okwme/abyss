@@ -39,9 +39,12 @@ pub enum Command {
         text: String,
         local_id: LocalId,
     },
+    /// Retries a failed or unknown send. Answered with the send's state,
+    /// or `SendRefused` when core holds no such send.
     RetrySend(LocalId),
-    /// Drops a failed or unknown send from the pending-send table. A send that
-    /// is in flight cannot be discarded (`Busy`).
+    /// Drops a failed, unknown or flood-waiting send from the pending-send
+    /// table. Answered `SendDiscarded`, or `DiscardRefused` with the state
+    /// of a send core keeps (one in flight cannot be discarded: `Busy`).
     DiscardSend(LocalId),
     /// The main window became active or inactive. Activation triggers a light
     /// refresh; while active, one also runs every 5 minutes (plan section 2).
@@ -318,6 +321,27 @@ pub enum Event {
         ids: Vec<MsgId>,
     },
     SendState {
+        local_id: LocalId,
+        state: SendState,
+    },
+    /// Core keeps this `SendText` (task 6j): dispatched, or kept `Failed`
+    /// for Retry. Comes before any `SendState` of it.
+    SendAdmitted {
+        local_id: LocalId,
+    },
+    /// Core holds nothing for this send: a `SendText` it refused (the
+    /// reason, if any, is sent as `Error` first), or a `RetrySend` of a
+    /// send it does not know. Its text exists only in the UI now.
+    SendRefused {
+        local_id: LocalId,
+    },
+    /// A `DiscardSend` ended: core holds nothing for this send any more.
+    SendDiscarded {
+        local_id: LocalId,
+    },
+    /// A `DiscardSend` was refused (after `Error(Busy)`): core keeps the
+    /// send, in `state`.
+    DiscardRefused {
         local_id: LocalId,
         state: SendState,
     },

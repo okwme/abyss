@@ -419,6 +419,7 @@ Messages carry no `random_id` (`api.tl:128`). The only correlation is `updateMes
   - Entries hold `{ chat: ChatId, peer: PeerRef, random_id, text, state, attempts }`.
   - They are **not** tied to `ViewGen` or `ClientGen`. Closing the chat, evicting its window or rebuilding the client never cancels or drops a send. `ViewGen` only decides whether a chat window currently *shows* the echo.
   - Entries leave the table on `Sent`, on a user discard, or when a `SentUnconfirmed` echo is cleared by reconcile.
+  - Admission and discards are acknowledged per `LocalId` (task 6j): `SendAdmitted` or `SendRefused` for every `SendText`, and `SendDiscarded` or `DiscardRefused` for every `DiscardSend`. The UI changes send capacity only on these answers, and counts every echo toward its cap (the same 288 as core's table).
 - **States:**
 
   ```rust
@@ -1026,6 +1027,37 @@ Open items:
 5. **Revocation after a failed marker (LOW).** Also fixed by the overlay: the screen is derived from the gate's current trigger, which a revocation escalates to `Server`, so "Stay signed in" goes. Test: `revocation_after_a_failed_marker_takes_stay_signed_in_away`. It was not run against the pre-overlay gate, which predates the other round 25 changes.
 - Also: the Fragment allowlist stays on `fragment.com`, with a comment that subdomains and the path format are unverified. `docs/connecting.md` now describes "Logging out" during the marker write, and says an unreadable record loads no session, opens no cache and deletes nothing.
 
+**Task 6j status (2026-11-17): round 33 re-check of task 6i, offline against the fake.** Both findings had one cause: the UI changed send capacity before core accepted the change. The contract is fixed rather than the cases. Each regression test fails with its fix disabled in place (checked one fix at a time). Core tests are in `crates/core/src/actor/tests/review6j.rs`. App tests are in `crates/app/src/chat/tests/review6j.rs` and `shell/tests.rs::a_refused_send_is_put_back_into_an_empty_box`. No exit-safety file was touched (`shell/mod.rs`, `storage.rs`, `cache/census.rs`), and the 10f areas only gained the new event arms and echo phases.
+- **The contract.** Send admission and discards get correlated answers:
+  - Core answers every `SendText` with `Event::SendAdmitted { local_id }` (it keeps the send: dispatched, or kept `Failed` for Retry; this comes before any `SendState`) or `Event::SendRefused { local_id }` (it holds nothing; the reason comes first as `Error`). This covers sends refused while signed out or behind a logout too.
+  - Core answers every `DiscardSend` with `Event::SendDiscarded` (it holds nothing for the send now, or never did) or `Event::DiscardRefused { local_id, state }` (`Busy`: it keeps the send in `state`).
+  - A Retry of a send core does not know is answered `Error(NotFound)`, then `SendRefused`, no longer `Failed`.
+  - A `SendText` that reuses a `local_id` core holds gets only `Error(Busy)`, so the answer never touches that send. The UI never reuses an id.
+- **The UI.** Each echo has a phase (`chat::sends::Phase`):
+  - `Submitted`: the composer was cleared when core's queue took the command, and the text lives in the echo until core answers.
+  - `Kept`: Retry and Discard are offered only in this phase.
+  - `Discarding`: shown as "Discarding…"; the echo stays until core answers.
+  - `Returned`: "Not sent and not kept", with "Put back in the box" and "Dismiss", never Retry. Put back fills only an empty box, and never clips or overwrites typed text. The echo is shown only in its own chat, so the box belongs to that chat.
+- **One capacity rule.** Every echo counts toward `MAX_ECHOES` (288), whatever its phase. Core's table never holds a send the UI has no echo for. Core keeps every send while its table has room: `hold_send` now takes an ordinary slot once the kept slots are full. So the UI never admits a send that core lacks room for, except in a race it can see: core answers `SendRefused` and the text stays in the UI.
+1. **`hold_send` checked only the kept slots (MEDIUM).** The case: 255 ordinary sends and 32 kept, then a send the UI made before it saw `LogoutStarting`. It is now kept in the last ordinary slot. Past the full table it is refused with `SendRefused`, and the text stays in the UI as a returned echo, never as an orphan `Failed` echo. Tests:
+   - core `a_send_behind_a_logout_is_kept_while_the_table_has_room`: send 288 is admitted, 289 is refused, and after a Discard, Retry 288 sends it;
+   - app `a_refused_send_keeps_its_text_for_the_box` and `a_retry_core_does_not_know_returns_the_text`;
+   - shell `a_refused_send_is_put_back_into_an_empty_box`.
+   - Round 31's test is now `refusals_behind_a_logout_are_kept_while_the_table_has_room`: a refusal past the kept bound is retried with its payload, not `NotFound`.
+2. **A discard racing an automatic resend let the UI over-admit (MEDIUM).** The echo now keeps its slot until core answers, and `DiscardRefused` applies core's state. Tests:
+   - core `a_discard_racing_an_automatic_resend_is_answered_with_the_kept_state` (the flood-wait resend is in flight; Discard gets `Busy` and `DiscardRefused { Sending }`; the send then completes);
+   - app `a_discard_keeps_its_slot_until_core_answers` (288 echoes, Discard of the flood-waiting one, then an immediate new submission: refused for room; after `DiscardRefused` the echo shows `Sending` and there is still no room; a second Discard frees the slot only on `SendDiscarded`);
+   - `every_discard_is_answered` and `unanswered_submissions_count_toward_the_cap`.
+- **Audit of optimistic UI changes to send state.**
+  - Composer cleared when the `SendText` is queued: reconciled. The text stays in the `Submitted` echo until `SendAdmitted`/`SendRefused`, and comes back on refusal.
+  - Echo pushed when the `SendText` is queued: harmless. It counts toward the cap before core answers, which errs on the safe side.
+  - Retry flips the echo to "Sending…" when it is queued: reconciled. Core answers every retry with the send's state (`answer_unrun_retry` behind an overlay or when a retry cannot run), or `SendRefused`.
+  - Discard: no longer optimistic (`Discarding` until answered).
+  - Flood-wait countdown (`resend_at`): display only. Every `SendState` resets it.
+  - The oldest `SentUnconfirmed` echo gives way at the cap: harmless. Core's table no longer holds that send (it moved to the unconfirmed list), and the server has the message.
+  - Sent/unconfirmed echoes leave on core's history evidence (`resolve`, `Reconciled`, `SendsCovered`): harmless. Core's table no longer holds them.
+  - Echoes cleared at logout or account change: harmless. Core tears down its table, and commands from an old epoch never act. A `DiscardSend` refused in the current epoch is answered too (`answer_unrun_discard`).
+
 **Task 6i status (2026-11-17): round 32 re-check of task 6h, offline against the fake.** Each regression test fails with its fix disabled in place (checked one fix at a time). Tests are in `crates/core/src/actor/tests/review6i.rs` and `secret/clock_gate.rs`. No exit-safety file was touched (`shell/mod.rs`, `storage.rs`, `cache/census.rs`).
 1. **The 288 echo cap admitted ordinary sends core dropped (MEDIUM).** Core now keeps the payload. The second slot kind is renamed `Slot::Kept` (`MAX_KEPT_SENDS`, 32). It holds refusals behind a logout, and now also ordinary sends past `MAX_PENDING_SENDS`: such a send is answered `Busy`, then `Failed`, and kept for Retry. Retry promotes a kept send to an ordinary slot when one is free, and otherwise answers `Busy` and keeps it. Core admits every send the UI does: commands are ordered, and the UI's echo cap (`MAX_ECHOES` = 256 + 32) equals core's whole table, so text from a cleared composer always stays retryable. Tests:
    - `a_send_past_the_ordinary_bound_is_kept_for_retry` is the exact sequence: 256 rejected ordinary sends, send 257 is `Busy` then `Failed`, Discard one, and Retry 257 is sent, not `NotFound`.
@@ -1411,6 +1443,11 @@ Open items:
   - **High:** the UI kept account A's messages and draft after logout, so account B could see them under a shared peer id.
   - **High:** commands queued behind Logout (sends included) could act for the next account. Reject account-scoped commands during logout and while signed out, quarantine the cache at teardown, and tag commands with an account generation.
   - **Medium:** a cache re-binding could lose its only completion notification: it reported before returning, and the actor checked `is_finished()`.
+
+- **Round 33 (re-check of task 6i, 2026-11-17).** GPT-6 Astra: the watchdog and hold-expiry fixes are sound. Two medium findings remain, both because the UI changed send capacity before core accepted the change. The contract is fixed in task 6j (section 13, Task 6j status):
+  - **Medium:** `hold_send` checked only the kept slots, so a send made behind a just-confirmed logout, with 255 ordinary and 32 kept sends held, was refused with no record, leaving an orphan `Failed` echo whose Retry was `NotFound`. Send admission is now acknowledged (`SendAdmitted`/`SendRefused`), core keeps a send while its table has room, and refused text stays in the UI for the box.
+  - **Medium:** the UI removed an echo when its Discard was queued, but core answered `Busy` because a flood wait's automatic resend had just gone in flight; the UI then admitted send 289 while core was full. Discards are now acknowledged (`SendDiscarded`/`DiscardRefused`), and an echo keeps its slot until then.
+  - Also: every other optimistic UI change to send state is audited (Task 6j status).
 
 - **Round 32 (re-check of task 6h, 2026-11-17).** GPT-6 Astra: the last blocker before the push. All fixed in task 6i (section 13, Task 6i status):
   - **Medium:** the UI's 288 echo cap admitted ordinary sends that core rejected past 256 with no record, after the composer was cleared, so the text was lost. Core now keeps such a send `Failed` in the kept slot (shared with refusals behind a logout) for Retry.

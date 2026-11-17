@@ -25,12 +25,14 @@ async fn send_settles(h: &mut Harness, id: u64) -> SendState {
     }
 }
 
-/// Finding 1: more sends are refused behind a stalled logout than the send
-/// table holds. Held refusals have their own bound, so after "Stay signed
-/// in" an ordinary send still has a slot, and a held one is retried with
-/// its payload. One refused past the held bound is answered as unknown.
+/// Finding 1: more sends are refused behind a stalled logout than the
+/// kept slots hold. Since round 33 they take ordinary slots once the kept
+/// ones are full (core keeps a send while its table has room, the UI's
+/// one capacity rule), and the UI's cap stops it there. After "Stay signed
+/// in" an ordinary send still has a slot, and every refusal is retried with
+/// its payload: one in a kept slot and one past it.
 #[tokio::test(start_paused = true)]
-async fn refused_sends_never_take_the_ordinary_send_slots() {
+async fn refusals_behind_a_logout_are_kept_while_the_table_has_room() {
     let mut h = harness(FakeScript::demo(1, 1), None).await;
     h.online().await;
     logout_stalled(&mut h).await;
@@ -56,43 +58,33 @@ async fn refused_sends_never_take_the_ordinary_send_slots() {
         ),
         "a held send was not kept: {ev:?}"
     );
-    // Past the held bound: no record, so its Retry is answered as unknown.
+    // Past the kept bound: in an ordinary slot, retried with its payload.
     let past = u64::try_from(MAX_KEPT_SENDS).unwrap() + 1;
     h.send(Command::RetrySend(LocalId(past))).await;
-    let (ev, seen) = h.until(settled(LocalId(past))).await;
-    assert!(matches!(
-        ev,
-        Event::SendState {
-            state: SendState::Failed,
-            ..
-        }
-    ));
+    let (ev, _) = h.until(settled(LocalId(past))).await;
     assert!(
-        seen.iter()
-            .any(|e| matches!(e, Event::Error(UserError::NotFound)))
+        matches!(
+            ev,
+            Event::SendState {
+                state: SendState::Sent { .. },
+                ..
+            }
+        ),
+        "a refusal past the kept bound was not kept: {ev:?}"
     );
     h.stop().await;
 }
 
 /// Answers a Retry of a send core does not know: `Error(NotFound)`, then
-/// `Failed`.
+/// `SendRefused`.
 async fn unknown_retry_is_not_found(h: &mut Harness, id: u64) {
     h.send(Command::RetrySend(LocalId(id))).await;
     let (ev, seen) = h.until(settled(LocalId(id))).await;
-    assert!(
-        matches!(
-            ev,
-            Event::SendState {
-                state: SendState::Failed,
-                ..
-            }
-        ),
-        "{ev:?}"
-    );
+    assert!(matches!(ev, Event::SendRefused { .. }), "{ev:?}");
     assert!(
         seen.iter()
             .any(|e| matches!(e, Event::Error(UserError::NotFound))),
-        "no NotFound before Failed: {seen:?}"
+        "no NotFound before SendRefused: {seen:?}"
     );
 }
 

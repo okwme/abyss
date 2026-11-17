@@ -321,13 +321,24 @@ impl ChatShell {
                 self.sync_rows(applied);
             }
             Event::SendState { local_id, state } => {
-                if self
-                    .echoes
-                    .set_state(local_id, state, Instant::now())
-                    .is_some()
-                {
-                    self.after_echo_change();
-                }
+                let changed = self.echoes.set_state(local_id, state, Instant::now());
+                self.echo_changed(changed);
+            }
+            Event::SendAdmitted { local_id } => {
+                let changed = self.echoes.admitted(local_id);
+                self.echo_changed(changed);
+            }
+            Event::SendRefused { local_id } => {
+                let changed = self.echoes.refused(local_id);
+                self.echo_changed(changed);
+            }
+            Event::SendDiscarded { local_id } => {
+                let changed = self.echoes.discarded(local_id);
+                self.echo_changed(changed);
+            }
+            Event::DiscardRefused { local_id, state } => {
+                let changed = self.echoes.discard_refused(local_id, state, Instant::now());
+                self.echo_changed(changed);
             }
             // `LoadEnded` needs the time: see [`Self::load_ended`]. Errors
             // never end a load: core says which load ended.
@@ -493,6 +504,13 @@ impl ChatShell {
 
     /// Echoes changed: drop the ones whose server copy is shown, then
     /// refresh the echo rows.
+    /// An echo of `changed`'s chat changed (`None`: nothing did).
+    fn echo_changed(&mut self, changed: Option<ChatId>) {
+        if changed.is_some() {
+            self.after_echo_change();
+        }
+    }
+
     fn after_echo_change(&mut self) {
         if let Some(w) = &self.window {
             self.echoes.resolve(w.chat(), |id| w.contains(id));

@@ -688,6 +688,61 @@ mod fake {
         ));
     }
 
+    /// Task 6j: a send core refused (`SendRefused`) keeps its text. Put
+    /// back never overwrites typed text; into an empty box it restores the
+    /// text whole and the echo goes.
+    #[gpui::test]
+    fn a_refused_send_is_put_back_into_an_empty_box(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        sign_in(&root, cx, &harness);
+        let script = FakeScript::demo(1, 0);
+        harness
+            .events
+            .unbounded_send(Event::DialogsReset(script.dialogs))
+            .unwrap();
+        cx.run_until_parked();
+        let chat = ChatId {
+            kind: PeerKind::User,
+            id: 1,
+        };
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_chat(chat, window, cx), cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("keep me");
+        cx.simulate_keystrokes("enter");
+        let local_id = match harness.sent.borrow().commands.last() {
+            Some(Command::SendText { local_id, .. }) => *local_id,
+            other => panic!("{other:?}"),
+        };
+        harness
+            .events
+            .unbounded_send(Event::SendRefused { local_id })
+            .unwrap();
+        cx.run_until_parked();
+        let draft = |cx: &mut gpui::VisualTestContext| {
+            root.read_with(cx, |root, cx| match &root.state {
+                State::Running(s) => s.composer.read(cx).text().to_owned(),
+                State::Failed(_) => String::new(),
+            })
+        };
+        cx.simulate_input("typed");
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.put_back(local_id, window, cx), cx);
+        });
+        assert_eq!(draft(cx), "typed", "typed text is never overwritten");
+        assert_eq!(read(&root, cx, |s| s.shell.row_count()), 1, "still kept");
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(
+                |s, cx| s.composer.update(cx, |c, cx| c.clear(window, cx)),
+                cx,
+            );
+            root.with_session(|s, cx| s.put_back(local_id, window, cx), cx);
+        });
+        assert_eq!(draft(cx), "keep me");
+        assert_eq!(read(&root, cx, |s| s.shell.row_count()), 0);
+    }
+
     fn commands_since(harness: &Harness, from: usize) -> Vec<String> {
         harness
             .sent

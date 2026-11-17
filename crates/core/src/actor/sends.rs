@@ -309,7 +309,8 @@ impl<B: Backend> Actor<B> {
     /// A new send. Past the ordinary bound it is kept `Failed` (`Busy`)
     /// rather than dropped, so Retry sends it once a slot frees.
     pub(super) async fn send_text(&mut self, chat: ChatId, text: String, local_id: LocalId) {
-        match self.admit_send(chat, text, local_id, Slot::Ordinary).await {
+        let order = [Slot::Ordinary, Slot::Kept];
+        match self.admit_send(chat, text, local_id, order).await {
             Some(Slot::Ordinary) => self.dispatch_send(local_id).await,
             Some(Slot::Kept) => {
                 self.error(UserError::Busy).await;
@@ -321,35 +322,33 @@ impl<B: Backend> Actor<B> {
 
     /// A new send refused while a logout hides the account (review round
     /// 28): validated and kept `Failed`, never dispatched, so Retry sends
-    /// it after "Stay signed in".
+    /// it after "Stay signed in". It takes an ordinary slot once the kept
+    /// ones are full (review round 33), so core keeps every send while its
+    /// whole table has room, as the UI's one capacity rule assumes.
     pub(super) async fn hold_send(&mut self, chat: ChatId, text: String, local_id: LocalId) {
-        if self
-            .admit_send(chat, text, local_id, Slot::Kept)
-            .await
-            .is_some()
-        {
+        let order = [Slot::Kept, Slot::Ordinary];
+        if self.admit_send(chat, text, local_id, order).await.is_some() {
             self.send_state(local_id, SendState::Failed).await;
         }
     }
 
     /// Validates a new send and enters it in the (bounded) table,
-    /// undispatched: in `want`'s slot, or an ordinary send past its bound
-    /// in a kept one. An ordinary send enters `Sending`, a kept one
-    /// `Failed`. `None`: refused, and answered.
+    /// undispatched and `Failed`, in the first slot of `order` with room.
+    /// Answered `SendAdmitted`; `None`: refused, and answered `SendRefused`
+    /// (task 6j). A `local_id` core already holds gets only `Error(Busy)`:
+    /// the UI never reuses one, and the answer must not touch that send.
     async fn admit_send(
         &mut self,
         chat: ChatId,
         text: String,
         local_id: LocalId,
-        want: Slot,
+        order: [Slot; 2],
     ) -> Option<Slot> {
         if self.sends.map.contains_key(&local_id) {
             self.error(UserError::Busy).await;
             return None;
         }
-        let slot = [want, Slot::Kept]
-            .into_iter()
-            .find(|s| self.sends.has_room(*s));
+        let slot = order.into_iter().find(|s| self.sends.has_room(*s));
         let refused = if slot.is_none() {
             Some(UserError::Busy)
         } else if !sendable(&text) {
@@ -361,7 +360,7 @@ impl<B: Backend> Actor<B> {
             (None, Some(slot), Some(id)) => (slot, id),
             (refused, _, _) => {
                 self.error(refused.unwrap_or(UserError::Internal)).await;
-                self.send_state(local_id, SendState::Failed).await;
+                self.emit(Event::SendRefused { local_id }).await;
                 return None;
             }
         };
@@ -377,10 +376,7 @@ impl<B: Backend> Actor<B> {
             flood_waits: 0,
             auto_until: Instant::now() + AUTO_RETRY_WINDOW,
             last_flood: 0,
-            state: match slot {
-                Slot::Ordinary => SendState::Sending,
-                Slot::Kept => SendState::Failed,
-            },
+            state: SendState::Failed,
             in_flight: false,
             retry_at: None,
             floor,
@@ -388,6 +384,7 @@ impl<B: Backend> Actor<B> {
         };
         self.sends.insert(local_id, pending);
         debug_assert!(self.sends.map.len() <= MAX_PENDING_SENDS + MAX_KEPT_SENDS);
+        self.emit(Event::SendAdmitted { local_id }).await;
         Some(slot)
     }
 
@@ -417,30 +414,46 @@ impl<B: Backend> Actor<B> {
 
     /// Answers a retry that does not run, so the UI's "Sending" ends: the
     /// send's state, or for a send core does not know, `Error(NotFound)`
-    /// then `Failed` (Discard removes its echo). The one path for every
-    /// retry not run, behind a logout or not (review round 31).
+    /// then `SendRefused` (the UI keeps its text, never a Retry that cannot
+    /// work). The one path for every retry not run, behind a logout or not
+    /// (review rounds 31 and 33).
     pub(super) async fn answer_unrun_retry(&mut self, local_id: LocalId) {
         if let Some(state) = self.sends.state_of(local_id) {
             return self.send_state(local_id, state).await;
         }
         self.error(UserError::NotFound).await;
-        self.send_state(local_id, SendState::Failed).await;
+        self.emit(Event::SendRefused { local_id }).await;
     }
 
     /// Removes a failed, unknown or flood-waiting send from the table,
-    /// freeing its slot.
+    /// freeing its slot. Always answered (task 6j): `SendDiscarded` once
+    /// core holds nothing for it (also for a send it does not know), else
+    /// `Error(Busy)` and `DiscardRefused` with the state it keeps (a flood
+    /// wait's automatic resend may have just gone in flight).
     pub(super) async fn discard_send(&mut self, local_id: LocalId) {
         let Some(p) = self.sends.map.get(&local_id) else {
-            return self.error(UserError::NotFound).await;
+            return self.emit(Event::SendDiscarded { local_id }).await;
         };
         let settled = matches!(
             p.state,
             SendState::Failed | SendState::Unknown { .. } | SendState::FloodWait { .. }
         );
         if p.in_flight || !settled {
-            return self.error(UserError::Busy).await;
+            let state = p.state;
+            self.error(UserError::Busy).await;
+            return self.emit(Event::DiscardRefused { local_id, state }).await;
         }
         self.sends.remove(local_id);
+        self.emit(Event::SendDiscarded { local_id }).await;
+    }
+
+    /// Answers a discard refused before it ran (signed out, or another
+    /// epoch's account): what core holds of the send.
+    pub(super) async fn answer_unrun_discard(&mut self, local_id: LocalId) {
+        match self.sends.state_of(local_id) {
+            Some(state) => self.emit(Event::DiscardRefused { local_id, state }).await,
+            None => self.emit(Event::SendDiscarded { local_id }).await,
+        }
     }
 
     /// Queues an attempt on the live instance. Without one, the send stays

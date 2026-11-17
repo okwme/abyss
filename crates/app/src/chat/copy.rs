@@ -7,7 +7,7 @@ use abyss_core::api::{ConnState, SendState};
 use abyss_core::model::{ChatKind, MediaKind};
 use gpui::SharedString;
 
-use super::sends::Echo;
+use super::sends::{Echo, Phase};
 
 pub(crate) const CHATS: &str = "Chats";
 pub(crate) const SELECT_CHAT: &str = "Select a chat";
@@ -26,6 +26,15 @@ pub(crate) const RETRY_HISTORY: &str = "Couldn't load messages · Retry";
 /// Shown once automatic retries of chat list pages gave up.
 pub(crate) const RETRY_CHATS: &str = "Couldn't load more chats · Retry";
 pub(crate) const DISCARD: &str = "Discard";
+/// A send core refused and holds nothing for (task 6j).
+pub(crate) const RETURNED: &str = "Not sent and not kept";
+pub(crate) const PUT_BACK: &str = "Put back in the box";
+pub(crate) const DISMISS: &str = "Dismiss";
+/// Put back while the message box has text.
+pub(crate) const BOX_NOT_EMPTY: &str =
+    "Clear the message box first: the text goes back into an empty box.";
+/// Shown once text is back in the message box.
+pub(crate) const PUT_BACK_DONE: &str = "Not sent and not kept. Your text is back in the box.";
 pub(crate) const LINK_COPIED: &str = "Link copied. abyss never opens links.";
 pub(crate) const FORUM_TOPICS: &str = "Topics arrive in a later version.";
 
@@ -97,6 +106,11 @@ pub(crate) fn byte_size(bytes: u64) -> String {
 /// The status line under an outgoing message that has no server copy yet.
 /// A flood-waiting send counts down to its resend.
 pub(crate) fn send_label(echo: &Echo, now: Instant) -> SharedString {
+    match echo.phase {
+        Phase::Returned => return RETURNED.into(),
+        Phase::Discarding => return "Discarding…".into(),
+        Phase::Submitted | Phase::Kept => {}
+    }
     match echo.state {
         SendState::FloodWait { .. } => match echo.wait_left(now) {
             Some(0) => "Resending…".into(),
@@ -141,6 +155,7 @@ mod send_label_tests {
         echoes
             .push(Echo::new(LocalId(1), chat, "x".into(), 0))
             .unwrap();
+        echoes.admitted(LocalId(1));
         let now = Instant::now();
         echoes.set_state(LocalId(1), SendState::FloodWait { seconds: 30 }, now);
         let e = echoes.get(LocalId(1)).unwrap();

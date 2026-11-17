@@ -12,9 +12,14 @@ use crate::backend::fake::{FakeScript, Op, text_message};
 use crate::model::LocalId;
 use crate::secret::SecretItem;
 
-/// The next `SendState` of `id` other than `Sending`.
+/// The next `SendState` of `id` other than `Sending`, or its
+/// `SendRefused` (core holds nothing for it, task 6j).
 pub(super) fn settled(id: LocalId) -> impl Fn(&Event) -> bool {
-    move |e| matches!(e, Event::SendState { local_id, state } if *local_id == id && *state != SendState::Sending)
+    move |e| match e {
+        Event::SendState { local_id, state } => *local_id == id && *state != SendState::Sending,
+        Event::SendRefused { local_id } => *local_id == id,
+        _ => false,
+    }
 }
 
 /// Logout with the marker write stalled (shown "Logging out"); it fails
@@ -37,7 +42,7 @@ pub(super) async fn stay_signed_in(h: &mut Harness) {
 
 /// Finding 2: a send refused while "Logging out" is shown is kept
 /// `Failed`; after the marker fails and "Stay signed in", Retry sends it.
-/// A retry of a send core does not know is answered `Failed`.
+/// A retry of a send core does not know is answered `SendRefused`.
 #[tokio::test(start_paused = true)]
 async fn a_send_refused_behind_a_logout_is_retryable_after_stay_signed_in() {
     let mut h = harness(FakeScript::demo(1, 1), None).await;
@@ -76,16 +81,7 @@ async fn a_send_refused_behind_a_logout_is_retryable_after_stay_signed_in() {
     );
     h.send(Command::RetrySend(LocalId(99))).await;
     let (ev, seen) = h.until(settled(LocalId(99))).await;
-    assert!(
-        matches!(
-            ev,
-            Event::SendState {
-                state: SendState::Failed,
-                ..
-            }
-        ),
-        "{ev:?}"
-    );
+    assert!(matches!(ev, Event::SendRefused { .. }), "{ev:?}");
     assert!(
         seen.iter()
             .any(|e| matches!(e, Event::Error(UserError::NotFound)))

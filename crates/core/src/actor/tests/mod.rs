@@ -26,6 +26,7 @@ mod review6f;
 mod review6g;
 mod review6h;
 mod review6i;
+mod review6j;
 mod watchdog;
 
 use std::path::PathBuf;
@@ -549,14 +550,16 @@ async fn rejected_send_fails_and_empty_text_is_refused() {
         local_id: LocalId(2),
     })
     .await;
-    let (ev, _) = h.until(send_state(LocalId(2))).await;
-    assert!(matches!(
-        ev,
-        Event::SendState {
-            state: SendState::Failed,
-            ..
-        }
-    ));
+    // Refused: core holds nothing for it (task 6j).
+    let (_, seen) = h
+        .until(|e| matches!(e, Event::SendRefused { local_id } if *local_id == LocalId(2)))
+        .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, Event::SendState { local_id, .. } if *local_id == LocalId(2))),
+        "{seen:?}"
+    );
     assert_eq!(h.fake.calls(Op::Send), 1);
     h.stop().await;
 }

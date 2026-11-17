@@ -134,12 +134,21 @@ fn open(core: &mut Core) -> ChatShell {
     shell
 }
 
+/// Submits `text`, and core keeps it (`SendAdmitted`).
 fn send(shell: &mut ChatShell, core: &mut Core, text: &str) -> LocalId {
     let chat = shell.send_target().unwrap().unwrap();
-    shell
+    let local_id = shell
         .submit(chat, text, 0, &mut core.admit())
         .unwrap()
-        .unwrap()
+        .unwrap();
+    shell.apply(Event::SendAdmitted { local_id });
+    local_id
+}
+
+/// Discards `local_id`, and core answers `SendDiscarded`.
+fn discard(shell: &mut ChatShell, core: &mut Core, local_id: LocalId) {
+    shell.discard(local_id, &mut core.admit()).unwrap();
+    shell.apply(Event::SendDiscarded { local_id });
 }
 
 fn set(shell: &mut ChatShell, local_id: LocalId, state: SendState) {
@@ -242,7 +251,7 @@ fn failed_send_retries_then_is_discarded() {
     assert!(matches!(core.take().as_slice(), [Command::RetrySend(r)] if *r == id));
     assert_eq!(state_of(&shell, 50), Some(SendState::Sending));
     set(&mut shell, id, SendState::Unknown { attempts: 3 });
-    shell.discard(id, &mut core.admit()).unwrap();
+    discard(&mut shell, &mut core, id);
     assert!(matches!(core.take().as_slice(), [Command::DiscardSend(r)] if *r == id));
     assert_eq!(shell.row_count(), 50);
     assert_eq!(shell.rows().item_count(), 50);
@@ -262,7 +271,7 @@ fn flood_waiting_send_can_be_discarded_but_not_retried() {
     assert!(core.take().is_empty(), "core resends it by itself");
     set(&mut shell, id, SendState::FloodWait { seconds: 5 });
     assert!(shell.countdown_tick(), "still waiting");
-    shell.discard(id, &mut core.admit()).unwrap();
+    discard(&mut shell, &mut core, id);
     assert!(matches!(core.take().as_slice(), [Command::DiscardSend(r)] if *r == id));
     assert_eq!(shell.row_count(), 50);
     assert!(!shell.countdown_tick(), "nothing waits: the ticker stops");
@@ -965,3 +974,4 @@ fn only_rows_inside_the_viewport_count_as_seen(cx: &mut TestAppContext) {
 
 mod review10e;
 mod review10f;
+mod review6j;

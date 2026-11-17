@@ -89,8 +89,9 @@ impl ChatShell {
         Ok(Some(local_id))
     }
 
-    /// Retries a failed or unknown send; it shows "Sending…" only once core
-    /// admitted the retry.
+    /// Retries a failed or unknown send; it shows "Sending…" once core's
+    /// queue took the retry. Core answers every retry (the send's state, or
+    /// `SendRefused`), so the flip is always reconciled.
     pub(crate) fn retry(&mut self, local_id: LocalId, admit: Admit<'_>) -> Result<(), Refused> {
         if !self.echoes.get(local_id).is_some_and(Echo::can_retry) {
             return Ok(());
@@ -101,16 +102,34 @@ impl ChatShell {
         Ok(())
     }
 
-    /// Drops a failed, unknown or flood-waiting send; the echo goes only
-    /// once core admitted the discard, so it never hides a send core keeps.
+    /// Drops a failed, unknown or flood-waiting send. The echo shows
+    /// "Discarding…" and keeps its slot until core answers (task 6j): it
+    /// goes on `SendDiscarded`, and stays with core's state on
+    /// `DiscardRefused` (an automatic resend may have gone in flight).
     pub(crate) fn discard(&mut self, local_id: LocalId, admit: Admit<'_>) -> Result<(), Refused> {
         if !self.echoes.get(local_id).is_some_and(Echo::can_discard) {
             return Ok(());
         }
         admit(Command::DiscardSend(local_id))?;
-        self.echoes.discarded(local_id);
-        self.sync_echoes();
+        self.echoes.discarding(local_id);
+        self.remeasure_echoes();
         Ok(())
+    }
+
+    /// Takes the text of a send core refused (`SendRefused`) out of its
+    /// echo, for the composer or to drop. `None`: no such returned echo.
+    pub(crate) fn take_returned(&mut self, local_id: LocalId) -> Option<String> {
+        let echo = self.echoes.take_returned(local_id)?;
+        self.sync_echoes();
+        Some(echo.text)
+    }
+
+    /// The text of a returned echo, if `local_id` is one.
+    pub(crate) fn returned_text(&self, local_id: LocalId) -> Option<&str> {
+        self.echoes
+            .get(local_id)
+            .filter(|e| e.is_returned())
+            .map(|e| e.text.as_str())
     }
 
     /// Back to the live tail from far up the history: core reopens the chat

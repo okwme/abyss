@@ -19,7 +19,7 @@
 use super::Actor;
 use super::jobs::Job;
 use super::lifecycle::Phase;
-use crate::api::{Command, Event, HistoryDir, LoadTarget, SendState, UserError};
+use crate::api::{Command, Event, HistoryDir, LoadTarget, UserError};
 use crate::backend::Backend;
 
 impl<B: Backend> Actor<B> {
@@ -70,13 +70,10 @@ impl<B: Backend> Actor<B> {
     pub(super) async fn acknowledge_refused(&mut self, cmd: Command) {
         match cmd {
             Command::SendText { local_id, .. } => {
-                self.emit(Event::SendState {
-                    local_id,
-                    state: SendState::Failed,
-                })
-                .await;
+                self.emit(Event::SendRefused { local_id }).await;
             }
             Command::RetrySend(local_id) => self.answer_unrun_retry(local_id).await,
+            Command::DiscardSend(local_id) => self.answer_unrun_discard(local_id).await,
             Command::LoadDialogs => {
                 self.load_ended(LoadTarget::Dialogs, Some(UserError::Busy))
                     .await;
