@@ -123,17 +123,6 @@ pub(crate) fn initials(title: &str) -> SharedString {
         .into()
 }
 
-/// A stable hue in `[0, 1)` for a chat or sender, from its id.
-pub(crate) fn hue(id: ChatId) -> f32 {
-    // FNV-1a over the id; display only, not security relevant.
-    let mut h: u32 = 0x811c_9dc5;
-    for b in id.id.to_le_bytes() {
-        h ^= u32::from(b);
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    f32::from(u16::try_from(h % 360).unwrap_or(0)) / 360.
-}
-
 #[cfg(test)]
 mod tests {
     use abyss_core::model::{ChatKind, MediaKind, PeerKind};
@@ -256,6 +245,5 @@ mod tests {
         assert_eq!(initials("ada lovelace"), "AL");
         assert_eq!(initials("  ✨ émile  zola bar"), "ÉZ");
         assert_eq!(initials(""), "");
-        assert!((0.0..1.0).contains(&hue(id(42))));
     }
 }

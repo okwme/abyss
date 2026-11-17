@@ -20,6 +20,20 @@ pub(crate) fn day(unix: i64, tz: &TimeZone) -> Option<Date> {
     zoned(unix, tz).map(|z| z.date())
 }
 
+/// Whole local calendar days from `unix` back to `now`, for the tone a row
+/// takes (old things sink). 0 for today, for a date in the future, and for
+/// something undated.
+pub(crate) fn days_ago(unix: i64, now: i64, tz: &TimeZone) -> i64 {
+    if unix <= 0 {
+        return 0;
+    }
+    let (Some(then), Some(today)) = (day(unix, tz), day(now, tz)) else {
+        return 0;
+    };
+    then.until(today)
+        .map_or(0, |span| i64::from(span.get_days()).max(0))
+}
+
 /// `14:05`.
 pub(crate) fn time_of_day(unix: i64, tz: &TimeZone) -> SharedString {
     zoned(unix, tz).map_or_else(SharedString::default, |z| {
@@ -72,6 +86,19 @@ mod tests {
     const UTC: TimeZone = TimeZone::UTC;
     /// 2026-11-16 14:05:00 UTC, a Monday.
     const NOW: i64 = 1_794_837_900;
+
+    #[test]
+    fn days_ago_counts_calendar_days() {
+        const DAY: i64 = 86_400;
+        // 14:05 today back to 23:59 yesterday is under a day, but a day ago.
+        assert_eq!(days_ago(NOW - 14 * 3600 - 6 * 60, NOW, &UTC), 1);
+        assert_eq!(days_ago(NOW - 14 * 3600, NOW, &UTC), 0);
+        assert_eq!(days_ago(NOW, NOW, &UTC), 0);
+        assert_eq!(days_ago(NOW - 40 * DAY, NOW, &UTC), 40);
+        assert_eq!(days_ago(NOW - 800 * DAY, NOW, &UTC), 800);
+        assert_eq!(days_ago(NOW + 3 * DAY, NOW, &UTC), 0, "future");
+        assert_eq!(days_ago(0, NOW, &UTC), 0, "undated");
+    }
 
     #[test]
     fn times_and_days() {

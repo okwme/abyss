@@ -7,87 +7,131 @@ use std::ops::Range;
 use abyss_core::model::{Body, ChatKind, ChatSummary, Message, MsgId};
 use abyss_core::rich_text::RichText;
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, FontWeight, Hsla,
-    InteractiveText, SharedString, Stateful, StyledText, WeakEntity, Window, div, font, hsla, list,
-    prelude::*, px, rgb, rgba, uniform_list, white,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, Hsla, InteractiveText,
+    Rgba, SharedString, Stateful, StyledText, WeakEntity, Window, div, font, list, prelude::*, px,
+    transparent_black, uniform_list,
 };
 use jiff::tz::TimeZone;
 
 use super::session::Session;
-use super::view::{ACCENT, BORDER, FG, MUTED, SELECTED, SURFACE, centered, field, muted};
+use super::view::{centered, field, muted};
 use super::{Root, State};
 use crate::chat::messages::MessageWindow;
 use crate::chat::rich::{self, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
 use crate::chat::{Row, copy, format, list as chat_list};
+use crate::ui::mark::mark;
+use crate::ui::theme::{self, Depth, Theme, Themes};
 
 const CHAT_ROW_HEIGHT: f32 = 56.;
 const SIDEBAR_WIDTH: f32 = 300.;
 const BUBBLE_MAX_WIDTH: f32 = 560.;
-const OUTGOING_BG: u32 = 0xdd_f4ff;
-const INCOMING_BG: u32 = 0xf6_f8fa;
-const SPOILER: u32 = 0x8c_959f;
-const CODE_BG: u32 = 0x1f23_2814;
 
 fn fonts() -> Fonts {
     Fonts {
-        body: font(".SystemUIFont"),
-        mono: font("Menlo"),
+        body: font(theme::BODY_FONT),
+        mono: font(theme::MONO_FONT),
     }
 }
 
-fn palette() -> Palette {
+/// Rich-text colors for text set in `ink`. All one color: a link is marked
+/// by its underline and a mention by its weight. A hidden spoiler is an
+/// opaque block, so the text under it cannot show through.
+fn palette(ink: Rgba, theme: &Theme) -> Palette {
     Palette {
-        text: rgb(FG).into(),
-        muted: rgb(MUTED).into(),
-        link: rgb(ACCENT).into(),
-        mention: rgb(ACCENT).into(),
-        code_bg: rgba(CODE_BG).into(),
-        spoiler: rgb(SPOILER).into(),
+        text: ink.into(),
+        muted: theme::quiet(ink).into(),
+        link: ink.into(),
+        mention: ink.into(),
+        code_bg: theme::faded(ink, 0.1).into(),
+        spoiler: theme.hidden.into(),
     }
 }
 
-/// A color for an avatar or a sender name, from an id hash.
-fn id_color(hue: f32) -> Hsla {
-    hsla(hue, 0.55, 0.45, 1.)
+/// Tone tracks age: the depth of something dated `unix`.
+fn depth_of(unix: i64, now: i64, tz: &TimeZone) -> Depth {
+    Depth::from_days(format::days_ago(unix, now, tz))
 }
 
-pub(super) fn chat_shell(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
+pub(super) fn chat_shell(
+    session: &Session,
+    theme: &Theme,
+    cx: &mut Context<'_, Root>,
+) -> AnyElement {
     div()
         .size_full()
         .flex()
         .flex_row()
-        .child(sidebar(session, cx))
-        .child(chat_pane(session, cx))
+        .child(sidebar(session, theme, cx))
+        .child(chat_pane(session, theme, cx))
         .into_any_element()
 }
 
-fn sidebar(session: &Session, cx: &mut Context<'_, Root>) -> Div {
-    let count = session.shell.list.len();
-    let body = if count == 0 {
+fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div {
+    let chats = session.shell.list.as_slice();
+    let body = if chats.is_empty() {
         centered().child(muted(copy::NO_CHATS)).into_any_element()
     } else {
-        uniform_list("chats", count, cx.processor(chat_rows))
+        uniform_list("chats", chats.len(), cx.processor(chat_rows))
             .flex_1()
             .into_any_element()
     };
+    // Below the last chat the column keeps that chat's tone, so the list
+    // reads as one descent with no lighter gap under it.
+    let floor = chats.last().map_or(Depth::NOW, |c| {
+        depth_of(c.last_date, format::now(), &format::local_tz())
+    });
     div()
         .w(px(SIDEBAR_WIDTH))
+        .flex_none()
         .h_full()
         .flex()
         .flex_col()
-        .border_r_1()
-        .border_color(rgb(BORDER))
-        .bg(rgb(SURFACE))
+        .bg(theme.surface(floor))
+        .text_color(theme.text_on(floor))
         .child(
             div()
                 .p_3()
                 .flex()
                 .justify_between()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(copy::CHATS))
-                .child(muted(copy::conn_label(session.conn))),
+                .items_baseline()
+                .bg(theme.surface(Depth::NOW))
+                .text_color(theme.text)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(mark(theme, 18.))
+                        .child(
+                            div()
+                                .font_family(theme::NAME_FONT)
+                                .text_lg()
+                                .child(copy::WORDMARK),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap_3()
+                        .child(muted(copy::conn_label(session.conn)).text_xs())
+                        .child(appearance_button(cx)),
+                ),
         )
         .child(body)
+}
+
+/// Opens the appearance panel; also in the app menu and on Cmd+comma.
+fn appearance_button(cx: &mut Context<'_, Root>) -> Stateful<Div> {
+    div()
+        .id("appearance")
+        .text_xs()
+        .cursor_pointer()
+        .child(crate::ui::copy::APPEARANCE)
+        .on_click(cx.listener(|root, _: &ClickEvent, _, cx| {
+            root.toggle_appearance(cx);
+        }))
 }
 
 fn chat_rows(
@@ -100,6 +144,7 @@ fn chat_rows(
         return Vec::new();
     };
     session.dialogs_seen(range.end.saturating_sub(1), window, cx);
+    let theme = &Themes::of(window, cx);
     let (tz, now) = (format::local_tz(), format::now());
     let selected = session.shell.selected();
     let chats = session.shell.list.as_slice();
@@ -113,8 +158,9 @@ fn chat_rows(
                 chat,
                 selected: selected == Some(chat.id),
                 time: format::list_time(chat.last_date, now, &tz),
+                depth: depth_of(chat.last_date, now, &tz),
             };
-            row.render(ix, cx)
+            row.render(ix, theme, cx)
         })
         .collect()
 }
@@ -123,16 +169,20 @@ struct ChatRow<'a> {
     chat: &'a ChatSummary,
     selected: bool,
     time: SharedString,
+    /// How far the chat has sunk: its surface darkens with its age.
+    depth: Depth,
 }
 
 impl ChatRow<'_> {
-    fn render(self, ix: usize, cx: &mut Context<'_, Root>) -> Stateful<Div> {
+    fn render(self, ix: usize, theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
         let chat = self.chat;
         let id = chat.id;
-        let bg = if self.selected {
-            rgb(SELECTED)
+        let (surface, ink) = (theme.surface(self.depth), theme.text_on(self.depth));
+        // The selected chat is marked by a rule in its own text color.
+        let mark: Hsla = if self.selected {
+            ink.into()
         } else {
-            rgba(0)
+            transparent_black()
         };
         let tag = copy::kind_label(chat.kind).map(|t| muted(t).text_xs().flex_none());
         let title = div()
@@ -143,6 +193,7 @@ impl ChatRow<'_> {
                     .flex_1()
                     .min_w_0()
                     .truncate()
+                    .font_family(theme::NAME_FONT)
                     .child(chat.title.clone()),
             )
             .children(tag)
@@ -157,20 +208,24 @@ impl ChatRow<'_> {
                     .min_w_0()
                     .truncate(),
             )
-            .children(unread_badge(chat));
+            .children(unread_badge(chat, surface, ink));
         div()
             .id(ix)
+            .w_full()
             .h(px(CHAT_ROW_HEIGHT))
             .px_3()
             .flex()
             .items_center()
             .gap_3()
-            .bg(bg)
+            .border_l_2()
+            .border_color(mark)
+            .bg(surface)
+            .text_color(ink)
             .cursor_pointer()
             .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
                 root.with_session(|s, cx| s.select_chat(id, window, cx), cx);
             }))
-            .child(avatar(chat))
+            .child(avatar(chat, ink))
             .child(
                 div()
                     .flex_1()
@@ -183,27 +238,28 @@ impl ChatRow<'_> {
     }
 }
 
-fn unread_badge(chat: &ChatSummary) -> Option<Div> {
+/// An unread count: the row's own two colors, swapped.
+fn unread_badge(chat: &ChatSummary, surface: Rgba, ink: Rgba) -> Option<Div> {
     (chat.unread > 0).then(|| {
         let mention = if chat.unread_mentions > 0 { "@ " } else { "" };
         div()
             .px_2()
             .flex_none()
             .rounded_full()
-            .bg(rgb(ACCENT))
-            .text_color(white())
+            .bg(ink)
+            .text_color(surface)
             .text_xs()
             .child(format!("{mention}{}", copy::unread_badge(chat.unread)))
     })
 }
 
-fn avatar(chat: &ChatSummary) -> Div {
+/// Initials on a faint disc of the row's text color (no images in Stage 1).
+fn avatar(chat: &ChatSummary, ink: Rgba) -> Div {
     div()
         .size(px(36.))
         .flex_none()
         .rounded_full()
-        .bg(id_color(chat_list::hue(chat.id)))
-        .text_color(white())
+        .bg(theme::faded(ink, 0.14))
         .text_sm()
         .flex()
         .justify_center()
@@ -211,7 +267,7 @@ fn avatar(chat: &ChatSummary) -> Div {
         .child(chat_list::initials(&chat.title))
 }
 
-fn chat_pane(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
+fn chat_pane(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     let Some(chat) = session.shell.selected_chat() else {
         return centered()
             .child(muted(copy::SELECT_CHAT))
@@ -231,6 +287,10 @@ fn chat_pane(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
             .into_any_element()
     };
     let detached = window.is_some_and(MessageWindow::has_newer);
+    // Above the oldest loaded message the pane keeps that message's tone.
+    let oldest = session.shell.row(0).map_or(Depth::NOW, |r| {
+        depth_of(r.date(), format::now(), &format::local_tz())
+    });
     div()
         .flex_1()
         .h_full()
@@ -243,10 +303,12 @@ fn chat_pane(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
                 .flex_1()
                 .min_h_0()
                 .relative()
+                .bg(theme.surface(oldest))
+                .text_color(theme.text_on(oldest))
                 .child(body)
-                .children(detached.then(|| jump_button(cx))),
+                .children(detached.then(|| jump_button(theme, cx))),
         )
-        .child(composer_area(session, chat))
+        .child(composer_area(session, chat, theme))
         .into_any_element()
 }
 
@@ -254,14 +316,13 @@ fn pane_header(chat: &ChatSummary) -> Div {
     let forum = matches!(chat.kind, ChatKind::Supergroup { forum: true, .. });
     div()
         .p_3()
-        .border_b_1()
-        .border_color(rgb(BORDER))
         .flex()
         .gap_2()
         .items_baseline()
         .child(
             div()
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_family(theme::NAME_FONT)
+                .text_lg()
                 .truncate()
                 .child(chat.title.clone()),
         )
@@ -269,33 +330,39 @@ fn pane_header(chat: &ChatSummary) -> Div {
         .children(forum.then(|| muted(copy::FORUM_TOPICS).text_xs()))
 }
 
-fn jump_button(cx: &mut Context<'_, Root>) -> Stateful<Div> {
-    pill("jump-to-latest", copy::JUMP_TO_LATEST)
-        .absolute()
-        .bottom_3()
-        .right_3()
-        .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
-            root.with_session(|s, cx| s.jump_to_latest(window, cx), cx);
-        }))
+fn jump_button(theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
+    pill(
+        "jump-to-latest",
+        copy::JUMP_TO_LATEST,
+        theme.text,
+        theme.on_text,
+    )
+    .absolute()
+    .bottom_3()
+    .right_3()
+    .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
+        root.with_session(|s, cx| s.jump_to_latest(window, cx), cx);
+    }))
 }
 
-fn pill(id: impl Into<ElementId>, label: &'static str) -> Stateful<Div> {
+/// A small action in `ink` on `fill`.
+fn pill(id: impl Into<ElementId>, label: &'static str, fill: Rgba, ink: Rgba) -> Stateful<Div> {
     div()
         .id(id)
         .px_3()
         .py_1()
         .rounded_full()
-        .bg(rgb(ACCENT))
-        .text_color(white())
+        .bg(fill)
+        .text_color(ink)
         .text_sm()
         .cursor_pointer()
         .child(label)
 }
 
-fn composer_area(session: &Session, chat: &ChatSummary) -> Div {
-    let area = div().p_3().border_t_1().border_color(rgb(BORDER));
+fn composer_area(session: &Session, chat: &ChatSummary, theme: &Theme) -> Div {
+    let area = div().p_3();
     if chat.can_send {
-        area.child(field(session.composer.clone().into_any_element()))
+        area.child(field(session.composer.clone().into_any_element(), theme))
     } else {
         area.child(muted(copy::READ_ONLY).text_sm())
     }
@@ -305,9 +372,10 @@ fn composer_area(session: &Session, chat: &ChatSummary) -> Div {
 fn message_row(
     root: &mut Root,
     ix: usize,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
+    let theme = Themes::of(window, cx);
     let State::Running(session) = &root.state else {
         return div().into_any_element();
     };
@@ -317,6 +385,7 @@ fn message_row(
     };
     let ctx = RowCtx {
         this: cx.weak_entity(),
+        theme,
         tz: format::local_tz(),
         groupish: shell
             .selected_chat()
@@ -339,14 +408,18 @@ fn message_row(
                 .and_then(|r| shell.window().and_then(|w| w.by_id(r)));
             ctx.message(m, shell.spoilers(m.id), reply)
         }
-        Row::Echo(e) => echo_row(e, cx),
+        Row::Echo(e) => echo_row(e, &theme, cx),
     };
+    // Each row carries the tone of its own age, so history darkens upward.
+    let depth = depth_of(row.date(), format::now(), &ctx.tz);
     div()
         .w_full()
         .px_4()
         .py_1()
         .flex()
         .flex_col()
+        .bg(theme.surface(depth))
+        .text_color(theme.text_on(depth))
         .children(start)
         .children(separator)
         .child(content)
@@ -369,19 +442,34 @@ enum Side {
     Outgoing,
 }
 
+impl Side {
+    /// The user's own words carry the most contrast on screen; whatever
+    /// arrives sits on a quiet wash.
+    fn fill(self, theme: &Theme) -> Rgba {
+        match self {
+            Self::Incoming => theme.incoming,
+            Self::Outgoing => theme.text,
+        }
+    }
+
+    /// The text color inside a bubble on this side.
+    fn ink(self, theme: &Theme) -> Rgba {
+        match self {
+            Self::Incoming => theme.text,
+            Self::Outgoing => theme.on_text,
+        }
+    }
+}
+
 /// A message bubble, right-aligned for outgoing messages.
-fn in_bubble(side: Side, content: Vec<AnyElement>) -> AnyElement {
-    let bg = if side == Side::Outgoing {
-        OUTGOING_BG
-    } else {
-        INCOMING_BG
-    };
+fn in_bubble(side: Side, theme: &Theme, content: Vec<AnyElement>) -> AnyElement {
     let inner = div()
         .max_w(px(BUBBLE_MAX_WIDTH))
         .px_3()
         .py_2()
-        .rounded_lg()
-        .bg(rgb(bg))
+        .rounded(px(theme::RADIUS))
+        .bg(side.fill(theme))
+        .text_color(side.ink(theme))
         .flex()
         .flex_col()
         .gap_1()
@@ -395,19 +483,18 @@ fn in_bubble(side: Side, content: Vec<AnyElement>) -> AnyElement {
     row.child(inner).into_any_element()
 }
 
-fn media_chip(label: &str) -> Div {
+fn media_chip(label: &str, ink: Rgba) -> Div {
     div()
         .px_2()
         .py_1()
         .rounded_md()
         .border_1()
-        .border_color(rgb(BORDER))
-        .bg(white())
+        .border_color(theme::line(ink))
         .text_sm()
         .child(format!("[{label}]"))
 }
 
-fn reply_quote(target: &Message) -> Div {
+fn reply_quote(target: &Message, ink: Rgba) -> Div {
     let text: SharedString = match &target.body {
         Body::Text(rt) => chat_list::preview_text(Some(&abyss_core::model::Preview::Text(
             abyss_core::sanitize::clean(rt.text(), abyss_core::sanitize::MAX_PREVIEW_BYTES),
@@ -418,9 +505,9 @@ fn reply_quote(target: &Message) -> Div {
     div()
         .pl_2()
         .border_l_2()
-        .border_color(rgb(ACCENT))
+        .border_color(ink)
         .text_xs()
-        .text_color(rgb(MUTED))
+        .opacity(theme::QUIET)
         .truncate()
         .child(text)
 }
@@ -428,6 +515,7 @@ fn reply_quote(target: &Message) -> Div {
 /// Per-row rendering context.
 struct RowCtx {
     this: WeakEntity<Root>,
+    theme: Theme,
     tz: TimeZone,
     /// Groups show sender names.
     groupish: bool,
@@ -443,6 +531,12 @@ impl RowCtx {
     }
 
     fn message(&self, m: &Message, spoilers: Spoilers, reply: Option<&Message>) -> AnyElement {
+        let side = if m.outgoing {
+            Side::Outgoing
+        } else {
+            Side::Incoming
+        };
+        let ink = side.ink(&self.theme);
         let body = match &m.body {
             Body::Service(text) => {
                 return div()
@@ -452,13 +546,15 @@ impl RowCtx {
                     .child(muted(text.clone()).text_sm().italic())
                     .into_any_element();
             }
-            Body::Text(rt) => self.rich(m.id, rt, spoilers),
+            Body::Text(rt) => self.rich(m.id, rt, spoilers, ink),
             Body::Media { kind, caption } => div()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(media_chip(&copy::media_label(kind)))
-                .children((!caption.text().is_empty()).then(|| self.rich(m.id, caption, spoilers)))
+                .child(media_chip(&copy::media_label(kind), ink))
+                .children(
+                    (!caption.text().is_empty()).then(|| self.rich(m.id, caption, spoilers, ink)),
+                )
                 .into_any_element(),
             Body::Unsupported => muted(copy::UNSUPPORTED).italic().into_any_element(),
         };
@@ -468,9 +564,8 @@ impl RowCtx {
             .filter(|_| self.groupish && !m.outgoing)
             .map(|s| {
                 div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(id_color(chat_list::hue(s.id)))
+                    .text_sm()
+                    .font_family(theme::NAME_FONT)
                     .child(s.name.clone())
                     .into_any_element()
             });
@@ -482,26 +577,21 @@ impl RowCtx {
         };
         let mut content: Vec<AnyElement> = Vec::with_capacity(4);
         content.extend(sender);
-        content.extend(reply.map(|r| reply_quote(r).into_any_element()));
+        content.extend(reply.map(|r| reply_quote(r, ink).into_any_element()));
         content.push(body);
         content.push(muted(footer).text_xs().into_any_element());
-        let side = if m.outgoing {
-            Side::Outgoing
-        } else {
-            Side::Incoming
-        };
-        in_bubble(side, content)
+        in_bubble(side, &self.theme, content)
     }
 
     /// Formatted text: a link click copies its target (links never open), a
     /// spoiler click reveals the message's spoilers.
-    fn rich(&self, id: MsgId, rt: &RichText, spoilers: Spoilers) -> AnyElement {
+    fn rich(&self, id: MsgId, rt: &RichText, spoilers: Spoilers, ink: Rgba) -> AnyElement {
         let rich::Body {
             text,
             runs,
             links,
             spoilers: hidden,
-        } = rich::style(rt, &fonts(), &palette(), spoilers);
+        } = rich::style(rt, &fonts(), &palette(ink, &self.theme), spoilers);
         let (mut ranges, targets): (Vec<Range<usize>>, Vec<SharedString>) =
             links.into_iter().unzip();
         ranges.extend(hidden);
@@ -518,7 +608,7 @@ impl RowCtx {
 
 /// An own send without a server copy yet: its state, and Retry and Discard
 /// where core accepts them.
-fn echo_row(e: &Echo, cx: &mut Context<'_, Root>) -> AnyElement {
+fn echo_row(e: &Echo, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     let local_id = e.local_id;
     let status = div()
         .flex()
@@ -534,15 +624,36 @@ fn echo_row(e: &Echo, cx: &mut Context<'_, Root>) -> AnyElement {
             root.with_session(|s, cx| s.discard_send(local_id, window, cx), cx);
         });
         status
-            .child(pill(("retry", local_id.0), copy::RETRY).on_click(retry))
-            .child(pill(("discard", local_id.0), copy::DISCARD).on_click(discard))
+            .child(
+                pill(
+                    ("retry", local_id.0),
+                    copy::RETRY,
+                    theme.on_text,
+                    theme.text,
+                )
+                .on_click(retry),
+            )
+            .child(
+                pill(
+                    ("discard", local_id.0),
+                    copy::DISCARD,
+                    theme.on_text,
+                    theme.text,
+                )
+                .on_click(discard),
+            )
     } else {
         status
     };
-    let text = rich::plain(&e.text, &fonts(), &palette());
+    let text = rich::plain(
+        &e.text,
+        &fonts(),
+        &palette(Side::Outgoing.ink(theme), theme),
+    );
     let body = StyledText::new(text.text).with_runs(text.runs);
     in_bubble(
         Side::Outgoing,
+        theme,
         vec![body.into_any_element(), status.into_any_element()],
     )
 }

@@ -3,6 +3,7 @@
 mod chat;
 mod launch;
 mod logging;
+mod onboarding;
 mod shell;
 mod ui;
 

@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use abyss_core::api::{AuthState, Command, ConnState, Event, PasswordBuf, UserError};
 use abyss_core::{BackendChoice, CoreConfig, SendError, StartError};
-use gpui::{AppContext, Context, Entity, Focusable, SharedString, Subscription, Task, Window};
+use gpui::{
+    AppContext, Context, Entity, FocusHandle, Focusable, SharedString, Subscription, Task, Window,
+};
 
 use super::Root;
 use super::auth::{AuthView, project};
@@ -73,6 +75,11 @@ pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
 pub(crate) struct Session {
     pub(super) core: SharedCore,
     pub(super) auth: AuthView,
+    /// Whether the Welcome screen has been left in this run. It comes before
+    /// the phone step of a signed-out run (plan section 17.3).
+    pub(super) welcomed: bool,
+    /// Holds focus while the Welcome screen shows, so Enter reaches it.
+    pub(super) welcome_focus: FocusHandle,
     /// Core said the password token is gone: the next submission asks for new
     /// parameters first.
     needs_params: bool,
@@ -128,6 +135,8 @@ impl Session {
         let session = Self {
             core: shared,
             auth: AuthView::Connecting,
+            welcomed: false,
+            welcome_focus: cx.focus_handle(),
             needs_params: false,
             phone,
             code,
@@ -226,8 +235,16 @@ impl Session {
         false
     }
 
+    /// Leaves the Welcome screen: the phone step shows and takes focus.
+    pub(super) fn accept_welcome(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        self.welcomed = true;
+        self.focus_for_auth(window, cx);
+        cx.notify();
+    }
+
     fn focus_for_auth(&self, window: &mut Window, cx: &mut Context<'_, Root>) {
         let handle = match self.auth {
+            AuthView::Phone { .. } if !self.welcomed => self.welcome_focus.clone(),
             AuthView::Phone { .. } => self.phone.focus_handle(cx),
             AuthView::Code { .. } => self.code.focus_handle(cx),
             AuthView::Password { .. } => self.password.focus_handle(cx),

@@ -379,7 +379,7 @@ pub enum MediaKind { Photo, Video, Voice, Audio, Document { name: String, size: 
   - An incoming message increments the count unless the chat is open, the window has focus and the list is following its tail.
   - **Mark read:** grammers' `mark_as_read` hardcodes `max_id: 0` (`dialogs.rs:226-240`). We call the raw `messages.readHistory(peer, max_id)` / `channels.readHistory(channel, max_id)` (`api.tl:2622, 2933`) with the **highest message id actually displayed**, coalesced. `InputChannel` comes from the `PeerRef` conversions (`peer.rs:781-797`).
   - Reads on other devices arrive as `Update::Raw` `updateReadHistoryInbox` / `updateReadChannelInbox` (`api.tl:349, 356`), which set `unread = still_unread_count`.
-- **Row:** fixed height, with an initials avatar (color from a hashed id, no image), the title, a 100-character preview (media shown as `[Photo]` etc.), the time and an unread badge.
+- **Row:** fixed height, with an initials avatar (a faint disc in the row's text color, no image; the theme has no per-chat colors, see `docs/brand/brand.md`), the title, a 100-character preview (media shown as `[Photo]` etc.), the time and an unread badge.
 - **Rendering:** `uniform_list` (`Z/examples/uniform_list.rs`).
 
 ## 8. Message view
@@ -393,9 +393,9 @@ pub enum MediaKind { Photo, Video, Voice, Audio, Document { name: String, size: 
   - Windows are kept only for the 8 most recently opened chats.
   - `ChatInvalidated` clears a window and refetches its tail if it's open.
 - **Rows:**
-  - The sender name appears only in groups, colored by hashed id.
+  - The sender name appears only in groups, set in the name face and the message's own text color (no per-sender color).
   - The body is rendered from `Segment`s mapped 1:1 to `TextRun`s (`StyledText::with_runs`, `text.rs:502`) and wrapped in `InteractiveText` (`text.rs:1013-1060`). Code and pre text use a monospace font. Spoilers render dimmed and reveal on click.
-  - **Links:** the tooltip shows the **real** target URL. Clicking opens `window.prompt` (`Z/src/window.rs:7149`) with the full URL and Open / Copy / Cancel. Open calls `cx.open_url` (`Z/src/app.rs:2050`) only for `http`/`https`. Every other scheme is copy-only.
+  - **Links:** copy-only, for every scheme (decision 2026-11-16; supersedes the earlier Open / Copy / Cancel prompt). A link renders as text, with a hidden target shown inline after the text it hides behind. Clicking copies the exact target to the clipboard and shows "Link copied". `cx.open_url` is never reachable from message content.
   - Each row also shows local time (`jiff`, which grammers already uses), day separators and an "edited" mark. Outgoing messages are right-aligned. A reply shows one line quoting the target if it's cached.
 - **Media:** an inert chip showing kind, sanitized name and size, plus the caption. No download API exists in `Backend`, and `FakeBackend` asserts that none is reached.
 - **Live updates** (`G/grammers-client/src/update/update.rs:23-48`):
@@ -853,6 +853,11 @@ Telegram requires an `api_id`/`api_hash` per client application. Decision: **bri
 - BYO costs one visit to my.telegram.org. The onboarding exists to make that visit painless.
 - A packaged release may later embed a project id at build time (`option_env!("ABYSS_EMBEDDED_API_ID")` / `..._HASH`). This is off by default and not part of Stage 1.
 
+**Amendment (2026-11-16, brand workshop).** The audience is now privacy-curious mainstream users (`docs/brand/brand.md`), who will not register an application at my.telegram.org. So:
+- **Packaged releases embed a project pair** and go straight to sign-in. This accepts the shared-registration risk above for those builds: one revocation or rate limit reaches every user of the embedded pair.
+- **BYO stays** the default for source builds, and is the fallback in a packaged build: `API_ID_INVALID` or `API_ID_PUBLISHED_FLOOD` on the embedded pair leads to the credentials screens, and a pair the user has stored still wins over the embedded one (resolution order below, unchanged).
+- **Blocked on** registering a project `api_id`, which does not exist yet. Until it does, nothing changes in code.
+
 **Resolution order:**
 1. `ABYSS_API_ID` + `ABYSS_API_HASH` env vars. This is a dev override and is never persisted.
 2. The Keychain item `dev.abyss.apicreds`, owned by the persistence worker with the same attributes as the session item (section 3, task 5 notes).
@@ -898,14 +903,16 @@ Telegram requires an `api_id`/`api_hash` per client application. Decision: **bri
 
 Every screen has Back except Welcome. Copy lives in one module (`crates/app/src/onboarding/copy.rs`) so docs and UI stay in sync.
 
-1. **Welcome.** What abyss is (a small, auditable client) and an honest threat model:
-   - It reduces the *client-side* attack surface.
-   - Cloud chats are still readable by Telegram's servers.
-   - There are no secret chats, calls, stickers, browser or Mini Apps in v1.
+1. **Welcome.** What abyss is (the wordmark, tagline and descriptor from `docs/brand/brand.md`) and an honest threat model. The threat model is stated **per network**, because what a server can read differs for each one and abyss is meant to reach more than Telegram. The copy module holds one statement per network, always in the same three parts:
+   - **What abyss changes.** It reduces the *client-side* attack surface. This part is the same for every network.
+   - **What that network's servers can still read.** For Telegram: cloud chats are readable by Telegram's servers.
+   - **What is missing in this version.** For Telegram: no secret chats, calls, stickers, browser or Mini Apps in v1.
 
-   One button: **Connect to Telegram**.
+   The screen shows the statement for the network being connected. One button: **Connect to Telegram**.
+
+   **Status (2026-11-16):** built ahead of the rest of 6b, app side only: `shell/welcome.rs` with the copy in `onboarding/copy.rs`. It shows before the phone step of a signed-out run, once per run (a UI-side flag on `Session`; core has no `Welcome` state yet). Enter or the button leaves it. When 6b adds `NeedCredentials`, the screen moves in front of the credentials steps.
 2. **Get API credentials.** Numbered steps, with **Open my.telegram.org** opening the system browser.
-   - The URL is the hardcoded constant `https://my.telegram.org/apps`, opened via `cx.open_url`. This is the only URL onboarding opens directly. Message links keep the separate confirm-before-open policy in section 8.
+   - The URL is the hardcoded constant `https://my.telegram.org/apps`, opened via `cx.open_url`. This is the only URL abyss ever opens. Message links are copy-only (section 8).
    - The steps:
      0. Prerequisite: you need an existing Telegram account signed in on an official app (phone or desktop), and you must keep that session available. Login codes for my.telegram.org and for abyss arrive there.
      1. Log in with your phone number. The login code arrives *in your Telegram app*, not by SMS.

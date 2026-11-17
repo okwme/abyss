@@ -186,13 +186,15 @@ fn spoilers_hide_until_revealed() {
 }
 
 #[test]
-fn mention_is_colored() {
+fn mention_is_marked_by_color_and_weight() {
     let s = styled(
         "hi @bob",
         &[entity(3, 4, EntityKind::Mention)],
         Spoilers::Hidden,
     );
     assert_eq!(s.runs[1].color, palette().mention);
+    assert_eq!(s.runs[0].font.weight, FontWeight::NORMAL);
+    assert_eq!(s.runs[1].font.weight, FontWeight::SEMIBOLD);
 }
 
 #[test]

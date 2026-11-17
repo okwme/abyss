@@ -1,48 +1,51 @@
-//! Rendering for the main window. Placeholder styling: a light palette and
-//! system font until the design pass.
+//! Rendering for the main window, in the tonal theme (`docs/brand/brand.md`):
+//! one hue, no accent color, emphasis by contrast only.
 
 use std::time::Instant;
 
 use abyss_core::api::UserError;
 use gpui::{
     AnyElement, ClickEvent, Context, Div, FontWeight, SharedString, Stateful, Window, div,
-    prelude::*, px, rgb, rgba, white,
+    prelude::*, px,
 };
 
+use super::appearance;
 use super::auth::AuthView;
 use super::chat_view::chat_shell;
 use super::session::Session;
 use super::shutdown::Closing;
+use super::welcome::welcome_screen;
 use super::{Failure, Root, State};
 use crate::ui::copy;
-
-pub(super) const FG: u32 = 0x1f_2328;
-pub(super) const MUTED: u32 = 0x65_6d76;
-pub(super) const BORDER: u32 = 0xd0_d7de;
-pub(super) const SURFACE: u32 = 0xf6_f8fa;
-pub(super) const ACCENT: u32 = 0x09_69da;
-const ERROR: u32 = 0xcf_222e;
-pub(super) const SELECTED: u32 = 0xdd_f4ff;
+use crate::ui::mark::mark;
+use crate::ui::theme::{self, Depth, Mode, Theme, Themes};
 
 type SubmitFn = fn(&mut Session, &mut Window, &mut Context<'_, Root>);
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let theme = &Themes::of(window, cx);
         let (body, overlay) = match &self.state {
             State::Failed(failure) => (failure_screen(failure).into_any_element(), None),
-            State::Running(session) => {
-                (session_body(session, cx), closing_overlay(session.closing))
-            }
+            State::Running(session) => (
+                session_body(session, theme, cx),
+                closing_overlay(session.closing, theme),
+            ),
         };
+        let panel = self
+            .appearance_open
+            .then(|| appearance::panel(theme, Mode::of(window), Themes::settings(cx), cx));
         div()
             .size_full()
             .relative()
             .flex()
             .flex_col()
-            .bg(white())
-            .text_color(rgb(FG))
+            .bg(theme.surface(Depth::NOW))
+            .text_color(theme.text)
+            .font_family(theme::BODY_FONT)
             .text_size(px(14.))
             .child(body)
+            .children(panel)
             .children(overlay)
     }
 }
@@ -56,19 +59,20 @@ pub(super) fn centered() -> Div {
         .items_center()
 }
 
-fn card() -> Div {
+pub(super) fn card() -> Div {
     div().w(px(420.)).flex().flex_col().gap_3().p_6()
 }
 
-fn title(text: impl Into<SharedString>) -> Div {
+pub(super) fn title(text: impl Into<SharedString>) -> Div {
     div()
         .text_xl()
         .font_weight(FontWeight::SEMIBOLD)
         .child(text.into())
 }
 
+/// Quiet text: whatever color it inherits, at reduced strength.
 pub(super) fn muted(text: impl Into<SharedString>) -> Div {
-    div().text_color(rgb(MUTED)).child(text.into())
+    div().opacity(theme::QUIET).child(text.into())
 }
 
 fn failure_screen(failure: &Failure) -> impl IntoElement {
@@ -84,27 +88,30 @@ fn failure_screen(failure: &Failure) -> impl IntoElement {
     )
 }
 
-fn session_body(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
-    let screen = auth_screen(session, cx);
+fn session_body(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
+    let screen = auth_screen(session, theme, cx);
     div()
         .size_full()
         .relative()
         .child(screen)
-        .children(session.notice.clone().map(toast))
+        .children(session.notice.clone().map(|text| toast(text, theme)))
         .into_any_element()
 }
 
 /// The auth router: one arm per state, each delegating to its own screen
 /// function. New states (credentials onboarding, welcome) add an arm and a
 /// screen function; nothing else changes.
-fn auth_screen(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
+fn auth_screen(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     match &session.auth {
         AuthView::Connecting => connecting_screen(),
-        AuthView::Phone { error } => phone_screen(session, *error, cx),
-        AuthView::Code { phone_hint, error } => code_screen(session, phone_hint, *error, cx),
-        AuthView::Password { hint, error } => password_screen(session, hint.as_deref(), *error, cx),
+        AuthView::Phone { .. } if !session.welcomed => welcome_screen(session, theme, cx),
+        AuthView::Phone { error } => phone_screen(session, *error, theme, cx),
+        AuthView::Code { phone_hint, error } => code_screen(session, phone_hint, *error, theme, cx),
+        AuthView::Password { hint, error } => {
+            password_screen(session, hint.as_deref(), *error, theme, cx)
+        }
         AuthView::FloodWait { until, .. } => flood_wait_screen(*until),
-        AuthView::SignedIn => chat_shell(session, cx),
+        AuthView::SignedIn => chat_shell(session, theme, cx),
     }
 }
 
@@ -115,6 +122,7 @@ fn connecting_screen() -> AnyElement {
 fn phone_screen(
     session: &Session,
     error: Option<UserError>,
+    theme: &Theme,
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
     let form = LoginForm {
@@ -124,13 +132,14 @@ fn phone_screen(
         error,
         submit: Session::submit_phone,
     };
-    form.render(cx)
+    form.render(theme, cx)
 }
 
 fn code_screen(
     session: &Session,
     phone_hint: &str,
     error: Option<UserError>,
+    theme: &Theme,
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
     let form = LoginForm {
@@ -140,13 +149,14 @@ fn code_screen(
         error,
         submit: Session::submit_code,
     };
-    form.render(cx)
+    form.render(theme, cx)
 }
 
 fn password_screen(
     session: &Session,
     hint: Option<&str>,
     error: Option<UserError>,
+    theme: &Theme,
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
     let form = LoginForm {
@@ -156,31 +166,69 @@ fn password_screen(
         error,
         submit: Session::submit_password,
     };
-    form.render(cx)
+    form.render(theme, cx)
 }
 
-pub(super) fn field(input: AnyElement) -> Div {
+/// An input's frame: the same wash as an incoming message.
+pub(super) fn field(input: AnyElement, theme: &Theme) -> Div {
     div()
         .w_full()
         .px_3()
         .py_2()
         .border_1()
-        .border_color(rgb(BORDER))
-        .rounded_md()
-        .bg(white())
+        .border_color(theme::line(theme.text))
+        .rounded(px(theme::RADIUS))
+        .bg(theme.incoming)
+        .text_color(theme.text)
         .child(input)
 }
 
-fn button(id: &'static str, label: &'static str) -> Stateful<Div> {
+/// The strongest fill on screen, the same as the user's own messages.
+pub(super) fn button(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div> {
     div()
         .id(id)
         .px_4()
         .py_2()
-        .rounded_md()
-        .bg(rgb(ACCENT))
-        .text_color(white())
+        .rounded(px(theme::RADIUS))
+        .bg(theme.text)
+        .text_color(theme.on_text)
+        .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .child(label)
+}
+
+/// An inline error. No color marks it (the theme has none to spare): a rule
+/// and a heavier weight do.
+fn error_line(error: UserError, theme: &Theme) -> Div {
+    div()
+        .pl_2()
+        .border_l_2()
+        .border_color(theme.text)
+        .font_weight(FontWeight::MEDIUM)
+        .child(copy::user_error(error))
+}
+
+/// The mark, the wordmark and the tagline, above each sign-in step.
+pub(super) fn brand(theme: &Theme) -> Div {
+    div()
+        .pb_4()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(mark(theme, 34.))
+                .child(
+                    div()
+                        .font_family(theme::NAME_FONT)
+                        .text_3xl()
+                        .child(crate::chat::copy::WORDMARK),
+                ),
+        )
+        .child(muted(copy::TAGLINE))
 }
 
 /// A login step: heading, explanation, one input, inline error, Continue.
@@ -193,27 +241,26 @@ struct LoginForm {
 }
 
 impl LoginForm {
-    fn render(self, cx: &mut Context<'_, Root>) -> AnyElement {
+    fn render(self, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
         let submit = self.submit;
         let on_click = cx.listener(move |root, _: &ClickEvent, window, cx| {
             root.with_session(|s, cx| submit(s, window, cx), cx);
         });
-        let error = self
-            .error
-            .map(|e| div().text_color(rgb(ERROR)).child(copy::user_error(e)));
         centered()
             .child(
                 card()
+                    .child(brand(theme))
                     .child(title(self.heading))
                     .child(muted(self.detail))
-                    .child(field(self.input))
-                    .children(error)
+                    .child(field(self.input, theme))
+                    .children(self.error.map(|e| error_line(e, theme)))
                     .child(
                         div()
                             .flex()
                             .justify_end()
-                            .child(button("continue", copy::CONTINUE).on_click(on_click)),
-                    ),
+                            .child(button("continue", copy::CONTINUE, theme).on_click(on_click)),
+                    )
+                    .child(muted(copy::DESCRIPTOR).text_xs().pt_4()),
             )
             .into_any_element()
     }
@@ -230,7 +277,8 @@ fn flood_wait_screen(until: Instant) -> AnyElement {
         .into_any_element()
 }
 
-fn toast(text: SharedString) -> Div {
+/// A passing notice: outlined, on the base surface, quieter than a message.
+fn toast(text: SharedString, theme: &Theme) -> Div {
     div()
         .absolute()
         .bottom_4()
@@ -242,26 +290,25 @@ fn toast(text: SharedString) -> Div {
             div()
                 .px_4()
                 .py_2()
-                .rounded_md()
-                .bg(rgb(FG))
-                .text_color(white())
+                .rounded_full()
+                .border_1()
+                .border_color(theme::line(theme.text))
+                .bg(theme.surface(Depth::NOW))
+                .text_color(theme.text)
                 .child(text),
         )
 }
 
-fn closing_overlay(closing: Closing) -> Option<AnyElement> {
+fn closing_overlay(closing: Closing, theme: &Theme) -> Option<AnyElement> {
     let content = match closing {
         Closing::Open => return None,
         Closing::Waiting => card().items_center().child(title(copy::CLOSING)),
         Closing::Unconfirmed => card()
             .child(title(copy::UNCONFIRMED_TITLE))
             .child(muted(copy::UNCONFIRMED_DETAIL))
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .child(button("quit", copy::QUIT).on_click(|_: &ClickEvent, _, cx| cx.quit())),
-            ),
+            .child(div().flex().justify_end().child(
+                button("quit", copy::QUIT, theme).on_click(|_: &ClickEvent, _, cx| cx.quit()),
+            )),
     };
     Some(
         div()
@@ -270,7 +317,7 @@ fn closing_overlay(closing: Closing) -> Option<AnyElement> {
             .left_0()
             .size_full()
             .occlude()
-            .bg(rgba(0xffff_ffe6))
+            .bg(theme::faded(theme.surface(Depth::NOW), 0.9))
             .flex()
             .justify_center()
             .items_center()

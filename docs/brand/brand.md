@@ -1,0 +1,128 @@
+# abyss brand
+
+Status: decided in the branding workshop on 2026-11-16. The colour system, the hue and tint picker, type, the mark and rules 1 to 5 are implemented in `crates/app/src/ui/theme.rs`, `ui/mark.rs` and the shell views. The icon is drawn (`assets/icon/`) and attached by the bundle script. A first landing page (`site/index.html`) and store listing copy (`docs/brand/store-listing.md`) exist; neither is published. What remains is under "Open".
+
+**Checking the look.** The views can be rendered to PNG without opening a window:
+
+```sh
+ABYSS_SNAPSHOT_DIR=/path/to/shots cargo test -p abyss --features snapshots shell::tests::snapshots
+```
+
+It writes the Welcome and sign-in screens, an open chat, the appearance panel and the chat list at three depths, in day and night.
+
+## Positioning
+
+- **Audience:** privacy-curious mainstream users.
+- **What it is:** the quiet, hardened window onto every network you message on. Telegram first.
+- **Lead claim:** calm. Safety is the reason the calm can be trusted.
+- **Idea:** the stream is the abyss; the app is the glass you read it through.
+- **Personality:** austere and exact, calm and quiet. Not menacing, not wry.
+- **Name:** `abyss`, lowercase, no article. "The abyss" means the endless stream, never the product.
+- **No Telegram visual DNA:** no paper plane, no sky blue. The brand must stretch to other networks.
+- **Tagline:** Look in. Nothing looks back.
+- **Descriptor:** "abyss, an unofficial Telegram client" as a store title, until a second network ships. In the app: "abyss is an unofficial Telegram client. It uses the Telegram API." Telegram's API terms allow "Telegram" in a title only after "Unofficial", forbid its logo, and require stating prominently that the app uses the Telegram API. The sign-in screens carry the wordmark, the tagline and that sentence.
+
+## Rules that hold in every theme
+
+Users choose the colour, so the brand is the set of rules that survive any hue.
+
+1. **Old things sink.** Tone tracks age in the chat list and in history. Older is darker, in both modes.
+2. **No accent colour.** Emphasis is contrast only. No state may depend on a hue.
+3. **The user's words carry the most contrast on screen.** Everything that arrives is quieter.
+4. **People are set in Charter.** Names and the wordmark use the serif. Messages, times and states use Avenir Next.
+5. **One radius, full-width bands.** Messages and the composer share a 12-point corner. Chat rows touch edge to edge.
+6. **One graphic device: the strata.** The ramp used in order, lightest first. No second colour, no decorative gradient.
+
+## Colour
+
+A theme is two numbers per mode: a hue and a tint amount. Lightness is fixed by the tables below and is not user-editable, which is what keeps text readable and rule 1 working.
+
+**The picker** (Appearance, in the app menu, on Cmd+comma and above the chat list) offers 24 hues, 15 degrees apart, and five tint amounts from 0% (grey) to 200%, separately for night and day. A choice applies as it is made. It is saved as three lines of text in `~/Library/Application Support/dev.abyss/theme`, readable only by the user; a missing or invalid file means the defaults.
+
+Values are `oklch(lightness chroma hue)`. Chroma is multiplied by the tint amount (default 1). Hex values are the defaults converted to sRGB; the darkest steps clip slightly.
+
+**Defaults:** night hue 215, day hue 200.
+
+| Step | Night | Hex | Day | Hex |
+| --- | --- | --- | --- | --- |
+| 1 (now) | 0.300 0.045 | `#0C333C` | 0.970 0.006 | `#F1F6F7` |
+| 2 | 0.275 0.044 | `#062D35` | 0.925 0.012 | `#DEE9E9` |
+| 3 | 0.250 0.042 | `#02272E` | 0.860 0.020 | `#C3D5D6` |
+| 4 | 0.225 0.040 | `#002027` | 0.790 0.028 | `#A7C0C2` |
+| 5 | 0.200 0.037 | `#001A20` | 0.430 0.045 | `#30575A` |
+| 6 | 0.175 0.034 | `#00141A` | 0.355 0.045 | `#1B4345` |
+| 7 (long ago) | 0.150 0.030 | `#000E13` | 0.280 0.040 | `#0B2F31` |
+
+| Role | Night | Hex | Day | Hex |
+| --- | --- | --- | --- | --- |
+| Text and own-message fill | 0.93 0.015 | `#DDEBEE` | 0.24 0.03 | `#0B2425` |
+| Text on own-message fill | 0.18 0.03 | `#01151A` | 0.97 0.006 | `#F1F6F7` |
+| Incoming-message fill | white at 8% | | white at 80% | |
+| Quiet text | text at 74% opacity | | text at 74% opacity | |
+
+In day mode, steps 1 to 4 take dark text and steps 5 to 7 take light text.
+
+**Which step a thing takes** is its age in local calendar days: today is step 1, yesterday 2, within a week 3, within 30 days 4, within 90 days 5, within a year 6, older 7.
+
+**Contrast** (WCAG ratio). Every way text can sit on the theme is checked: on each step, inside an incoming message over each step, and inside the user's own message, at full and at quiet strength. The weakest pair is 5.6 in night mode and 4.8 in day mode, against a minimum of 4.5. The tests in `theme.rs` hold this for all 120 combinations the picker offers, in both modes, so no choice can make text unreadable.
+
+The workshop boards used day steps 4 to 6 at 0.760, 0.520 and 0.400, an incoming fill of 62% and quiet text at 68%. Those failed the minimum for quiet text and were tuned to the values above.
+
+**Hue carries no meaning anywhere.** Avatars are initials on a faint disc of the row's text colour, sender names take the message's text colour, a link is marked by its underline, a mention by its weight, and an error by a rule and a heavier weight.
+
+**Public ramp.** Everything outside the app (icon, website, screenshots, store page) uses hue 215 and these six tones only:
+
+| Name | oklch | Hex |
+| --- | --- | --- |
+| Surface | 0.93 0.015 | `#DDEBEE` |
+| Shallows | 0.74 0.035 | `#93B1B9` |
+| Mid water | 0.56 0.050 | `#517C87` |
+| Deep | 0.40 0.050 | `#244F59` |
+| Trench | 0.27 0.045 | `#032C34` |
+| Floor | 0.17 0.032 | `#001318` |
+
+What is ownable is the low saturation, not the hue. Keep the tint low so 215 never reads as Telegram blue.
+
+Mid water is the one tone that cannot carry body text in ramp colours at 4.5:1. The landing page sets text in black on that band; prefer headings or no text there.
+
+## Type
+
+- **Charter:** names and the wordmark.
+- **Avenir Next:** everything else. It is licensed only as part of macOS, so it cannot ship on another platform or be embedded on a website.
+- **On macOS nothing is bundled.** Both faces come from the system, which keeps font files out of the app's supply chain.
+
+**For other platforms and the web** (research by a delegated model on 2026-11-16; licences and metrics not re-checked by hand, so confirm before shipping any font file):
+
+- **Charter:** Matthew Butterick's free Charter package, under the Bitstream Charter licence. Regular, italic, bold and bold italic only, and no Cyrillic, so names in other scripts fall back to another face.
+- **Sans:** Lato (SIL Open Font License 1.1) is the recommended stand-in: regular, medium and semibold with italics, tabular figures, Latin, Cyrillic, Greek and Vietnamese. It runs about 3% narrower than Avenir Next and is a little warmer, so line heights and truncation need retuning. Source Sans 3 and Montserrat were the alternatives considered.
+- **If fonts are ever bundled:** static cuts only, pinned to an upstream revision with a checksum verified in the build. This is a small but real addition to the attack surface, since the system's font parser then reads files the app supplies.
+- **Fallback order with nothing bundled:** names in Charter, Bitstream Charter, Charis SIL, Georgia, Noto Serif; everything else in Avenir Next, Lato, Segoe UI, Noto Sans.
+
+## Icon
+
+"Well": the tile shape repeated inward, each step darker, drifting slightly downward.
+
+- Built only from the public ramp, so it survives system tinting.
+- The centre stays empty and dark. Never add a highlight; that is the "nothing looks back" part.
+- **The mark** is the shape full bleed: [well.svg](../../assets/icon/well.svg). The app draws it live in the theme's own hue (`crates/app/src/ui/mark.rs`), beside the wordmark.
+- **The app icon** is the shape on Apple's macOS icon grid (824-point body on a 1024-point canvas, continuous corners, soft shadow): `assets/icon/abyss.icns`, generated by `assets/icon/render.swift`.
+- **Building the app bundle:** `scripts/bundle.sh` builds the release binary and writes `target/bundle/abyss.app` (binary, `abyss.icns`, `assets/macos/Info.plist`), then signs it ad hoc and verifies the seal. `ABYSS_BUNDLE_PRECOMPILED_SHADERS=1` builds with `--no-default-features`, as CI does. `scripts/icon.sh` regenerates `abyss.icns` from `render.swift`.
+- **Small sizes** (32 pixels and under) draw four levels instead of six. Checked by eye at 16 points on light and dark grounds: it reads as nested squares; six levels blurred together.
+
+## Voice
+
+- Say what happened and what abyss did. Plain words, sentence case.
+- No exclamation marks. No adjectives such as "secure" or "military-grade". Numbers over adjectives.
+- The app's text is always shorter and quieter than the user's.
+- State uncertainty as a fact ("Not sure it was sent").
+- Water vocabulary is for marketing only. Interface labels stay plain ("Chats", not "Depths").
+- The link claim is "never opens links from messages". Onboarding opens one fixed URL, so the unqualified claim is false.
+
+## Open
+
+- **Layered icon, not yet used:** `assets/icon/abyss.icon` is an Icon Composer document that Xcode 27.2's `actool` compiles without errors, rendered and checked in the default and dark appearances only. Open it in Icon Composer to check clear and tinted before the bundle switches to it; the system adds a faint rim sheen in the default appearance that the file cannot turn off. The bundle still uses `abyss.icns`.
+- **Signing:** the bundle is signed ad hoc. Developer ID signing, notarization and the App Sandbox are Stage 3. `cargo dev` still runs the bare binary with the generic Dock icon.
+- **A project `api_id`:** packaged releases are to embed one (plan section 17.1, amended), and none is registered yet.
+- **The rest of onboarding:** the Welcome screen is built (`crates/app/src/shell/welcome.rs`, copy in `crates/app/src/onboarding/copy.rs`). The credentials steps of plan section 17.3 belong to task 6b.
+- **Type off macOS:** the stand-ins above are a recommendation, not adopted. No font is bundled anywhere, so the landing page shows system faces on non-Apple devices.
+- **Publishing:** `site/index.html` and the store listing are drafts. One claim on them runs ahead of the app: the encrypted message cache exists and is tested in core, but the app does not turn it on yet.

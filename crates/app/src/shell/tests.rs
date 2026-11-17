@@ -127,6 +127,40 @@ fn drain_takes_at_most_drain_max_per_wake() {
     assert_eq!(drain(events.as_mut(), first).len(), 10);
 }
 
+/// The panel works in any state, here on the error screen. No store is set
+/// up in tests, so the choice stays in memory.
+#[gpui::test]
+fn appearance_choice_rethemes_the_window_and_reset_restores_it(cx: &mut TestAppContext) {
+    use crate::ui::theme::{Choice, Hue, Mode, Settings, Themes, Tint};
+
+    let missing = LaunchError::MissingCredentials(vec![API_ID_VAR]);
+    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(missing), window, cx));
+    cx.run_until_parked();
+    let showing = cx.update(|window, _| Mode::of(window));
+    let before = cx.update(|window, cx| Themes::of(window, cx));
+    assert_eq!(cx.update(|_, cx| Themes::settings(cx)), Settings::default());
+
+    root.update(cx, Root::toggle_appearance);
+    cx.run_until_parked();
+    root.read_with(cx, |root, _| assert!(root.appearance_open));
+
+    let choice = Choice {
+        hue: Hue::all().next().unwrap(),
+        tint: Tint::all().last().unwrap(),
+    };
+    cx.update(|_, cx| Themes::set(Settings::default().with(showing, choice), cx));
+    cx.run_until_parked();
+    assert_ne!(cx.update(|window, cx| Themes::of(window, cx)), before);
+    assert_eq!(cx.update(|_, cx| Themes::settings(cx)).get(showing), choice);
+
+    cx.update(|_, cx| Themes::set(Settings::default(), cx));
+    cx.run_until_parked();
+    assert_eq!(cx.update(|window, cx| Themes::of(window, cx)), before);
+
+    root.update(cx, Root::toggle_appearance);
+    root.read_with(cx, |root, _| assert!(!root.appearance_open));
+}
+
 #[cfg(feature = "fake")]
 mod fake {
     use abyss_core::api::{AuthState, PasswordBuf, UserError};
@@ -138,8 +172,20 @@ mod fake {
     use crate::shell::session::Started;
     use crate::ui::text_input;
 
+    /// A window past the Welcome screen, which has its own test.
     fn open(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {
-        cx.update(|cx| cx.bind_keys(text_input::key_bindings()));
+        let (root, cx, harness) = open_at_welcome(cx);
+        root.update(cx, |root, cx| {
+            root.with_session(|s, _| s.welcomed = true, cx);
+        });
+        (root, cx, harness)
+    }
+
+    fn open_at_welcome(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {
+        cx.update(|cx| {
+            cx.bind_keys(text_input::key_bindings());
+            cx.bind_keys(crate::shell::key_bindings());
+        });
         let (commands, events, harness) = link();
         let started = Started {
             commands,
@@ -150,6 +196,28 @@ mod fake {
             cx.add_window_view(|window, cx| Root::with_started(Ok(started), window, cx));
         cx.run_until_parked();
         (root, cx, harness)
+    }
+
+    /// A signed-out run shows the Welcome screen first. Typing does nothing
+    /// there; Enter leaves it, and the phone field then has focus.
+    #[gpui::test]
+    fn welcome_comes_before_the_phone_step(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open_at_welcome(cx);
+        core_says(&harness, cx, AuthState::Phone { error: None });
+        assert!(!read(&root, cx, |s| s.welcomed));
+        cx.simulate_input("+15550100");
+        cx.simulate_keystrokes("enter");
+        assert!(read(&root, cx, |s| s.welcomed), "Enter leaves Welcome");
+        assert!(
+            last_command(&harness).is_none(),
+            "nothing typed on Welcome reaches core"
+        );
+        cx.simulate_input("+15550100");
+        cx.simulate_keystrokes("enter");
+        assert!(matches!(
+            last_command(&harness),
+            Some(Command::SubmitPhone(p)) if p == "+15550100"
+        ));
     }
 
     fn read<R>(
@@ -428,3 +496,6 @@ mod fake {
         assert_eq!(closing(&root, cx), Some(Closing::Waiting));
     }
 }
+
+#[cfg(feature = "snapshots")]
+mod snapshots;

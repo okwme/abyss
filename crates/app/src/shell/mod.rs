@@ -1,6 +1,7 @@
 //! The main window: startup failures, the auth router, the chat shell, and
 //! the shutdown protocol (plan sections 1, 4, 5, 12).
 
+mod appearance;
 mod auth;
 mod bridge;
 mod chat_view;
@@ -8,6 +9,7 @@ mod chats;
 mod session;
 mod shutdown;
 mod view;
+mod welcome;
 
 use abyss_core::StartError;
 use abyss_core::api::Event;
@@ -25,7 +27,11 @@ actions!(
     abyss,
     [
         /// Our own quit (Cmd+Q), so shutdown can wait for core (plan section 5).
-        Quit
+        Quit,
+        /// Shows or hides the appearance panel (Cmd+comma).
+        Appearance,
+        /// Leaves the Welcome screen for the first sign-in step (Enter).
+        Connect
     ]
 );
 
@@ -34,12 +40,18 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", Quit, None),
+        KeyBinding::new("cmd-,", Appearance, None),
+        KeyBinding::new("enter", Connect, Some(welcome::KEY_CONTEXT)),
     ]
 }
 
 /// The app menu, so the menu bar's Quit goes through [`Quit`] too.
 pub(crate) fn menus() -> Vec<Menu> {
-    vec![Menu::new("abyss").items([MenuItem::action("Quit abyss", Quit)])]
+    vec![Menu::new("abyss").items([
+        MenuItem::action(crate::ui::copy::APPEARANCE_MENU, Appearance),
+        MenuItem::separator(),
+        MenuItem::action("Quit abyss", Quit),
+    ])]
 }
 
 /// Why abyss can't run; shown as a full-window explanation.
@@ -56,7 +68,11 @@ enum State {
 
 pub(crate) struct Root {
     state: State,
+    /// Whether the appearance panel is showing.
+    appearance_open: bool,
     _on_app_quit: Subscription,
+    /// Redraws when the system switches between light and dark.
+    _on_appearance: Subscription,
 }
 
 impl Root {
@@ -94,10 +110,19 @@ impl Root {
             }
             async {}
         });
+        let on_appearance = cx.observe_window_appearance(window, |_, _, cx| cx.notify());
         Self {
             state,
+            appearance_open: false,
             _on_app_quit: on_app_quit,
+            _on_appearance: on_appearance,
         }
+    }
+
+    /// Shows or hides the appearance panel.
+    pub(crate) fn toggle_appearance(&mut self, cx: &mut Context<'_, Self>) {
+        self.appearance_open = !self.appearance_open;
+        cx.notify();
     }
 
     /// Runs `f` on the session if core is running.
@@ -160,9 +185,15 @@ pub(crate) fn open(launch: Result<Launch, LaunchError>, cx: &mut App) -> gpui::R
         }),
         ..Default::default()
     };
+    crate::ui::theme::Themes::init(cx);
     let handle = cx.open_window(options, |window, cx| {
         cx.new(|cx| Root::new(launch, window, cx))
     })?;
+    cx.on_action(move |_: &Appearance, cx: &mut App| {
+        handle
+            .update(cx, |root, _, cx| root.toggle_appearance(cx))
+            .ok();
+    });
     cx.on_action(move |_: &Quit, cx: &mut App| {
         let quit_now = handle.update(cx, Root::request_close).unwrap_or(true);
         if quit_now {

@@ -9,6 +9,26 @@ use gpui::SharedString;
 
 use crate::launch::{API_HASH_VAR, API_ID_VAR, LaunchError};
 
+/// The tagline, shown with the wordmark on the sign-in screens.
+pub(crate) const TAGLINE: &str = "Look in. Nothing looks back.";
+/// What abyss is, in the form Telegram's API terms require: "Telegram" in a
+/// description only after "unofficial", and a plain statement that the app
+/// uses the Telegram API, shown where the user first meets it.
+pub(crate) const DESCRIPTOR: &str =
+    "abyss is an unofficial Telegram client. It uses the Telegram API.";
+
+pub(crate) const APPEARANCE: &str = "Appearance";
+pub(crate) const APPEARANCE_MENU: &str = "Appearance…";
+pub(crate) const APPEARANCE_NOTE: &str =
+    "Pick a hue and how much of it. Lightness is fixed, so text stays readable in any hue.";
+pub(crate) const NIGHT: &str = "Night";
+pub(crate) const DAY: &str = "Day";
+pub(crate) const IN_USE: &str = "in use now";
+pub(crate) const HUE: &str = "Hue";
+pub(crate) const TINT: &str = "Tint";
+pub(crate) const RESET: &str = "Reset";
+pub(crate) const DONE: &str = "Done";
+
 pub(crate) const CONNECTING: &str = "Connecting…";
 pub(crate) const CONTINUE: &str = "Continue";
 

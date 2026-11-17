@@ -5,7 +5,8 @@ use abyss_core::api::{ConnState, SendState};
 use abyss_core::model::{ChatKind, MediaKind};
 use gpui::SharedString;
 
-pub(crate) const CHATS: &str = "Chats";
+/// The wordmark above the chat list: lowercase, no article.
+pub(crate) const WORDMARK: &str = "abyss";
 pub(crate) const SELECT_CHAT: &str = "Select a chat";
 pub(crate) const NO_CHATS: &str = "No chats yet";
 pub(crate) const LOADING_HISTORY: &str = "Loading…";
@@ -18,7 +19,7 @@ pub(crate) const READ_ONLY: &str = "Only admins can post in this group.";
 pub(crate) const JUMP_TO_LATEST: &str = "Jump to latest";
 pub(crate) const RETRY: &str = "Retry";
 pub(crate) const DISCARD: &str = "Discard";
-pub(crate) const LINK_COPIED: &str = "Link copied. abyss never opens links.";
+pub(crate) const LINK_COPIED: &str = "Link copied. abyss never opens links from messages.";
 pub(crate) const FORUM_TOPICS: &str = "Topics arrive in a later version.";
 
 pub(crate) fn conn_label(conn: Option<ConnState>) -> SharedString {

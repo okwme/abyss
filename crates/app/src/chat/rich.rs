@@ -142,6 +142,9 @@ fn text_run(len: usize, style: Style, look: Look, fonts: &Fonts, palette: &Palet
     };
     if style.contains(Style::BOLD) {
         font.weight = FontWeight::BOLD;
+    } else if look == Look::Text && style.contains(Style::MENTION) {
+        // The theme has no accent color, so weight marks a mention.
+        font.weight = FontWeight::SEMIBOLD;
     }
     if style.contains(Style::ITALIC) {
         font.style = FontStyle::Italic;
