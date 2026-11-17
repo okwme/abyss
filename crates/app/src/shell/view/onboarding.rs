@@ -7,7 +7,7 @@ use abyss_core::api::{CredentialError, UserError};
 use gpui::{AnyElement, Context, Div, SharedString, Stateful, div, prelude::*, px};
 
 use super::{
-    LoginForm, back_button, brand, button, card, centered, error_line, field, footer, muted, on,
+    LoginForm, back_button, brand, button, card, error_line, field, footer, muted, on, page,
     secondary, title,
 };
 use crate::shell::Root;
@@ -31,10 +31,6 @@ pub(super) fn screen(
         Onboarding::Env { error } => env(*error),
         Onboarding::Keychain => keychain(theme, cx),
     }
-}
-
-fn page(content: Div) -> AnyElement {
-    centered().child(content).into_any_element()
 }
 
 fn welcome(theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {

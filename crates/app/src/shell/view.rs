@@ -52,6 +52,28 @@ impl Render for Root {
     }
 }
 
+/// A card screen: scrolls when its content is taller than the window, and
+/// is centered when it fits (task 12: the guide was cut off, buttons
+/// unreachable, on a short window).
+pub(super) fn page(content: impl IntoElement) -> AnyElement {
+    div()
+        .id("page")
+        .size_full()
+        .overflow_y_scroll()
+        .child(
+            div()
+                .w_full()
+                .min_h_full()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .items_center()
+                .py_4()
+                .child(content),
+        )
+        .into_any_element()
+}
+
 pub(super) fn centered() -> Div {
     div()
         .size_full()
@@ -82,7 +104,7 @@ fn failure_screen(failure: &Failure) -> impl IntoElement {
         Failure::Launch(error) => copy::launch_error(error),
         Failure::Start(error) => copy::start_error(error),
     };
-    centered().child(
+    page(
         card()
             .w(px(560.))
             .child(title(heading))
@@ -248,15 +270,14 @@ fn logout_incomplete_screen(
         Session::retry_logout,
         cx,
     );
-    centered()
-        .child(
-            card()
-                .child(title(copy::LOGOUT_INCOMPLETE_TITLE))
-                .child(error_line(copy::LOGOUT_INCOMPLETE_DETAIL, theme))
-                .children(remote)
-                .child(footer(None, vec![retry])),
-        )
-        .into_any_element()
+    page(
+        card()
+            .child(title(copy::LOGOUT_INCOMPLETE_TITLE))
+            .child(error_line(copy::LOGOUT_INCOMPLETE_DETAIL, theme))
+            .children(remote)
+            .child(footer(None, vec![retry])),
+    )
+    .into_any_element()
 }
 
 /// "Couldn't start logout": nothing changed. Retry writes the marker again;
@@ -284,14 +305,13 @@ fn logout_not_started_screen(
         Session::retry_logout,
         cx,
     );
-    centered()
-        .child(
-            card()
-                .child(title(copy::LOGOUT_NOT_STARTED_TITLE))
-                .child(error_line(detail, theme))
-                .child(footer(stay, vec![retry])),
-        )
-        .into_any_element()
+    page(
+        card()
+            .child(title(copy::LOGOUT_NOT_STARTED_TITLE))
+            .child(error_line(detail, theme))
+            .child(footer(stay, vec![retry])),
+    )
+    .into_any_element()
 }
 
 /// "Couldn't read Keychain" at startup: Retry reads the marker again.
@@ -301,14 +321,13 @@ fn startup_blocked_screen(theme: &Theme, cx: &mut Context<'_, Root>) -> AnyEleme
         Session::retry_startup,
         cx,
     );
-    centered()
-        .child(
-            card()
-                .child(title(copy::STARTUP_BLOCKED_TITLE))
-                .child(error_line(copy::STARTUP_BLOCKED_DETAIL, theme))
-                .child(footer(None, vec![retry])),
-        )
-        .into_any_element()
+    page(
+        card()
+            .child(title(copy::STARTUP_BLOCKED_TITLE))
+            .child(error_line(copy::STARTUP_BLOCKED_DETAIL, theme))
+            .child(footer(None, vec![retry])),
+    )
+    .into_any_element()
 }
 
 /// The auth router: one arm per state, each delegating to its own screen
@@ -525,19 +544,18 @@ impl LoginForm {
     fn render(self, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
         let error = self.error.map(|e| error_line(copy::user_error(e), theme));
         let submit = on(button("continue", copy::CONTINUE, theme), self.submit, cx);
-        centered()
-            .child(
-                card()
-                    .child(brand(theme))
-                    .child(title(self.heading))
-                    .child(muted(self.detail))
-                    .child(field(self.input, theme))
-                    .children(self.extra)
-                    .children(error)
-                    .child(footer(self.back, vec![submit]))
-                    .child(muted(copy::DESCRIPTOR).text_xs().pt_4()),
-            )
-            .into_any_element()
+        page(
+            card()
+                .child(brand(theme))
+                .child(title(self.heading))
+                .child(muted(self.detail))
+                .child(field(self.input, theme))
+                .children(self.extra)
+                .children(error)
+                .child(footer(self.back, vec![submit]))
+                .child(muted(copy::DESCRIPTOR).text_xs().pt_4()),
+        )
+        .into_any_element()
     }
 }
 
@@ -548,14 +566,13 @@ fn flood_wait_screen(
     cx: &mut Context<'_, Root>,
 ) -> AnyElement {
     let left = until.saturating_duration_since(Instant::now()).as_secs() + 1;
-    centered()
-        .child(
-            card()
-                .child(title(copy::FLOOD_TITLE))
-                .child(muted(copy::flood_detail(left)))
-                .child(footer(back_button(session, theme, cx), Vec::new())),
-        )
-        .into_any_element()
+    page(
+        card()
+            .child(title(copy::FLOOD_TITLE))
+            .child(muted(copy::flood_detail(left)))
+            .child(footer(back_button(session, theme, cx), Vec::new())),
+    )
+    .into_any_element()
 }
 
 /// A passing notice: outlined, on the base surface, quieter than a message.
