@@ -57,7 +57,7 @@ pub(crate) const BOX_NOT_EMPTY: &str =
     "Clear the message box first: the text goes back into an empty box.";
 /// Shown once text is back in the message box.
 pub(crate) const PUT_BACK_DONE: &str = "Not sent and not kept. Your text is back in the box.";
-pub(crate) const LINK_COPIED: &str = "Link copied. abyss never opens links.";
+pub(crate) const LINK_COPIED: &str = "Link copied. abyss never opens links from messages.";
 pub(crate) const FORUM_TOPICS: &str = "Topics arrive in a later version.";
 
 pub(crate) fn conn_label(conn: Option<ConnState>) -> SharedString {

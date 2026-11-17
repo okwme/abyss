@@ -397,7 +397,7 @@ pub enum MediaKind { Photo, Video, Voice, Audio, Document { name: String, size: 
 - **Rows:**
   - The sender name appears only in groups, colored by hashed id.
   - The body is rendered from `Segment`s mapped 1:1 to `TextRun`s (`StyledText::with_runs`, `text.rs:502`) and wrapped in `InteractiveText` (`text.rs:1013-1060`). Code and pre text use a monospace font. Spoilers render dimmed and reveal on click.
-  - **Links:** the tooltip shows the **real** target URL. Clicking opens `window.prompt` (`Z/src/window.rs:7149`) with the full URL and Open / Copy / Cancel. Open calls `cx.open_url` (`Z/src/app.rs:2050`) only for `http`/`https`. Every other scheme is copy-only.
+  - **Links:** copy-only, for every scheme (decision 2026-11-16; supersedes the earlier Open / Copy / Cancel prompt). A link renders as text, with a hidden target shown inline after the text it hides behind. Clicking copies the exact target to the clipboard and shows "Link copied". `cx.open_url` is never reachable from message content.
   - Each row also shows local time (`jiff`, which grammers already uses), day separators and an "edited" mark. Outgoing messages are right-aligned. A reply shows one line quoting the target if it's cached.
 - **Media:** an inert chip showing kind, sanitized name and size, plus the caption. No download API exists in `Backend`, and `FakeBackend` asserts that none is reached.
 - **Live updates** (`G/grammers-client/src/update/update.rs:23-48`):
@@ -1692,7 +1692,7 @@ Every screen has Back except Welcome. Copy lives in one module (`crates/app/src/
 
    One button: **Connect to Telegram**.
 2. **Get API credentials.** Numbered steps, with **Open my.telegram.org** opening the system browser.
-   - The URL is the hardcoded constant `https://my.telegram.org/apps`, opened via `cx.open_url`. This is the only URL onboarding opens directly. Message links keep the separate confirm-before-open policy in section 8.
+   - The URL is the hardcoded constant `https://my.telegram.org/apps`, opened via `cx.open_url`. This is the only URL abyss ever opens. Message links are copy-only (section 8).
    - The steps:
      0. Prerequisite: you need an existing Telegram account signed in on an official app (phone or desktop), and you must keep that session available. Login codes for my.telegram.org and for abyss arrive there.
      1. Log in with your phone number. The login code arrives *in your Telegram app*, not by SMS.
