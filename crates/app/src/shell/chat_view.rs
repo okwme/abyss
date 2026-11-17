@@ -72,10 +72,8 @@ fn sidebar(session: &Session, cx: &mut Context<'_, Root>) -> Div {
             .flex_1()
             .into_any_element()
     };
-    let retry = session
-        .shell
-        .list
-        .gave_up()
+    // After a core stop nothing can load: no Retry (round 37).
+    let retry = (session.shell.list.gave_up() && !session.shell.is_stopped())
         .then(|| retry_button("retry-chats", copy::RETRY_CHATS, cx).bottom_3());
     div()
         .w(px(SIDEBAR_WIDTH))
@@ -248,7 +246,10 @@ fn chat_pane(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
             .into_any_element(),
         Some(text) => centered().child(muted(text)).into_any_element(),
     };
-    let detached = window.is_some_and(MessageWindow::has_newer);
+    // After a core stop nothing can load: no Jump or Retry (round 37).
+    let live = !session.shell.is_stopped();
+    let detached = live && window.is_some_and(MessageWindow::has_newer);
+    let gave_up = live && session.shell.history_gave_up();
     // Once this pane is painted, check what the list shows (mark read,
     // load more, live tail): the layout is then the one on screen.
     let this = cx.weak_entity();
@@ -273,10 +274,7 @@ fn chat_pane(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
                 .child(body)
                 .children(detached.then(|| jump_button(cx)))
                 .children(
-                    session
-                        .shell
-                        .history_gave_up()
-                        .then(|| retry_button("retry-history", copy::RETRY_HISTORY, cx).top_3()),
+                    gave_up.then(|| retry_button("retry-history", copy::RETRY_HISTORY, cx).top_3()),
                 )
                 .child(after_paint),
         )
