@@ -93,6 +93,10 @@ pub struct ChatSummary {
     pub last: Option<Preview>,
     /// Unix seconds.
     pub last_date: i64,
+    /// Id of the chat's newest message, when known (the dialog's top message,
+    /// then every newer message that bumped it). Orders bumps and replays
+    /// without relying on timestamps, which collide within a second.
+    pub last_id: Option<MsgId>,
     pub can_send: bool,
 }
 

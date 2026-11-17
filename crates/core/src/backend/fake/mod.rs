@@ -7,7 +7,7 @@
 //! fixed latency, live updates pushed by the test, and counters.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,11 +15,12 @@ use grammers_session::Session as _;
 use tokio::sync::{Notify, mpsc};
 
 use super::{
-    Account, AuthError, Backend, BackendError, CheckPassword, Client, DialogsCursor, DialogsPage,
-    HistoryPage, HistoryQuery, Instance, InstanceControl, PasswordChallenge, Seed, SessionSeed,
-    SessionSnapshot, SignIn, StreamError, StreamItem, Update, UpdateStream,
+    Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest, DialogsCursor,
+    DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl, PasswordChallenge, Seed,
+    SentCode, SessionSeed, SessionSnapshot, SignIn, StreamError, StreamItem, Update, UpdateStream,
 };
-use crate::api::PasswordBuf;
+use crate::api::{ApiCredentials, CodeDelivery, NextDelivery, PasswordBuf};
+use crate::credentials::{CredentialSlot, EnvResolution};
 use crate::model::{Body, ChatId, ChatKind, ChatSummary, Message, MsgId, PeerKind, ThreadKey};
 use crate::rich_text::RichText;
 use crate::session::AbyssSession;
@@ -43,6 +44,8 @@ pub enum Op {
     Read,
     IsAuthorized,
     RequestCode,
+    /// `auth.resendCode` (task 6b).
+    ResendCode,
     SignIn,
     CheckPassword,
     PasswordChallenge,
@@ -58,12 +61,19 @@ pub enum Fault {
     /// Never completes (a stalled transport).
     Hang,
     /// The server applies the call, but the answer never arrives (an
-    /// ambiguous completion). Data calls just hang.
+    /// ambiguous completion). Sends are accepted (a message exists on the
+    /// server) and then hang; other data calls just hang.
     CompleteThenHang,
     /// Panics inside the call (a bug in the Telegram library).
     Panic,
     /// Succeeds after the given extra delay.
     Delay(Duration),
+    /// Login calls (`sign_in`, `check_password`): the request sits in the
+    /// sender's queue and the server applies it after the delay, whether or
+    /// not the caller still waits (grammers keeps a request queued after its
+    /// future is dropped). Retiring the instance first drops it, as quitting
+    /// the runner drops the queue. Data calls treat it as `Delay`.
+    Queued(Duration),
 }
 
 /// A fault applied to the next build.
@@ -86,14 +96,42 @@ pub enum QuitBehavior {
 }
 
 /// Initial data for a fake account.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FakeScript {
     pub dialogs: Vec<ChatSummary>,
     /// Per chat, ascending by id.
     pub history: HashMap<ChatId, Vec<Message>>,
     pub latency: Duration,
     pub login: FakeLogin,
+    /// What the environment says about credentials. The default is a valid
+    /// env pair ([`fake_credentials`]), so the fake starts at the phone
+    /// screen; `Absent` starts onboarding (`--fake --onboarding`).
+    pub env: EnvResolution,
 }
+
+impl Default for FakeScript {
+    fn default() -> Self {
+        Self {
+            dialogs: Vec::new(),
+            history: HashMap::new(),
+            latency: Duration::ZERO,
+            login: FakeLogin::default(),
+            env: EnvResolution::Pair(fake_credentials()),
+        }
+    }
+}
+
+/// A valid-looking pair the fake server accepts.
+pub fn fake_credentials() -> ApiCredentials {
+    ApiCredentials::fake(FAKE_API_ID)
+}
+
+/// The `api_id` of [`fake_credentials`].
+pub const FAKE_API_ID: i32 = 1_000_000;
+/// An `api_id` the fake server answers with `API_ID_INVALID`.
+pub const FAKE_INVALID_API_ID: i32 = 1;
+/// An `api_id` the fake server answers with `API_ID_PUBLISHED_FLOOD`.
+pub const FAKE_PUBLISHED_API_ID: i32 = 2;
 
 /// How the fake server answers a login.
 #[derive(Clone, Debug)]
@@ -106,6 +144,11 @@ pub struct FakeLogin {
     /// The number has no account: `sign_in` answers `SignUpRequired`.
     pub sign_up_required: bool,
     pub display_name: String,
+    /// The self user a login caches (the account the session belongs to).
+    pub self_id: i64,
+    /// Where a first code request says the code went. `None` scripts an
+    /// unsupported flow (email setup): `OfficialAppRequired`.
+    pub sent: Option<SentCode>,
 }
 
 impl Default for FakeLogin {
@@ -116,6 +159,13 @@ impl Default for FakeLogin {
             hint: None,
             sign_up_required: false,
             display_name: "Fake User".into(),
+            self_id: auth::FAKE_SELF_ID,
+            sent: Some(SentCode {
+                delivery: CodeDelivery::App,
+                length: Some(5),
+                next: Some(NextDelivery::Sms),
+                timeout: Some(Duration::from_secs(60)),
+            }),
         }
     }
 }
@@ -175,6 +225,7 @@ pub fn summary(id: ChatId, title: &str) -> ChatSummary {
         unread_mentions: 0,
         last: None,
         last_date: 0,
+        last_id: None,
         can_send: true,
     }
 }
@@ -216,10 +267,17 @@ struct State {
     dialogs: Vec<ChatSummary>,
     history: HashMap<ChatId, Vec<Message>>,
     faults: HashMap<Op, VecDeque<Fault>>,
+    /// Extra waits before the next calls' faults or answers (`lead`).
+    leads: HashMap<Op, VecDeque<Duration>>,
     build_faults: VecDeque<BuildFault>,
     calls: HashMap<Op, usize>,
     sent: Vec<(ChatId, i64)>,
+    /// Server-side dedup: every `random_id` the server accepted, with the
+    /// message it created. Telegram deduplicates by `random_id` per sender.
+    accepted: HashMap<i64, (ChatId, MsgId)>,
     attempted: Vec<(ChatId, i64)>,
+    /// The last `Client::retain_peers` set.
+    retained: Option<Vec<ChatId>>,
     read: Vec<(ChatId, MsgId)>,
     seeds: Vec<Seed>,
     /// The most recently retired instance's session, for late-write tests.
@@ -253,11 +311,18 @@ pub struct FakeHandle {
 pub struct FakeBackend {
     shared: Arc<Shared>,
     stream: Arc<tokio::sync::Mutex<mpsc::Receiver<StreamCmd>>>,
+    /// The pair in use; a build waits for one (plan section 17.2a).
+    slot: CredentialSlot,
 }
 
 impl FakeBackend {
     pub fn new(script: FakeScript) -> (FakeBackend, FakeHandle) {
         let (tx, rx) = mpsc::channel(UPDATE_CAPACITY);
+        let slot = CredentialSlot::new(script.env.clone());
+        // Direct builds (the contract suite) need no actor to resolve an env pair.
+        if let EnvResolution::Pair(creds) = script.env {
+            slot.set(Some(creds));
+        }
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 dialogs: script.dialogs,
@@ -279,6 +344,7 @@ impl FakeBackend {
         let backend = FakeBackend {
             shared,
             stream: Arc::new(tokio::sync::Mutex::new(rx)),
+            slot,
         };
         (backend, handle)
     }
@@ -341,6 +407,18 @@ impl FakeHandle {
             let q = s.faults.entry(op).or_default();
             if q.len() < MAX_FAULTS {
                 q.push_back(fault);
+            }
+        });
+    }
+
+    /// Queues a one-shot wait for the next data call of `op`, before its
+    /// fault (if any) applies: with `inject`, a failure or panic that comes
+    /// late.
+    pub fn lead(&self, op: Op, wait: Duration) {
+        self.shared.with(|s| {
+            let q = s.leads.entry(op).or_default();
+            if q.len() < MAX_FAULTS {
+                q.push_back(wait);
             }
         });
     }
@@ -447,6 +525,23 @@ impl FakeHandle {
         self.shared.with(|s| s.attempted.clone())
     }
 
+    /// The server message created for `random_id`, if the server accepted it
+    /// (including sends whose answer was lost).
+    pub fn accepted(&self, random_id: i64) -> Option<(ChatId, MsgId)> {
+        self.shared.with(|s| s.accepted.get(&random_id).copied())
+    }
+
+    /// Server messages in `chat` (own sends included).
+    pub fn server_history(&self, chat: ChatId) -> Vec<Message> {
+        self.shared
+            .with(|s| s.history.get(&chat).cloned().unwrap_or_default())
+    }
+
+    /// The last peer set core asked an instance to retain.
+    pub fn retained_peers(&self) -> Option<Vec<ChatId>> {
+        self.shared.with(|s| s.retained.clone())
+    }
+
     pub fn read_calls(&self) -> Vec<(ChatId, MsgId)> {
         self.shared.with(|s| s.read.clone())
     }
@@ -460,6 +555,11 @@ impl FakeHandle {
         };
         let next = next_home_dc(&session);
         session.set_home_dc_id(next).await.is_ok()
+    }
+
+    /// Edits the server's dialog list (server order).
+    pub fn edit_dialogs(&self, f: impl FnOnce(&mut Vec<ChatSummary>)) {
+        self.shared.with(|s| f(&mut s.dialogs));
     }
 
     /// Replaces a chat's server-side history (e.g. simulate deletions).
@@ -479,7 +579,12 @@ impl Backend for FakeBackend {
         self.shared.with(|s| s.account = Some(account));
     }
 
+    fn credentials(&self) -> &CredentialSlot {
+        &self.slot
+    }
+
     async fn build(&self, seed: Seed) -> Result<Instance<Self>, BackendError> {
+        let creds = self.slot.wait().await;
         // Like the real backend: a fresh session object over the account's
         // critical cell (or the retired instance's), taking its write token.
         let account = self.shared.with(|s| s.account.clone());
@@ -511,7 +616,7 @@ impl Backend for FakeBackend {
             stream: Arc::clone(&self.stream),
             baseline,
         };
-        Ok(self.instance(session, updates, runner_rx))
+        Ok(self.instance(session, updates, runner_rx, creds))
     }
 }
 
@@ -526,12 +631,16 @@ impl FakeBackend {
         session: Arc<AbyssSession>,
         updates: FakeUpdates,
         runner_rx: mpsc::Receiver<RunnerCmd>,
+        creds: Arc<ApiCredentials>,
     ) -> Instance<Self> {
         let quit = Arc::new(Notify::new());
+        let retired = Arc::new(AtomicBool::new(false));
         Instance {
             client: FakeClient {
                 shared: Arc::clone(&self.shared),
                 session: Arc::clone(&session),
+                creds,
+                retired: Arc::clone(&retired),
             },
             updates,
             runner: Box::pin(run_runner(
@@ -543,6 +652,7 @@ impl FakeBackend {
                 shared: Arc::clone(&self.shared),
                 quit,
                 session,
+                retired,
             },
         }
     }
@@ -573,6 +683,8 @@ pub struct FakeControl {
     shared: Arc<Shared>,
     quit: Arc<Notify>,
     session: Arc<AbyssSession>,
+    /// Shared with the instance's client: its queued requests are dropped.
+    retired: Arc<AtomicBool>,
 }
 
 impl InstanceControl for FakeControl {
@@ -581,6 +693,7 @@ impl InstanceControl for FakeControl {
     }
 
     fn retire(self) -> SessionSnapshot {
+        self.retired.store(true, Ordering::SeqCst);
         self.shared.retired.fetch_add(1, Ordering::SeqCst);
         // Revoke first: a late write through this instance must not reach the
         // snapshot the next instance is built from.
@@ -623,6 +736,10 @@ pub struct FakeClient {
     shared: Arc<Shared>,
     /// This instance's session.
     session: Arc<AbyssSession>,
+    /// The pair this instance was built with.
+    creds: Arc<ApiCredentials>,
+    /// Set when the instance is retired: queued requests are dropped.
+    retired: Arc<AtomicBool>,
 }
 
 impl FakeClient {
@@ -638,13 +755,24 @@ impl FakeClient {
     /// session gets `Unauthorized`.
     async fn enter(&self, op: Op) -> Result<InFlight<'_>, BackendError> {
         let fault = self.take_fault(op);
+        let lead = self
+            .shared
+            .with(|s| s.leads.get_mut(&op).and_then(VecDeque::pop_front));
+        if let Some(wait) = lead {
+            tokio::time::sleep(wait).await;
+        }
+        self.enter_with(fault).await
+    }
+
+    /// [`Self::enter`] with the fault already taken.
+    async fn enter_with(&self, fault: Option<Fault>) -> Result<InFlight<'_>, BackendError> {
         let guard = InFlight::new(&self.shared);
         if !self.shared.latency.is_zero() {
             tokio::time::sleep(self.shared.latency).await;
         }
         match fault {
             None => {}
-            Some(Fault::Delay(d)) => tokio::time::sleep(d).await,
+            Some(Fault::Delay(d) | Fault::Queued(d)) => tokio::time::sleep(d).await,
             Some(Fault::Error(e)) => return Err(e),
             Some(Fault::Auth(_)) => return Err(BackendError::Rejected),
             Some(Fault::Hang | Fault::CompleteThenHang) => std::future::pending().await,
@@ -689,8 +817,18 @@ impl Client for FakeClient {
         self.auth_is_authorized().await
     }
 
-    async fn request_login_code(&self, phone: &str) -> Result<Self::LoginToken, AuthError> {
+    async fn request_login_code(
+        &self,
+        phone: &str,
+    ) -> Result<CodeRequest<Self::LoginToken>, AuthError> {
         self.auth_request_code(phone).await
+    }
+
+    async fn resend_login_code(
+        &self,
+        token: &Self::LoginToken,
+    ) -> Result<CodeRequest<Self::LoginToken>, AuthError> {
+        self.auth_resend_code(token).await
     }
 
     async fn sign_in(
@@ -766,27 +904,23 @@ impl Client for FakeClient {
     ) -> Result<MsgId, BackendError> {
         self.shared
             .with(|s| push_capped(&mut s.attempted, (chat, random_id)));
-        let _g = self.enter(Op::Send).await?;
-        // Telegram deduplicates by `random_id` and answers a repeat with
-        // `RANDOM_ID_DUPLICATE`, which carries no message id.
-        if self
-            .shared
-            .with(|s| s.sent.iter().any(|&(c, r)| c == chat && r == random_id))
-        {
+        let fault = self.take_fault(Op::Send);
+        let lost = matches!(fault, Some(Fault::CompleteThenHang));
+        let _g = self.enter_with(fault.filter(|_| !lost)).await?;
+        // Telegram deduplicates by `random_id` (per sender, whatever the
+        // peer) and answers a repeat with `RANDOM_ID_DUPLICATE`, which
+        // carries no message id: no second message is created.
+        if self.shared.with(|s| s.accepted.contains_key(&random_id)) {
             return Err(BackendError::SentUnconfirmed);
+        }
+        if lost {
+            // Accepted, but the answer is lost: the server holds the message.
+            self.accept(chat, &text, random_id);
+            return std::future::pending().await;
         }
         // The real server also echoes own sends as updates; the fake does not, so tests
         // control update ordering explicitly with `FakeHandle::push_update`.
-        let id = self.shared.with(|s| {
-            push_capped(&mut s.sent, (chat, random_id));
-            let history = s.history.entry(chat).or_default();
-            let id = history.last().map_or(1, |m| m.id.0.saturating_add(1));
-            let mut msg = text_message(chat, id, &text);
-            msg.outgoing = true;
-            history.push(msg);
-            MsgId(id)
-        });
-        Ok(id)
+        Ok(self.accept(chat, &text, random_id))
     }
 
     async fn read_history(&self, chat: ChatId, max_id: MsgId) -> Result<(), BackendError> {
@@ -794,6 +928,28 @@ impl Client for FakeClient {
         self.shared
             .with(|s| push_capped(&mut s.read, (chat, max_id)));
         Ok(())
+    }
+
+    fn retain_peers(&self, required: &[ChatId]) {
+        self.shared.with(|s| s.retained = Some(required.to_vec()));
+    }
+}
+
+impl FakeClient {
+    /// The server accepts a send: one new message, remembered by `random_id`.
+    fn accept(&self, chat: ChatId, text: &str, random_id: i64) -> MsgId {
+        self.shared.with(|s| {
+            push_capped(&mut s.sent, (chat, random_id));
+            let history = s.history.entry(chat).or_default();
+            let id = MsgId(history.last().map_or(1, |m| m.id.0.saturating_add(1)));
+            let mut msg = text_message(chat, id.0, text);
+            msg.outgoing = true;
+            history.push(msg);
+            if s.accepted.len() < MAX_LOG {
+                s.accepted.insert(random_id, (chat, id));
+            }
+            id
+        })
     }
 }
 

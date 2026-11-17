@@ -55,16 +55,27 @@ impl Harness {
 async fn login_is_confirmed_and_goes_online() {
     let mut h = signed_out(no_password()).await;
     let code = h.phone_to_code().await;
-    let AuthState::Code { phone_hint, error } = code else {
+    let AuthState::Code {
+        phone_hint,
+        error,
+        sent,
+    } = code
+    else {
         unreachable!()
     };
     assert_eq!(error, None);
     assert!(!phone_hint.contains("900123"), "the hint is masked");
+    let sent = sent.expect("the sent-code info");
+    assert_eq!(sent.delivery, crate::api::CodeDelivery::App);
+    assert!(sent.resend_at.is_some());
     h.send(Command::SubmitCode(FAKE_CODE.into())).await;
     assert_eq!(
         h.signed_in().await,
         AuthState::SignedIn {
-            display_name: "Demo User".into()
+            display_name: "Demo User".into(),
+            new_login: Some(crate::api::NewLogin {
+                has_password: Some(false)
+            }),
         }
     );
     let (ev, _) = h
@@ -179,6 +190,8 @@ async fn expired_code_then_resend() {
     h.send(Command::ResendCode).await;
     h.auth(|s| matches!(s, AuthState::Code { error: None, .. }))
         .await;
+    // The expired request cannot be resent: a fresh code is requested.
+    assert_eq!(h.fake.calls(Op::ResendCode), 1);
     assert_eq!(h.fake.calls(Op::RequestCode), 2);
     h.send(Command::SubmitCode(FAKE_CODE.into())).await;
     h.signed_in().await;
@@ -294,7 +307,8 @@ async fn api_id_invalid_returns_to_credentials() {
         matches!(
             s,
             AuthState::NeedCredentials {
-                error: Some(CredentialError::ApiIdInvalid)
+                error: Some(CredentialError::ApiIdInvalid),
+                ..
             }
         )
     })
@@ -324,7 +338,10 @@ async fn login_barrier_failure_is_signed_in_unsaved() {
     assert_eq!(
         h.signed_in().await,
         AuthState::SignedInUnsaved {
-            display_name: "Demo User".into()
+            display_name: "Demo User".into(),
+            new_login: Some(crate::api::NewLogin {
+                has_password: Some(false)
+            }),
         }
     );
     h.online().await;
@@ -361,5 +378,173 @@ async fn second_migration_routes_to_sign_in_and_login_clears_the_halt() {
     h.signed_in().await;
     h.online().await;
     assert_eq!(h.fake.builds(), 3);
+    h.stop().await;
+}
+
+// Task 6 review findings (task 6b). Each test fails on the task 6 code.
+
+/// Finding 1: an inconclusive probe is not "signed out". The sign-in went
+/// through; the first probe fails in transport. Core stays in `Verifying`,
+/// accepts no new sign-in, and the next probe completes the login.
+#[tokio::test(start_paused = true)]
+async fn inconclusive_probe_is_retried_not_read_as_signed_out() {
+    let mut h = signed_out(no_password()).await;
+    h.phone_to_code().await;
+    h.fake.inject(Op::SignIn, Fault::CompleteThenHang);
+    h.fake
+        .inject(Op::IsAuthorized, Fault::Error(BackendError::Transient));
+    h.send(Command::SubmitCode(FAKE_CODE.into())).await;
+    let (_, skipped) = h
+        .until(|e| {
+            matches!(
+                e,
+                Event::Auth(AuthState::Verifying {
+                    error: Some(UserError::Network)
+                })
+            )
+        })
+        .await;
+    assert!(
+        !skipped
+            .iter()
+            .any(|e| matches!(e, Event::Auth(s) if is_code(s)))
+    );
+    // A new sign-in is not accepted: the probe answers first.
+    h.send(Command::SubmitCode(FAKE_CODE.into())).await;
+    h.signed_in().await;
+    assert_eq!(h.fake.calls(Op::SignIn), 1);
+    assert_eq!(h.fake.calls(Op::IsAuthorized), 2);
+    h.stop().await;
+}
+
+/// Finding 1: a flood wait on the probe is honored, then the probe resumes
+/// (here: the sign-in never reached the server, so back to the code).
+#[tokio::test(start_paused = true)]
+async fn flood_wait_on_the_probe_is_honored() {
+    let mut h = signed_out(no_password()).await;
+    h.phone_to_code().await;
+    h.fake
+        .inject(Op::SignIn, Fault::Error(BackendError::Transient));
+    h.fake.inject(
+        Op::IsAuthorized,
+        Fault::Error(BackendError::FloodWait { seconds: 30 }),
+    );
+    h.send(Command::SubmitCode(FAKE_CODE.into())).await;
+    let state = h.auth(|s| matches!(s, AuthState::FloodWait { .. })).await;
+    let AuthState::FloodWait { resume, .. } = state else {
+        unreachable!()
+    };
+    assert_eq!(*resume, AuthState::Verifying { error: None });
+    h.auth(|s| {
+        matches!(
+            s,
+            AuthState::Code {
+                error: Some(UserError::Network),
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(h.fake.calls(Op::IsAuthorized), 2);
+    h.send(Command::SubmitCode(FAKE_CODE.into())).await;
+    h.signed_in().await;
+    h.stop().await;
+}
+
+/// Finding 2: a login result from a retired instance is stale. The startup
+/// check lost with its instance is redone on the next one, instead of
+/// settling for an empty display name.
+#[tokio::test(start_paused = true)]
+async fn startup_check_lost_with_its_instance_is_redone() {
+    let (backend, fake) = FakeBackend::new(no_password());
+    fake.inject(Op::FetchSelf, Fault::Delay(Duration::from_secs(20)));
+    let mut h = harness_with(backend, fake, None).await;
+    h.online().await;
+    h.internal.send(super::Internal::Wake).await.unwrap();
+    let state = h.auth(AuthState::is_signed_in).await;
+    assert_eq!(
+        state,
+        AuthState::SignedIn {
+            display_name: "Demo User".into(),
+            new_login: None,
+        }
+    );
+    assert_eq!(h.fake.calls(Op::FetchSelf), 2);
+    assert_eq!(h.fake.builds(), 2);
+    h.stop().await;
+}
+
+/// Finding 3: `AUTH_KEY_UNREGISTERED`/`SESSION_REVOKED` during login tears
+/// the local session down although no account is signed in.
+#[tokio::test(start_paused = true)]
+async fn revocation_during_login_tears_the_session_down() {
+    let mut h = signed_out(no_password()).await;
+    h.phone_to_code().await;
+    h.fake
+        .inject(Op::SignIn, Fault::Error(BackendError::Unauthorized));
+    h.send(Command::SubmitCode(FAKE_CODE.into())).await;
+    h.auth(|s| *s == AuthState::LoggingOut).await;
+    h.auth(|s| matches!(s, AuthState::LoggedOut { .. })).await;
+    h.auth(|s| {
+        matches!(
+            s,
+            AuthState::Phone {
+                error: Some(UserError::SessionRevoked)
+            }
+        )
+    })
+    .await;
+    assert_eq!(h.fake.builds(), 2, "a fresh instance for the next login");
+    h.stop().await;
+}
+
+/// Finding 3: the probe's "not authorized" is not a revocation.
+#[tokio::test(start_paused = true)]
+async fn not_authorized_probe_is_not_a_revocation() {
+    let mut h = signed_out(no_password()).await;
+    h.phone_to_code().await;
+    h.fake.inject(Op::SignIn, Fault::Hang);
+    h.send(Command::SubmitCode(FAKE_CODE.into())).await;
+    let (_, skipped) = h.until(|e| matches!(e, Event::Auth(s) if is_code(s))).await;
+    assert!(
+        !skipped
+            .iter()
+            .any(|e| matches!(e, Event::Auth(AuthState::LoggingOut)))
+    );
+    // Task 6d: the timed-out sign-in's instance is retired before the probe
+    // (it may still hold the request); that is a rebuild, not a logout.
+    assert_eq!(h.fake.builds(), 2);
+    assert_eq!(h.fake.retired(), 1);
+    h.stop().await;
+}
+
+/// Finding 4: login calls take admission permits; a timed-out one parks
+/// its permit, and repeated timeouts rebuild the instance, which recycles
+/// the parked permits.
+#[tokio::test(start_paused = true)]
+async fn login_calls_take_permits_and_park_them_on_timeout() {
+    let max = crate::actor::MAX_CONCURRENT;
+    let mut h = signed_out(no_password()).await;
+    for round in 0..3 {
+        h.fake.inject(Op::RequestCode, Fault::Hang);
+        h.send(Command::SubmitPhone(PHONE.into())).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(h.permits.available_permits(), max - round - 1);
+        h.auth(|s| {
+            matches!(
+                s,
+                AuthState::Phone {
+                    error: Some(UserError::Network)
+                }
+            )
+        })
+        .await;
+    }
+    h.until(|e| matches!(e, Event::Connection(ConnState::Rebuilding { .. })))
+        .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(h.fake.builds(), 2);
+    assert_eq!(h.permits.available_permits(), max);
+    h.phone_to_code().await;
     h.stop().await;
 }

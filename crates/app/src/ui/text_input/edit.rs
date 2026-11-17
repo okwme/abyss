@@ -44,11 +44,20 @@ impl Limits {
         lines: Lines::Single,
         max_utf16: 20,
     };
+    /// A login code: up to core's bound for any delivery; the code screen
+    /// narrows it to the delivery's (`EditBuffer::set_max_utf16`).
     pub(crate) const CODE: Limits = Limits {
         filter: CharFilter::Digits,
         lines: Lines::Single,
-        max_utf16: 8,
+        max_utf16: abyss_core::api::MAX_CODE_DIGITS,
     };
+    /// `api_id`: at most 10 digits (a positive 32-bit number).
+    pub(crate) const API_ID: Limits = Limits {
+        filter: CharFilter::Digits,
+        lines: Lines::Single,
+        max_utf16: 10,
+    };
+
     pub(crate) const COMPOSER: Limits = Limits {
         filter: CharFilter::Any,
         lines: Lines::Multi,
@@ -93,7 +102,8 @@ pub(crate) fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
-#[derive(Debug)]
+/// The content (a phone number, a code, a message draft) never reaches
+/// `Debug` output (task 6c).
 pub(crate) struct EditBuffer {
     content: String,
     selected: Range<usize>,
@@ -103,6 +113,15 @@ pub(crate) struct EditBuffer {
     /// Bumps on every content change, so layouts from an older revision are
     /// never used to map offsets.
     revision: u64,
+}
+
+impl std::fmt::Debug for EditBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditBuffer")
+            .field("len", &self.content.len())
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EditBuffer {
@@ -277,6 +296,15 @@ impl EditBuffer {
     }
 
     /// Takes the content, leaving the field empty.
+    /// Changes the length bound (a code field follows the delivery). Text
+    /// over the new bound is cleared rather than cut.
+    pub(crate) fn set_max_utf16(&mut self, max: usize) {
+        self.limits.max_utf16 = max;
+        if self.utf16_len() > max {
+            drop(self.take());
+        }
+    }
+
     pub(crate) fn take(&mut self) -> String {
         self.selected = 0..0;
         self.reversed = false;
@@ -364,6 +392,23 @@ mod tests {
         let mut b = EditBuffer::new(Limits::COMPOSER);
         b.replace(None, text);
         b
+    }
+
+    /// Task 6c: no field's content (phone, code, draft) reaches `Debug`.
+    #[test]
+    fn debug_never_prints_the_content() {
+        for (limits, text) in [
+            (Limits::PHONE, "+15550100"),
+            (Limits::CODE, "24680"),
+            (Limits::API_ID, "97531"),
+            (Limits::COMPOSER, "secret plans"),
+        ] {
+            let mut b = EditBuffer::new(limits);
+            b.replace(None, text);
+            assert_eq!(b.text(), text);
+            let shown = format!("{b:?}");
+            assert!(!shown.contains(text), "{shown}");
+        }
     }
 
     #[test]
@@ -456,6 +501,40 @@ mod tests {
         let mut b = EditBuffer::new(Limits::CODE);
         b.replace(None, "12-34 5+6\n");
         assert_eq!(b.text(), "123456");
+    }
+
+    /// Finding 5: a flash call's whole number fits; the bound follows the
+    /// delivery and never exceeds core's.
+    #[test]
+    fn code_bound_follows_the_delivery() {
+        let mut b = EditBuffer::new(Limits::CODE);
+        assert_eq!(b.replace(None, "447700900123"), Fit::Whole);
+        assert_eq!(b.text(), "447700900123");
+        assert_eq!(b.replace(None, &"1".repeat(40)), Fit::Clipped);
+        assert_eq!(b.utf16_len(), abyss_core::api::MAX_CODE_DIGITS);
+        b.set_max_utf16(5);
+        assert_eq!(b.text(), "", "over the new bound: cleared");
+        assert_eq!(b.replace(None, "1234567"), Fit::Clipped);
+        assert_eq!(b.text(), "12345");
+    }
+
+    /// Round 19, 3: a lone `*` flash-call pattern accepts a number of any
+    /// length, so a complete international number fits the code field.
+    #[test]
+    fn lone_wildcard_flash_call_takes_a_whole_number() {
+        use abyss_core::api::{CodeDelivery, SentCodeInfo};
+        let sent = SentCodeInfo {
+            delivery: CodeDelivery::FlashCall {
+                pattern: "*".into(),
+            },
+            length: None,
+            next: None,
+            resend_at: None,
+        };
+        let mut b = EditBuffer::new(Limits::CODE);
+        b.set_max_utf16(sent.max_code_digits());
+        assert_eq!(b.replace(None, "447700900123"), Fit::Whole);
+        assert_eq!(b.text(), "447700900123");
     }
 
     #[test]

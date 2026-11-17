@@ -7,11 +7,15 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use super::{SecretItem, SecretStore, StoreError};
+use super::{ClockGate, SecretItem, SecretStore, StoreError};
 
 /// Longest a held operation waits for [`FaultControl::release`]. Bounds every
 /// test that forgets to release.
 const MAX_HOLD: Duration = Duration::from_secs(10);
+
+/// Tests: milliseconds every [`FaultyStore`] operation sleeps (unset: none).
+#[cfg(test)]
+const TEST_STORE_DELAY_VAR: &str = "ABYSS_TEST_STORE_DELAY_MS";
 
 /// Thread-safe in-memory store. Clones share storage, so a test can keep one
 /// clone to inspect what the persistence worker wrote.
@@ -82,6 +86,17 @@ struct Faults {
     failing: AtomicU8,
     /// Deletions of these items fail (one bit per item).
     failing_deletes: AtomicU8,
+    /// Reads and writes of these items fail (one bit per item).
+    failing_gets: AtomicU8,
+    failing_sets: AtomicU8,
+    /// Operations on these items block until released (one bit per item).
+    held_items: AtomicU8,
+    /// Items an operation is blocked on by [`FaultControl::hold_item`].
+    entered_items: AtomicU8,
+    /// Operations on these items never answer (until released): unlike a
+    /// hold, the clock gate stays shut.
+    stalled_items: AtomicU8,
+    gate: ClockGate,
     calls: AtomicU64,
     held: Mutex<bool>,
     released: Condvar,
@@ -123,6 +138,32 @@ impl FaultControl {
             .fetch_or(item_bit(item), Ordering::SeqCst);
     }
 
+    /// Makes reading `item` fail (a locked Keychain) until [`Self::heal_item`].
+    pub fn fail_get_of(&self, item: SecretItem) {
+        self.0
+            .failing_gets
+            .fetch_or(item_bit(item), Ordering::SeqCst);
+    }
+
+    /// Makes writing `item` fail until [`Self::heal_item`].
+    pub fn fail_set_of(&self, item: SecretItem) {
+        self.0
+            .failing_sets
+            .fetch_or(item_bit(item), Ordering::SeqCst);
+    }
+
+    /// Ends every per-item failure of `item`.
+    pub fn heal_item(&self, item: SecretItem) {
+        let keep = !item_bit(item);
+        self.0.failing_gets.fetch_and(keep, Ordering::SeqCst);
+        self.0.failing_sets.fetch_and(keep, Ordering::SeqCst);
+        self.0.failing_deletes.fetch_and(keep, Ordering::SeqCst);
+    }
+
+    fn item_fails(mask: &AtomicU8, item: SecretItem) -> bool {
+        mask.load(Ordering::SeqCst) & item_bit(item) != 0
+    }
+
     fn delete_fails(&self, item: SecretItem) -> bool {
         self.0.failing_deletes.load(Ordering::SeqCst) & item_bit(item) != 0
     }
@@ -134,11 +175,68 @@ impl FaultControl {
         }
     }
 
+    /// Blocks every subsequent operation on `item` until [`Self::release`]
+    /// (at most 10 s): a Keychain prompt for one item nobody answers.
+    pub fn hold_item(&self, item: SecretItem) {
+        self.0.held_items.fetch_or(item_bit(item), Ordering::SeqCst);
+    }
+
+    /// Blocks every subsequent operation on `item` until [`Self::release`]
+    /// (at most 10 s) while the paused clock stays held: a store operation
+    /// that never answers, which only a wall-clock bound ends (review round
+    /// 32).
+    pub fn stall_item(&self, item: SecretItem) {
+        self.0
+            .stalled_items
+            .fetch_or(item_bit(item), Ordering::SeqCst);
+    }
+
+    /// Ends [`Self::hold`], every [`Self::hold_item`] and
+    /// [`Self::stall_item`].
     pub fn release(&self) {
         if let Ok(mut held) = self.0.held.lock() {
             *held = false;
+            self.0.held_items.store(0, Ordering::SeqCst);
+            self.0.stalled_items.store(0, Ordering::SeqCst);
+            self.0.entered_items.store(0, Ordering::SeqCst);
         }
+        self.0.gate.released();
         self.0.released.notify_all();
+    }
+
+    /// Whether an operation on `item` is blocked by [`Self::hold_item`] now.
+    pub fn hold_entered(&self, item: SecretItem) -> bool {
+        self.0.entered_items.load(Ordering::SeqCst) & item_bit(item) != 0
+    }
+
+    /// The gate keeping a paused clock still while the store works.
+    pub fn clock_gate(&self) -> ClockGate {
+        self.0.gate.clone()
+    }
+
+    /// Waits while `item` is stalled (bounded like [`Self::hold`]).
+    fn stall(&self, item: SecretItem) {
+        let bit = item_bit(item);
+        let stalled = |_: &mut bool| self.0.stalled_items.load(Ordering::SeqCst) & bit != 0;
+        if let Ok(guard) = self.0.held.lock() {
+            let _ = self.0.released.wait_timeout_while(guard, MAX_HOLD, stalled);
+        }
+    }
+
+    /// Waits while `item` is held (bounded like [`Self::hold`]).
+    fn wait_item(&self, item: SecretItem) {
+        self.stall(item);
+        let bit = item_bit(item);
+        let held = |_: &mut bool| self.0.held_items.load(Ordering::SeqCst) & bit != 0;
+        if let Ok(guard) = self.0.held.lock() {
+            if !held(&mut false) {
+                return;
+            }
+            self.0.entered_items.fetch_or(bit, Ordering::SeqCst);
+            let epoch = self.0.gate.hold_began();
+            let _ = self.0.released.wait_timeout_while(guard, MAX_HOLD, held);
+            self.0.gate.hold_ended(epoch);
+        }
     }
 
     /// Number of operations started so far.
@@ -148,13 +246,18 @@ impl FaultControl {
 
     fn before(&self, op: StoreOp) -> Result<(), StoreError> {
         self.0.calls.fetch_add(1, Ordering::SeqCst);
-        if let Ok(held) = self.0.held.lock() {
+        if let Ok(held) = self.0.held.lock()
+            && *held
+        {
+            // Time may pass on a paused clock while held (`ClockGate`).
+            let epoch = self.0.gate.hold_began();
             // A timeout or poisoned lock just ends the hold; the bound matters
             // more than the reason.
             let _ = self
                 .0
                 .released
                 .wait_timeout_while(held, MAX_HOLD, |held| *held);
+            self.0.gate.hold_ended(epoch);
         }
         let ms = self.0.delay_ms.load(Ordering::SeqCst);
         if ms > 0 {
@@ -179,6 +282,16 @@ pub struct FaultyStore<S> {
 impl<S: SecretStore> FaultyStore<S> {
     pub fn new(inner: S) -> (Self, FaultControl) {
         let control = FaultControl::default();
+        // Tests: every operation of every faulty store this slow, to prove
+        // that no test depends on how fast the store thread answers (review
+        // round 31).
+        #[cfg(test)]
+        if let Some(ms) = std::env::var(TEST_STORE_DELAY_VAR)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            control.set_delay(Duration::from_millis(ms));
+        }
         (
             Self {
                 inner,
@@ -190,18 +303,32 @@ impl<S: SecretStore> FaultyStore<S> {
 }
 
 impl<S: SecretStore> SecretStore for FaultyStore<S> {
+    #[cfg(test)]
+    fn clock_gate(&self) -> Option<ClockGate> {
+        Some(self.control.clock_gate())
+    }
+
     fn get(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
         self.control.before(StoreOp::Get)?;
+        self.control.wait_item(item);
+        if FaultControl::item_fails(&self.control.0.failing_gets, item) {
+            return Err(StoreError::Injected);
+        }
         self.inner.get(item)
     }
 
     fn set(&self, item: SecretItem, secret: &[u8]) -> Result<(), StoreError> {
         self.control.before(StoreOp::Set)?;
+        self.control.wait_item(item);
+        if FaultControl::item_fails(&self.control.0.failing_sets, item) {
+            return Err(StoreError::Injected);
+        }
         self.inner.set(item, secret)
     }
 
     fn delete(&self, item: SecretItem) -> Result<(), StoreError> {
         self.control.before(StoreOp::Delete)?;
+        self.control.wait_item(item);
         if self.control.delete_fails(item) {
             return Err(StoreError::Injected);
         }
@@ -213,5 +340,7 @@ const fn item_bit(item: SecretItem) -> u8 {
     match item {
         SecretItem::Session => 1,
         SecretItem::CacheKey => 2,
+        SecretItem::ApiCredentials => 4,
+        SecretItem::LogoutPending => 8,
     }
 }

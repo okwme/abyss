@@ -4,9 +4,10 @@ use crate::model::{ChatId, ChatSummary, LocalId, Message, MsgId};
 use crate::store::ViewGen;
 
 pub use crate::auth_types::{
-    ApiHash, ApiHashError, AuthState, CredentialError, LocalDeletion, LogoutStatus,
-    PASSWORD_CAPACITY, PasswordBuf, PasswordTooLong, RemoteLogout, SaveStatus, StorageError,
-    mask_phone,
+    ApiCredentials, ApiHash, ApiHashError, ApiId, ApiIdError, AuthState, CodeDelivery,
+    CredentialError, CredentialItem, CredentialSource, EnvVar, LocalDeletion, LogoutStatus,
+    LogoutTrigger, MAX_CODE_DIGITS, MAX_DELIVERY_TEXT, NewLogin, NextDelivery, PASSWORD_CAPACITY,
+    PasswordBuf, PasswordTooLong, RemoteLogout, SaveStatus, SentCodeInfo, StorageError, mask_phone,
 };
 
 /// Generation of the client instance. Bumps on every rebuild, login and logout;
@@ -38,9 +39,12 @@ pub enum Command {
         text: String,
         local_id: LocalId,
     },
+    /// Retries a failed or unknown send. Answered with the send's state,
+    /// or `SendRefused` when core holds no such send.
     RetrySend(LocalId),
-    /// Drops a failed or unknown send from the pending-send table. A send that
-    /// is in flight cannot be discarded (`Busy`).
+    /// Drops a failed, unknown or flood-waiting send from the pending-send
+    /// table. Answered `SendDiscarded`, or `DiscardRefused` with the state
+    /// of a send core keeps (one in flight cannot be discarded: `Busy`).
     DiscardSend(LocalId),
     /// The main window became active or inactive. Activation triggers a light
     /// refresh; while active, one also runs every 5 minutes (plan section 2).
@@ -49,10 +53,42 @@ pub enum Command {
         chat: ChatId,
         max_id: MsgId,
     },
+    /// The chat whose live tail is on screen: the open chat, scrolled to its
+    /// newest message. `None` when scrolled up or no chat is shown. Together
+    /// with `Window(Active)`, this alone suppresses the unread increment for
+    /// incoming messages; until the app sends it, every incoming message
+    /// counts as unread and is cleared by `MarkRead`.
+    ViewingTail(Option<ChatId>),
     /// Signs out: remote `auth.logOut`, then local deletion of the session
     /// item and the cache (plan sections 5, 16). While signed out, it retries
     /// the local deletion only.
     Logout,
+    /// Onboarding (plan section 17.2): use this pair. Persisted only after
+    /// the first successful code request. Refused while an env override or
+    /// an unreadable Keychain is in control.
+    SubmitCredentials {
+        api_id: i32,
+        api_hash: ApiHash,
+    },
+    /// Deletes the stored pair (never an env override). Refused while signed
+    /// in: changing credentials means logging out first.
+    ForgetStoredCredentials,
+    /// Re-runs credential resolution: the Retry for an unreadable Keychain,
+    /// or "use the saved pair" after Back.
+    ReloadCredentials,
+    /// Retries saving the entered pair after a Keychain write failed
+    /// ([`CredentialItem::SaveFailed`]). Refused unless a code request
+    /// succeeded with that pair (its proof).
+    RetryCredentialSave,
+    /// One login step back (plan section 17.3): code, password and the
+    /// official-app screens go to the phone screen; the phone screen goes to
+    /// the credential screens. Refused once signed in (only logout goes back),
+    /// except on [`AuthState::LogoutNotStarted`] after a user's logout, where
+    /// it stays signed in.
+    Back,
+    /// Reads the logout-pending marker again after startup could not
+    /// ([`AuthState::StartupBlocked`]).
+    RetryStartup,
 }
 
 impl std::fmt::Debug for Command {
@@ -81,7 +117,14 @@ impl std::fmt::Debug for Command {
                 .field("chat", chat)
                 .field("max_id", max_id)
                 .finish(),
+            Self::ViewingTail(c) => f.debug_tuple("ViewingTail").field(c).finish(),
             Self::Logout => f.write_str("Logout"),
+            Self::SubmitCredentials { .. } => f.write_str("SubmitCredentials(<redacted>)"),
+            Self::ForgetStoredCredentials => f.write_str("ForgetStoredCredentials"),
+            Self::ReloadCredentials => f.write_str("ReloadCredentials"),
+            Self::RetryCredentialSave => f.write_str("RetryCredentialSave"),
+            Self::Back => f.write_str("Back"),
+            Self::RetryStartup => f.write_str("RetryStartup"),
         }
     }
 }
@@ -120,6 +163,15 @@ pub enum SendState {
         attempts: u8,
     },
     Failed,
+    /// The server asked to wait (`FLOOD_WAIT`): not sent. Core resends it with
+    /// the same `random_id` once `seconds` (counted from this event) have
+    /// passed (at least one second); it can be discarded meanwhile. Automatic
+    /// resends are bounded: after repeated flood waits, or past a total retry
+    /// window, the send becomes `Failed` (with `UserError::FloodWait`) and
+    /// waits for Retry or Discard.
+    FloodWait {
+        seconds: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +195,16 @@ pub enum UserError {
     PhoneInvalid,
     /// Telegram banned the phone number (`PHONE_NUMBER_BANNED`).
     PhoneBanned,
+    /// Too many login attempts for this number (`PHONE_NUMBER_FLOOD`,
+    /// `PHONE_PASSWORD_FLOOD`); no countdown is given.
+    PhoneFlood,
+    /// The entered API credentials could not be saved to the Keychain. They
+    /// stay in memory and are retried on the next successful login step.
+    CredentialsNotSaved(StorageError),
+    /// The stored API credentials could not be deleted.
+    CredentialsNotForgotten(StorageError),
+    /// Not while signed in: log out first.
+    SignOutFirst,
     /// The login code is wrong or expired; ask for a new one.
     InvalidCode,
     /// The 2FA password is wrong.
@@ -160,6 +222,15 @@ pub enum UserError {
     Internal,
 }
 
+/// The load a [`Event::LoadEnded`] is about: one the UI asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadTarget {
+    /// `LoadDialogs`.
+    Dialogs,
+    /// `LoadOlder` (`dir: Older`) or `LoadNewer` (`dir: Newer`) of `chat`.
+    History { chat: ChatId, dir: HistoryDir },
+}
+
 /// Which part of a window a history event extends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryDir {
@@ -174,15 +245,31 @@ pub enum HistoryDir {
 #[derive(Debug)]
 pub enum Event {
     Auth(AuthState),
+    /// Which credential source is in control (plan section 17.2a); `None`
+    /// while none is.
+    CredentialSource(Option<CredentialSource>),
+    /// The credential Keychain item's save/delete state (round 11): the UI
+    /// offers Retry on a failure.
+    CredentialItem(CredentialItem),
     Connection(ConnState),
     /// The whole chat list, replacing the UI's copy. A reloaded first page
     /// (bootstrap, refresh) is merged into the loaded list in core, so later
     /// pages survive it.
     DialogsReset(Vec<ChatSummary>),
     /// Chats a later page added or changed: the UI updates listed chats in
-    /// place and appends new ones.
+    /// place and appends new ones. A page that reorders the list (after a
+    /// refresh, a newly found chat is placed in server order and may evict a
+    /// provisional one) is sent as `DialogsReset` instead.
     DialogsAppended(Vec<ChatSummary>),
-    /// A chat's summary changed (new message, unread count).
+    /// Whether more dialogs pages can be loaded (`LoadDialogs`), after every
+    /// applied dialogs page. A refreshed first page restarts pagination, so
+    /// this can turn `true` again after a `false`.
+    DialogsPaging {
+        has_more: bool,
+    },
+    /// A chat's summary changed (new message, unread count). A new message
+    /// moves an unpinned chat to the top of the unpinned section exactly when
+    /// `last_id` grew; read-state changes keep `last_id`.
     ChatBumped(ChatSummary),
     History {
         chat: ChatId,
@@ -196,12 +283,65 @@ pub enum Event {
         has_more: bool,
     },
     ChatInvalidated(ChatId),
+    /// The server's tail of `chat` was applied to `view` (open, bootstrap,
+    /// gap or light refresh), after the `History`/`Deleted`/`Edited` events
+    /// it caused. Everything in the window up to `newest` is now the server's
+    /// truth: echoes of sends at or below `newest` are in it (or were
+    /// deleted). It says nothing about `SentUnconfirmed` sends, whose ids
+    /// are unknown (see `SendsCovered`).
+    Reconciled {
+        chat: ChatId,
+        view: ViewGen,
+        newest: Option<MsgId>,
+    },
+    /// A load the UI asked for ended without its answer (`DialogsPaging`,
+    /// or `History` in that direction). `error: None`: there was nothing
+    /// to load (every dialogs page is loaded; the chat is not open, or has
+    /// no more history that way). `Some`: it failed or was not queued; the
+    /// error is also sent as `Error`. A `LoadOlder`/`LoadNewer` that arrives
+    /// while another history load of its chat runs is not dropped: it runs
+    /// once that load ends, so it is always answered by one or the other.
+    LoadEnded {
+        target: LoadTarget,
+        error: Option<UserError>,
+    },
+    /// These `SentUnconfirmed` sends of `chat` are covered by server history
+    /// requested after the server accepted them, and already applied to the
+    /// chat's window: their messages are shown (or were deleted), so their
+    /// echoes can go. Sent after the `History` events that showed them.
+    /// Core fetches older pages (a few at most) when the tail alone does not
+    /// reach back to a send; until this event, the echo stays.
+    SendsCovered {
+        chat: ChatId,
+        sends: Vec<LocalId>,
+    },
     Edited(Message),
     Deleted {
         chat: ChatId,
         ids: Vec<MsgId>,
     },
     SendState {
+        local_id: LocalId,
+        state: SendState,
+    },
+    /// Core keeps this `SendText` (task 6j): dispatched, or kept `Failed`
+    /// for Retry. Comes before any `SendState` of it.
+    SendAdmitted {
+        local_id: LocalId,
+    },
+    /// Core holds nothing for this send: a `SendText` it refused (the
+    /// reason, if any, is sent as `Error` first), or a `RetrySend` of a
+    /// send it does not know. Its text exists only in the UI now.
+    SendRefused {
+        local_id: LocalId,
+    },
+    /// A `DiscardSend` ended: core holds nothing for this send any more.
+    SendDiscarded {
+        local_id: LocalId,
+    },
+    /// A `DiscardSend` was refused (after `Error(Busy)`): core keeps the
+    /// send, in `state`.
+    DiscardRefused {
         local_id: LocalId,
         state: SendState,
     },
@@ -226,6 +366,7 @@ impl Event {
             }
             Event::Edited(m) => m.retained_bytes(),
             Event::Deleted { ids, .. } => ids.capacity() * std::mem::size_of::<MsgId>(),
+            Event::SendsCovered { sends, .. } => sends.capacity() * std::mem::size_of::<LocalId>(),
             _ => 0,
         }
     }

@@ -1,14 +1,19 @@
 //! Applying completions and live updates to the store, cache and UI.
 
 use super::Actor;
-use super::boot::{BootKind, Origin, Snapshot};
-use super::jobs::{CallError, CallResult, DialogsStep, Done, Outcome, PAGE, StreamEnd};
+use super::boot::{BootKind, Origin, Snapshot, TailVia};
+use super::jobs::{
+    CallError, CallResult, DialogsStep, Done, Load, Outcome, PAGE, ReqId, StreamEnd,
+};
 use super::lifecycle::Reason;
-use crate::api::{Event, HistoryDir, UserError};
-use crate::backend::{Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, Update};
+use super::loads::Owed;
+use crate::api::{Event, HistoryDir, LoadTarget, UserError, WindowState};
+use crate::backend::{
+    Backend, BackendError, DialogsPage, HistoryPage, HistoryQuery, StreamError, Update,
+};
 use crate::cache::CacheCmd;
-use crate::model::{ChatId, ChatSummary, Message, MsgId, Preview};
-use crate::store::{Bump, Change, Rest, Unread, ViewGen};
+use crate::model::{ChatId, ChatSummary, Message, MsgId};
+use crate::store::{Bump, Change, Last, Rest, Unread, ViewGen, Window};
 
 pub(super) fn user_error(e: CallError) -> UserError {
     match e {
@@ -51,10 +56,76 @@ pub(super) enum TailMode {
 pub(super) struct HistoryReply {
     pub(super) chat: ChatId,
     pub(super) view: ViewGen,
+    /// The load that asked for it (its order says what it can cover).
+    pub(super) req: ReqId,
     pub(super) dir: HistoryDir,
     pub(super) query: HistoryQuery,
+    /// See [`Job::History`](super::jobs::Job::History).
+    pub(super) floor: Option<MsgId>,
+    /// What the server page covered, captured before tombstones filter it.
+    pub(super) covered: Option<Coverage>,
     pub(super) page: HistoryPage,
     pub(super) mode: TailMode,
+}
+
+/// What a completed history load was, taken from the actor's bookkeeping
+/// as it completes.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LoadEnd {
+    /// It was a covering fetch (`covered.rs`).
+    cover_fetch: bool,
+    /// It owed the UI its answer (`loads.rs`).
+    owed: Option<Owed>,
+}
+
+/// The ids a server page covered: its oldest and newest message as the
+/// server sent them. Captured before buffered deletions filter the page, so a
+/// page emptied by tombstones still bounds what it is authoritative for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Coverage {
+    pub(super) oldest: MsgId,
+    pub(super) newest: MsgId,
+}
+
+impl Coverage {
+    pub(super) fn of(page: &HistoryPage) -> Option<Self> {
+        let ids = page.messages.iter().map(|m| m.id);
+        Some(Self {
+            oldest: ids.clone().min()?,
+            newest: ids.max()?,
+        })
+    }
+}
+
+impl HistoryReply {
+    /// Up to which id a tail is authoritative: the newest id the server sent,
+    /// and the newest the window held when it was requested. Window messages
+    /// above it arrived later and are kept; at or below it, the server decides.
+    pub(super) fn authoritative_top(&self) -> Option<MsgId> {
+        self.covered.map(|c| c.newest).max(self.floor)
+    }
+
+    /// The inclusive id range a tail is authoritative for: from the oldest id
+    /// the server sent (or the start of history, when the page is the whole
+    /// history) up to [`Self::authoritative_top`]. A partial page that covered
+    /// nothing establishes nothing: `None`, so nothing is deleted.
+    pub(super) fn authoritative_range(&self) -> Option<(MsgId, MsgId)> {
+        let top = self.authoritative_top()?;
+        let lo = if self.page.has_more {
+            self.covered?.oldest
+        } else {
+            MIN_ID
+        };
+        Some((lo, top))
+    }
+}
+
+/// What a history call asked for.
+#[derive(Clone, Copy, Debug)]
+struct HistoryReq {
+    dir: HistoryDir,
+    query: HistoryQuery,
+    floor: Option<MsgId>,
 }
 
 impl<B: Backend> Actor<B> {
@@ -70,6 +141,7 @@ impl<B: Backend> Actor<B> {
         let err = call_error(&done.outcome).filter(|_| current);
         match done.outcome {
             Outcome::Send { local_id, res } => self.on_send(local_id, res).await,
+            Outcome::SendExpired { local_id } => self.send_window_closed(local_id).await,
             _ if !current => {}
             Outcome::Dialogs { step, res } => {
                 self.on_dialogs(step, res).await;
@@ -78,49 +150,62 @@ impl<B: Backend> Actor<B> {
                 }
             }
             Outcome::History {
-                chat,
-                view,
+                load,
                 dir,
                 query,
+                floor,
                 res,
-            } => self.on_history_done(chat, view, dir, query, res).await,
+            } => {
+                let req = HistoryReq { dir, query, floor };
+                self.on_history_done(load, req, res).await;
+            }
             // Read marks are best effort; the next read covers a lost one.
             Outcome::Read(_) | Outcome::UpdatesEnded(StreamEnd::Cancelled) => {}
             Outcome::CacheChats(chats) => self.on_cache_chats(chats).await,
             Outcome::CacheHistory {
-                chat,
-                view,
+                load,
                 dir,
                 anchor,
                 messages,
-            } => {
-                self.on_cache_history(chat, view, dir, anchor, messages)
-                    .await;
-            }
-            Outcome::UpdatesEnded(StreamEnd::Failed(_)) => {
-                self.rebuild(Reason::StreamFailed).await;
-            }
+            } => self.on_cache_history(load, dir, anchor, messages).await,
+            Outcome::UpdatesEnded(StreamEnd::Failed(e)) => self.on_stream_failed(e).await,
         }
         if let Some(e) = err {
             self.inspect_call(e).await;
         }
     }
 
-    async fn on_history_done(
-        &mut self,
-        chat: ChatId,
-        view: ViewGen,
-        dir: HistoryDir,
-        query: HistoryQuery,
-        res: CallResult<HistoryPage>,
-    ) {
+    /// The update stream ended for good: auth loss runs the local logout,
+    /// migration the migration policy, anything else a rebuild.
+    async fn on_stream_failed(&mut self, e: StreamError) {
+        match e {
+            StreamError::Unauthorized => self.session_revoked().await,
+            StreamError::Migrated => {
+                self.error(UserError::AccountMigrated).await;
+                self.rebuild(Reason::Migrated).await;
+            }
+            StreamError::Transient | StreamError::Fatal => {
+                self.rebuild(Reason::StreamFailed).await;
+            }
+        }
+    }
+
+    /// A finished history call. A tail that is its chat's boot snapshot
+    /// completes the snapshot whether or not its view is still current.
+    async fn on_history_done(&mut self, load: Load, req: HistoryReq, res: CallResult<HistoryPage>) {
         let boot = self
             .boot
             .as_ref()
-            .filter(|b| dir == HistoryDir::Tail && b.awaits_tail(chat))
-            .filter(|_| self.history_busy.get(&chat) == Some(&view))
+            .filter(|b| req.dir == HistoryDir::Tail && b.awaits_tail(load))
             .map(|b| b.kind);
-        self.release_history(chat, view);
+        self.release_history(load);
+        // Whatever the outcome or the view, the load's metadata goes now: a
+        // stale reply must not leave a covering fetch or an owed answer
+        // behind (task 10f).
+        let ended = LoadEnd {
+            cover_fetch: self.covers.fetch_ended(load.chat, load.req),
+            owed: self.take_owed(load),
+        };
         match res {
             Ok(page) => {
                 let mode = if boot == Some(BootKind::Refresh) {
@@ -129,26 +214,42 @@ impl<B: Backend> Actor<B> {
                     TailMode::Replace
                 };
                 let reply = HistoryReply {
-                    chat,
-                    view,
-                    dir,
-                    query,
+                    chat: load.chat,
+                    view: load.view,
+                    req: load.req,
+                    dir: req.dir,
+                    query: req.query,
+                    floor: req.floor,
+                    covered: Coverage::of(&page),
                     page,
                     mode,
                 };
-                self.on_history(reply).await;
+                self.on_history(reply, ended).await;
             }
-            Err(e) => self.error(user_error(e)).await,
+            Err(e) => {
+                self.error(user_error(e)).await;
+                // Only the load the UI waits on ends: never a tail (a load
+                // deferred behind it still runs), a background fetch, or a
+                // load of a view the UI no longer shows.
+                if ended.owed.is_some() {
+                    self.history_ended(load.chat, req.dir, Some(user_error(e)))
+                        .await;
+                }
+            }
         }
         if boot.is_some() {
-            self.snapshot_done(Snapshot::Tail(chat)).await;
+            self.snapshot_done(Snapshot::Tail(load)).await;
         }
     }
 
-    /// Ends the single-flight history load for `chat` if it belongs to `view`.
-    pub(super) fn release_history(&mut self, chat: ChatId, view: ViewGen) {
-        if self.history_busy.get(&chat) == Some(&view) {
-            self.history_busy.remove(&chat);
+    /// Ends the single-flight history load of its chat if it is `load`.
+    pub(super) fn release_history(&mut self, load: Load) {
+        if self
+            .history_busy
+            .get(&load.chat)
+            .is_some_and(|l| l.req == load.req)
+        {
+            self.history_busy.remove(&load.chat);
         }
     }
 
@@ -162,27 +263,33 @@ impl<B: Backend> Actor<B> {
         self.dialogs_busy = false;
         match res {
             Ok(DialogsPage { chats, next }) => {
+                let rest = if next.is_some() {
+                    Rest::More
+                } else {
+                    Rest::Last
+                };
                 let event = match step {
                     DialogsStep::First => {
                         if let Some(boot) = self.boot.as_mut() {
                             boot.note_dialogs(&chats);
                         }
-                        let rest = if next.is_some() {
-                            Rest::More
-                        } else {
-                            Rest::Last
-                        };
-                        let kept = self.dialogs.merge_first_page(chats, rest);
-                        // Chats kept from later server pages: loading continues
-                        // after them, so the cursor stays where it was.
-                        if kept == 0 || !self.dialogs_loaded {
-                            self.dialogs_next = next;
-                        }
+                        // Chats kept from later pages stay provisionally, but
+                        // pagination restarts from the fresh cursor: a chat
+                        // that appeared below the first page meanwhile is only
+                        // found by walking forward again (later pages confirm
+                        // the kept rows, and admit new ones in server order).
+                        self.dialogs.merge_first_page(chats, rest);
+                        self.dialogs_next = next;
                         Event::DialogsReset(self.dialogs.as_slice().to_vec())
                     }
                     DialogsStep::Next => {
                         self.dialogs_next = next;
-                        Event::DialogsAppended(self.dialogs.append(chats))
+                        let page = self.dialogs.append(chats, rest);
+                        if page.reordered {
+                            Event::DialogsReset(self.dialogs.as_slice().to_vec())
+                        } else {
+                            Event::DialogsAppended(page.changed)
+                        }
                     }
                 };
                 // `PutChats` replaces the cached list, so it always gets the whole list.
@@ -192,8 +299,14 @@ impl<B: Backend> Actor<B> {
                 }
                 self.dialogs_loaded = true;
                 self.emit(event).await;
+                let has_more = self.dialogs_next.is_some();
+                self.emit(Event::DialogsPaging { has_more }).await;
             }
-            Err(e) => self.error(user_error(e)).await,
+            Err(e) => {
+                self.error(user_error(e)).await;
+                self.load_ended(LoadTarget::Dialogs, Some(user_error(e)))
+                    .await;
+            }
         }
         if std::mem::take(&mut self.dialogs_queued) {
             self.load_dialogs().await;
@@ -248,50 +361,87 @@ impl<B: Backend> Actor<B> {
         .await;
     }
 
+    fn is_current(&self, chat: ChatId, view: ViewGen) -> bool {
+        self.windows.get(chat).is_some_and(|w| w.view_gen() == view)
+    }
+
     async fn on_cache_history(
         &mut self,
-        chat: ChatId,
-        view: ViewGen,
+        load: Load,
         dir: HistoryDir,
         anchor: Option<MsgId>,
         messages: Option<Vec<Message>>,
     ) {
         let messages = messages.unwrap_or_default();
         if dir == HistoryDir::Tail {
-            return self.on_cache_tail(chat, view, messages).await;
+            return self.on_cache_tail(load, messages).await;
         }
-        self.release_history(chat, view);
+        self.release_history(load);
+        let owed = self.take_owed(load);
+        let Load { chat, view, .. } = load;
         let Some(anchor) = anchor else { return };
-        if messages.is_empty() {
-            // The cache ran out; continue from the server.
-            if self.windows.get(chat).is_some_and(|w| w.view_gen() == view) {
-                self.history_busy.insert(chat, view);
-                self.fetch_more(chat, view, dir, anchor).await;
+        if !self.is_current(chat, view) {
+            return;
+        }
+        // The window's oldest end moved while the cache was read (see
+        // `on_older`); a newer read needs no such check, since nothing but a
+        // deletion changes a detached window's newest end.
+        if dir == HistoryDir::Older && !self.starts_at(chat, anchor) {
+            if let Some(owed) = owed {
+                self.restart_older(owed).await;
             }
             return;
         }
-        // Older: the cache never proves the start of history, so the server
-        // decides. Newer: a short page means the cache reached its newest row.
-        let has_more =
-            dir == HistoryDir::Older || u32::try_from(messages.len()).is_ok_and(|n| n >= PAGE);
-        let page = HistoryPage { messages, has_more };
+        // Only the server establishes either end of history: the cache never
+        // proves the start, and a short newer page only means the cache ends
+        // there (live messages may be missing from it), not that the live
+        // tail is reached. So both stay open, and a short newer page
+        // continues from the server.
+        let short = match dir {
+            HistoryDir::Older => messages.is_empty(),
+            _ => u32::try_from(messages.len()).map_or(true, |n| n < PAGE),
+        };
+        let page = HistoryPage {
+            messages,
+            has_more: true,
+        };
         let res = match dir {
             HistoryDir::Older => self.windows.prepend(chat, view, page),
             _ => self.windows.append_newer(chat, view, page),
         };
-        if let Ok(change) = res {
+        let mut owed = owed;
+        if let Ok(change) = res
+            && !(short && change.inserted.is_empty())
+        {
             self.emit_history(chat, view, dir, change).await;
+            owed = None; // answered
         }
+        if !short {
+            return;
+        }
+        // The cache ran out; continue from the server at the new edge. The
+        // continuation answers the UI only if the cache page did not.
+        let edge = self.windows.get(chat).and_then(|w| match dir {
+            HistoryDir::Older => w.messages().front(),
+            _ => w.messages().back(),
+        });
+        let edge = edge.map_or(anchor, |m| m.id);
+        let load = self.begin_load(chat, view);
+        if let Some(owed) = owed {
+            self.owe(load, dir, owed.restarts);
+        }
+        self.fetch_more(load, dir, edge).await;
     }
 
     /// Shows cached history, then asks the server for the tail. The server request
     /// is chained after the cache read so `on_tail` always sees what the cache held.
-    async fn on_cache_tail(&mut self, chat: ChatId, view: ViewGen, messages: Vec<Message>) {
-        let snapshot = self.is_tail_snapshot(chat, view);
-        if self.windows.get(chat).is_none_or(|w| w.view_gen() != view) {
-            self.release_history(chat, view);
+    async fn on_cache_tail(&mut self, load: Load, messages: Vec<Message>) {
+        let snapshot = self.is_tail_snapshot(load);
+        let Load { chat, view, .. } = load;
+        if !self.is_current(chat, view) {
+            self.release_history(load);
             if snapshot {
-                self.snapshot_done(Snapshot::Tail(chat)).await;
+                self.snapshot_done(Snapshot::Tail(load)).await;
             }
             return;
         }
@@ -306,14 +456,12 @@ impl<B: Backend> Actor<B> {
             self.emit_history(chat, view, HistoryDir::Tail, change)
                 .await;
         }
-        if snapshot {
-            self.push_tail_snapshot(chat, view);
-        } else {
-            self.request_tail(chat, view).await;
-        }
+        self.start_tail(load, TailVia::Server).await;
     }
 
-    async fn on_history(&mut self, mut p: HistoryReply) {
+    /// A server page; `ended` says what its load was (its bookkeeping is
+    /// already cleared, so a stale page leaves nothing behind).
+    async fn on_history(&mut self, mut p: HistoryReply, ended: LoadEnd) {
         if self
             .windows
             .get(p.chat)
@@ -328,32 +476,19 @@ impl<B: Backend> Actor<B> {
         match p.dir {
             HistoryDir::Tail if p.mode == TailMode::Merge => self.merge_tail(p).await,
             HistoryDir::Tail => self.on_tail(p).await,
-            HistoryDir::Older => {
-                let hi = match p.query {
-                    HistoryQuery::Before(id) => MsgId(id.0.saturating_sub(1)),
-                    _ => MAX_ID,
-                };
-                let lo = if p.page.has_more {
-                    p.page.messages.first().map_or(hi, |m| m.id)
-                } else {
-                    MIN_ID
-                };
-                self.reconcile(p.chat, lo, hi, &p.page.messages).await;
-                if let Ok(change) = self.windows.prepend(p.chat, p.view, p.page) {
-                    self.emit_history(p.chat, p.view, p.dir, change).await;
-                }
-            }
+            HistoryDir::Older => self.on_older(p, ended).await,
             HistoryDir::Newer => {
                 let lo = match p.query {
                     HistoryQuery::After(id) => MsgId(id.0.saturating_add(1)),
                     _ => MIN_ID,
                 };
-                let hi = if p.page.has_more {
-                    p.page.messages.last().map_or(lo, |m| m.id)
-                } else {
-                    MAX_ID
+                let hi = match (p.page.has_more, p.covered) {
+                    (false, _) => Some(MAX_ID),
+                    (true, covered) => covered.map(|c| c.newest),
                 };
-                self.reconcile(p.chat, lo, hi, &p.page.messages).await;
+                if let Some(hi) = hi {
+                    self.reconcile(p.chat, lo, hi, &p.page.messages).await;
+                }
                 if let Ok(change) = self.windows.append_newer(p.chat, p.view, p.page) {
                     self.emit_history(p.chat, p.view, p.dir, change).await;
                 }
@@ -361,9 +496,66 @@ impl<B: Backend> Actor<B> {
         }
     }
 
+    /// A page of history older than the window, asked as `Before(edge)`
+    /// when `edge` was the window's oldest message. It is applied only if
+    /// `edge` still is: live messages may have trimmed the window's oldest
+    /// end meanwhile (and deletions made room again), and the page would
+    /// then leave a hole above it that coverage could span (task 10e). A
+    /// page that no longer continues the window is dropped; the user's load
+    /// it answered (its own, or one a covering fetch absorbed) starts over
+    /// from the window's current edge, a bounded number of times
+    /// (`loads::restart_older`).
+    async fn on_older(&mut self, p: HistoryReply, ended: LoadEnd) {
+        let hi = match p.query {
+            HistoryQuery::Before(id) => MsgId(id.0.saturating_sub(1)),
+            _ => MAX_ID,
+        };
+        // A partial page is authoritative from the oldest id the server
+        // sent, even when tombstones emptied it.
+        let lo = match (p.page.has_more, p.covered) {
+            (false, _) => Some(MIN_ID),
+            (true, covered) => covered.map(|c| c.oldest),
+        };
+        if let Some(lo) = lo {
+            self.reconcile(p.chat, lo, hi, &p.page.messages).await;
+        }
+        let edge = match p.query {
+            HistoryQuery::Before(edge) => Some(edge),
+            _ => None,
+        };
+        if edge.is_some_and(|edge| !self.starts_at(p.chat, edge)) {
+            tracing::debug!("older page no longer continues the window");
+            if let Some(owed) = ended.owed {
+                self.restart_older(owed).await;
+            }
+            return;
+        }
+        // A page core fetched on its own never drops a message.
+        let applied = if ended.cover_fetch {
+            self.windows.prepend_fitting(p.chat, p.view, p.page)
+        } else {
+            self.windows.prepend(p.chat, p.view, p.page)
+        };
+        if let Ok(change) = applied {
+            self.emit_history(p.chat, p.view, p.dir, change).await;
+        }
+        if let Some(edge) = edge {
+            self.older_covers(p.chat, p.view, edge, lo).await;
+        }
+    }
+
+    /// Whether `chat`'s window still starts at `edge`, the oldest message
+    /// it held when an older page was asked for.
+    fn starts_at(&self, chat: ChatId, edge: MsgId) -> bool {
+        self.windows
+            .get(chat)
+            .and_then(|w| w.messages().front())
+            .is_some_and(|m| m.id == edge)
+    }
+
     /// Writes a server page over `[lo, hi]` of a contiguous cache.
     pub(super) async fn reconcile(&self, chat: ChatId, lo: MsgId, hi: MsgId, page: &[Message]) {
-        if self.contiguous.contains(&chat) && lo <= hi {
+        if self.windows.is_cache_contiguous(chat) && lo <= hi {
             self.cache_write(CacheCmd::Reconcile {
                 chat,
                 lo,
@@ -380,36 +572,77 @@ impl<B: Backend> Actor<B> {
     /// covered range is reconciled. Otherwise there may be a gap, so the chat's
     /// cache is replaced by the page. The cache worker decides, against what the
     /// cache holds: a rebuild may have invalidated the window. Either way the
-    /// cache is then contiguous with the live tail for the rest of the session.
+    /// cache is then contiguous with the live tail for the window's lifetime.
+    ///
+    /// Window messages up to [`HistoryReply::authoritative_top`] are replaced
+    /// by the page, so cached or stale messages the server no longer has go,
+    /// including the newest ones and everything when the server's history is
+    /// empty. Only messages newer than that (live updates that arrived after
+    /// the request) are kept on top.
     pub(super) async fn on_tail(&mut self, p: HistoryReply) {
-        let HistoryReply { chat, mut page, .. } = p;
+        let top = p.authoritative_top();
+        let range = p.authoritative_range();
+        let HistoryReply {
+            chat,
+            req,
+            mut page,
+            ..
+        } = p;
         let Some(w) = self.windows.get(chat) else {
             return;
         };
-        let page_max = page.messages.last().map(|m| m.id);
-        // Live messages that arrived after the request was served.
         let late = w
             .messages()
             .iter()
-            .filter(|m| page_max.is_none_or(|max| m.id > max))
+            .filter(|m| top.is_none_or(|t| m.id > t))
             .cloned();
         page.messages.extend(late);
-        if self.cache.is_some() {
-            self.contiguous.insert(chat);
+        // The cache is reconciled from the page's covered start (not from the
+        // first message tombstones left), or from the start of history when
+        // the page is all of it. A partial page that covered nothing proves
+        // nothing: the cache is left alone and is not contiguous.
+        let from = match (page.has_more, range) {
+            (false, _) => Some(None),
+            (true, Some((lo, _))) => Some(Some(lo)),
+            (true, None) => None,
+        };
+        if self.cache.is_some()
+            && let Some(from) = from
+        {
             self.cache_write(CacheCmd::ReconcileTail {
                 chat,
                 messages: page.messages.clone(),
-                has_more: page.has_more,
+                from,
             })
             .await;
         }
         let Some(view) = self.windows.invalidate(chat) else {
             return;
         };
+        // Loads deferred for the replaced view are over with it: the UI
+        // forgets them on the new view's `Tail` and asks again if needed.
+        self.deferred.retain(|d| d.chat != chat);
+        self.forget_owed(chat);
+        if self.cache.is_some() && from.is_some() {
+            self.windows.set_cache_contiguous(chat);
+        }
         if let Ok(change) = self.windows.prepend(chat, view, page) {
             self.emit_history(chat, view, HistoryDir::Tail, change)
                 .await;
         }
+        self.emit_reconciled(chat, view).await;
+        self.tail_covers(chat, view, req, range.map(|(lo, _)| lo))
+            .await;
+    }
+
+    /// Tells the UI that `view` of `chat` now matches the server's tail.
+    pub(super) async fn emit_reconciled(&self, chat: ChatId, view: ViewGen) {
+        let newest = self
+            .windows
+            .get(chat)
+            .and_then(|w| w.messages().back())
+            .map(|m| m.id);
+        self.emit(Event::Reconciled { chat, view, newest }).await;
     }
 
     /// Whether the window already holds a newer copy of `m` (a later edit), which
@@ -447,6 +680,7 @@ impl<B: Backend> Actor<B> {
                     self.emit(Event::ChatBumped(summary)).await;
                 }
             }
+            Update::MessageId { random_id, id } => self.on_message_id(random_id, id).await,
         }
     }
 
@@ -456,52 +690,58 @@ impl<B: Backend> Actor<B> {
         if self.has_newer_copy(&m) || !self.windows.replace(m.clone()) {
             return;
         }
-        if self.contiguous.contains(&chat) {
+        if self.windows.is_cache_contiguous(chat) {
             self.cache_write(CacheCmd::PutMessages(chat, vec![m.clone()]))
                 .await;
         }
         self.emit(Event::Edited(m)).await;
     }
 
+    /// Whether the user is looking at `chat`'s live tail right now: the
+    /// window is active, the UI reports this chat's tail on screen, and the
+    /// window holds the tail. Only then does a new message not count as unread.
+    fn tail_visible(&self, chat: ChatId) -> bool {
+        self.window == WindowState::Active
+            && self.viewing == Some(chat)
+            && self.open == Some(chat)
+            && self.windows.get(chat).is_some_and(|w| !w.has_newer())
+    }
+
     async fn on_new_message(&mut self, m: Message, origin: Origin<'_>) {
         let chat = m.thread.chat;
-        let window = self
-            .windows
-            .get(chat)
-            .map(|w| (w.view_gen(), !w.has_newer()));
-        let attached = self.open == Some(chat) && window.is_some_and(|(_, attached)| attached);
-        let unread = if m.outgoing || attached {
+        let unread = if m.outgoing || self.tail_visible(chat) {
             Unread::Unchanged
         } else {
             Unread::Increment
         };
-        // A replayed message the dialogs snapshot already reflects must not bump
-        // the chat again (and count as unread twice).
+        // A replayed message the dialogs snapshot already reflects (by top
+        // message id, not by timestamp) must not bump the chat again and count
+        // as unread twice. `Dialogs::bump` applies the same rule live.
         let reflected = match origin {
             Origin::Live => false,
-            Origin::Replay(dates) => dates.get(&chat).is_some_and(|d| *d >= m.date),
+            Origin::Replay(tops) => tops.get(&chat).is_some_and(|top| *top >= m.id),
         };
-        if !reflected
-            && let Bump::Updated(summary) = self.dialogs.bump(chat, Preview::of(&m), m.date, unread)
+        if !reflected && let Bump::Updated(summary) = self.dialogs.bump(chat, Last::of(&m), unread)
         {
             self.emit(Event::ChatBumped(summary)).await;
         }
-        let Some((view, _)) = window else { return };
+        let Some(view) = self.windows.get(chat).map(Window::view_gen) else {
+            return;
+        };
         if self.has_newer_copy(&m) {
             return;
         }
-        let id = m.id;
-        let change = self.windows.upsert(m);
-        if !change.inserted.contains(&id) {
-            return;
-        }
-        if self.contiguous.contains(&chat)
-            && let Some(stored) = self.windows.get(chat).and_then(|w| w.get(id)).cloned()
-        {
-            self.cache_write(CacheCmd::PutMessages(chat, vec![stored]))
+        // Written through even when a detached window does not take it, so a
+        // contiguous cache keeps reaching the live tail.
+        if self.windows.is_cache_contiguous(chat) {
+            self.cache_write(CacheCmd::PutMessages(chat, vec![m.clone()]))
                 .await;
         }
-        self.emit_history(chat, view, HistoryDir::Newer, change)
-            .await;
+        let id = m.id;
+        let change = self.windows.upsert(m);
+        if change.inserted.contains(&id) {
+            self.emit_history(chat, view, HistoryDir::Newer, change)
+                .await;
+        }
     }
 }

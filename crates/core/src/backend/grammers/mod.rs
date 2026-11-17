@@ -13,35 +13,17 @@
 //! error names and codes, counts and ids, never a TL value: no `Debug` of a
 //! request, response, peer or update, which could carry text or a phone.
 //!
-//! # TODO(task 6b): auth
+//! # Auth (task 6b)
 //!
-//! Task 6 added the auth methods to [`Client`] and the state machine in core.
-//! Here they are stubs: every one answers `Rejected` (so a stored session
-//! still starts as signed in, and a login attempt fails visibly). Over a built
-//! instance they map onto grammers as follows (plan section 4):
-//! - `is_authorized` → `Client::is_authorized` (`auth.rs:105-111`).
-//! - `request_login_code(phone)` → `Client::request_login_code(phone, api_hash)`
-//!   (handles `303` itself); needs the `api_hash`, which this backend does not
-//!   hold yet (only `api_id`).
-//! - `sign_in(token, code)` → `Client::sign_in`; `PasswordRequired`,
-//!   `InvalidCode` (includes `PHONE_CODE_EXPIRED`), `SignUpRequired`.
-//! - `check_password(token, pw)` → `Client::check_password` with the password
-//!   bytes as a slice; contains the `current_algo.clone().unwrap()` panic site.
-//! - `refetch_password_token` → raw `account.getPassword` +
-//!   `PasswordToken::new`.
-//! - `fetch_self` (ambiguous completion) → raw `users.getUsers([inputUserSelf])`,
-//!   then `session.cache_peer(is_self: Some(true))` and `session.barrier()`.
-//! - `sign_out` → `Client::sign_out` with the runner alive.
-//! - Auth calls use [`invoke::RetryClass::Never`]; their RPC errors need typed
-//!   mapping (`PHONE_NUMBER_INVALID`, `PHONE_NUMBER_BANNED`, `API_ID_INVALID`,
-//!   `API_ID_PUBLISHED_FLOOD`) beyond [`BackendError`].
-//! - `BackendError::Unauthorized` (`AUTH_KEY_UNREGISTERED`, `SESSION_REVOKED`,
-//!   any `401`) must run the local part of logout in core; today core maps it
-//!   to `UserError::Rejected`.
-//! - Until then, an instance built from a logged-out session never reports a
-//!   baseline (grammers skips `getState` without a self user), so core would
-//!   rebuild it every 10 s: core must not bootstrap while logged out.
+//! The login calls run over raw TL in [`auth`] (plan sections 4 and 17.2a):
+//! `auth.sendCode` keeping the full `auth.SentCode` with the instance's
+//! `api_hash`, `auth.resendCode`, `auth.signIn`, `auth.checkPassword` with an
+//! `account.getPassword` refetch, `users.getUsers([inputUserSelf])` for the
+//! self user, and `auth.logOut`. All use [`invoke::RetryClass::Never`].
+//! A build waits for the [`CredentialSlot`] to hold a pair, so no instance
+//! exists without credentials; core never bootstraps while signed out.
 
+mod auth;
 mod calls;
 mod errors;
 mod invoke;
@@ -51,7 +33,6 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-use std::future::{Future, ready};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -60,18 +41,18 @@ use grammers_client::sender::{
     ConnectionParams, NoRetries, SenderPool, SenderPoolHandle, UpdatesConfiguration,
 };
 
+pub use auth::{GrammersLoginToken, GrammersPasswordToken};
 pub use stream::GrammersUpdates;
 
 use super::{
-    Account, AuthError, Backend, BackendError, CheckPassword, Client, DialogsCursor, DialogsPage,
-    HistoryPage, HistoryQuery, Instance, InstanceControl, PasswordChallenge, Seed, SessionSeed,
-    SessionSnapshot, SignIn,
+    Account, AuthError, Backend, BackendError, CheckPassword, Client, CodeRequest, CredentialSlot,
+    DialogsCursor, DialogsPage, HistoryPage, HistoryQuery, Instance, InstanceControl,
+    PasswordChallenge, Seed, SessionSeed, SessionSnapshot, SignIn,
 };
-use crate::api::PasswordBuf;
+use crate::api::{ApiCredentials, PasswordBuf};
 use crate::model::{ChatId, MsgId};
 use crate::session::{AbyssSession, PersistHandle};
 use calls::Calls;
-use pins::Pins;
 
 /// Update channel between the runner and the stream (plan section 2; grammers'
 /// default is 100).
@@ -90,9 +71,10 @@ fn connection_params() -> ConnectionParams {
     }
 }
 
-/// Builds grammers client instances for one Telegram application id.
+/// Builds grammers client instances for the API credentials in its slot.
 pub struct GrammersBackend {
-    api_id: i32,
+    /// The pair in use; each build takes the current one.
+    slot: CredentialSlot,
     /// Loads the persisted session for `SessionSeed::Stored` when core has
     /// not provided the account (`use_account`).
     persist: PersistHandle,
@@ -107,9 +89,9 @@ impl std::fmt::Debug for GrammersBackend {
 }
 
 impl GrammersBackend {
-    pub fn new(api_id: i32, persist: PersistHandle) -> Self {
+    pub fn new(slot: CredentialSlot, persist: PersistHandle) -> Self {
         Self {
-            api_id,
+            slot,
             persist,
             account: std::sync::Mutex::new(None),
         }
@@ -153,21 +135,27 @@ impl Backend for GrammersBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(account);
     }
 
+    fn credentials(&self) -> &CredentialSlot {
+        &self.slot
+    }
+
     async fn build(&self, seed: Seed) -> Result<Instance<Self>, BackendError> {
+        // The retired instance's pins (core's last required set) arrive in
+        // the snapshot and stay pinned until core's first `retain_peers` on
+        // this instance.
+        let creds = self.slot.wait().await;
         let snapshot = self.snapshot(seed.session).await;
-        // The retired instance's pins (its dialogs, open chats and sends)
-        // stay pinned here until newer dialogs push them out.
-        let pins = Pins::new(
-            seed.peers.as_slice(),
-            snapshot.carried.iter().filter_map(map::info_chat),
-        );
         let session =
             Arc::new(AbyssSession::from_snapshot(snapshot).map_err(|_| BackendError::Transient)?);
         let SenderPool {
             runner,
             handle,
             updates,
-        } = SenderPool::with_configuration(Arc::clone(&session), self.api_id, connection_params());
+        } = SenderPool::with_configuration(
+            Arc::clone(&session),
+            creds.api_id.get(),
+            connection_params(),
+        );
         let client = grammers_client::Client::with_configuration(
             handle.clone(),
             ClientConfiguration {
@@ -179,7 +167,11 @@ impl Backend for GrammersBackend {
             .await
             .map_err(|_| BackendError::Transient)?;
         Ok(Instance {
-            client: GrammersClient(Calls::new(client, Arc::clone(&session), pins)),
+            client: GrammersClient {
+                calls: Calls::new(client, Arc::clone(&session)),
+                creds,
+                pool: handle.thin.clone(),
+            },
             updates: GrammersUpdates::new(stream, session.baseline_established()),
             runner: Box::pin(runner.run()),
             control: GrammersControl {
@@ -191,65 +183,83 @@ impl Backend for GrammersBackend {
 }
 
 /// Calls of one grammers instance.
-#[derive(Debug)]
-pub struct GrammersClient(Calls<grammers_client::Client>);
+pub struct GrammersClient {
+    calls: Calls<grammers_client::Client>,
+    /// The pair this instance was built with (`auth.sendCode` needs the hash).
+    creds: Arc<ApiCredentials>,
+    /// For a login-time `303`: cull the old DC's connection.
+    pool: SenderPoolHandle,
+}
 
-/// Stub login token (task 6b: grammers `LoginToken` plus the full `SentCode`).
-#[derive(Debug)]
-pub struct GrammersLoginToken(());
-
-/// Stub password token (task 6b: grammers `PasswordToken`).
-#[derive(Debug)]
-pub struct GrammersPasswordToken(());
-
-/// Every auth call until task 6b.
-const AUTH_STUB: AuthError = AuthError::Backend(BackendError::Rejected);
+impl std::fmt::Debug for GrammersClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrammersClient").finish_non_exhaustive()
+    }
+}
 
 impl Client for GrammersClient {
     type LoginToken = GrammersLoginToken;
     type PasswordToken = GrammersPasswordToken;
 
-    fn is_authorized(&self) -> impl Future<Output = Result<bool, BackendError>> + Send {
-        ready(Err(BackendError::Rejected))
+    async fn is_authorized(&self) -> Result<bool, BackendError> {
+        auth::is_authorized(self.calls.invoker()).await
     }
 
-    fn request_login_code(
+    async fn request_login_code(
         &self,
-        _phone: &str,
-    ) -> impl Future<Output = Result<GrammersLoginToken, AuthError>> + Send {
-        ready(Err(AUTH_STUB))
+        phone: &str,
+    ) -> Result<CodeRequest<GrammersLoginToken>, AuthError> {
+        let pool = &self.pool;
+        let disconnect = |dc| {
+            pool.disconnect_from_dc(dc);
+        };
+        let session = self.calls.session();
+        auth::send_code(
+            self.calls.invoker(),
+            session,
+            &self.creds,
+            phone,
+            disconnect,
+        )
+        .await
     }
 
-    fn sign_in(
+    async fn resend_login_code(
         &self,
-        _token: &GrammersLoginToken,
-        _code: &str,
-    ) -> impl Future<Output = Result<SignIn<GrammersPasswordToken>, AuthError>> + Send {
-        ready(Err(AUTH_STUB))
+        token: &GrammersLoginToken,
+    ) -> Result<CodeRequest<GrammersLoginToken>, AuthError> {
+        auth::resend_code(self.calls.invoker(), token).await
     }
 
-    fn check_password(
+    async fn sign_in(
         &self,
-        _token: GrammersPasswordToken,
+        token: &GrammersLoginToken,
+        code: &str,
+    ) -> Result<SignIn<GrammersPasswordToken>, AuthError> {
+        auth::sign_in(self.calls.invoker(), self.calls.session(), token, code).await
+    }
+
+    async fn check_password(
+        &self,
+        token: GrammersPasswordToken,
         password: PasswordBuf,
-    ) -> impl Future<Output = Result<CheckPassword<GrammersPasswordToken>, AuthError>> + Send {
-        drop(password);
-        ready(Err(AUTH_STUB))
+    ) -> Result<CheckPassword<GrammersPasswordToken>, AuthError> {
+        let session = self.calls.session();
+        auth::check_password(self.calls.invoker(), session, token, password).await
     }
 
-    fn password_challenge(
+    async fn password_challenge(
         &self,
-    ) -> impl Future<Output = Result<PasswordChallenge<GrammersPasswordToken>, AuthError>> + Send
-    {
-        ready(Err(AUTH_STUB))
+    ) -> Result<PasswordChallenge<GrammersPasswordToken>, AuthError> {
+        auth::password_challenge(self.calls.invoker()).await
     }
 
-    fn fetch_self(&self) -> impl Future<Output = Result<Account, BackendError>> + Send {
-        ready(Err(BackendError::Rejected))
+    async fn fetch_self(&self) -> Result<Account, BackendError> {
+        auth::fetch_self(self.calls.invoker(), self.calls.session()).await
     }
 
-    fn sign_out(&self) -> impl Future<Output = Result<(), BackendError>> + Send {
-        ready(Err(BackendError::Rejected))
+    async fn sign_out(&self) -> Result<(), BackendError> {
+        auth::sign_out(self.calls.invoker()).await
     }
 
     async fn dialogs(
@@ -257,7 +267,7 @@ impl Client for GrammersClient {
         cursor: Option<DialogsCursor>,
         limit: u32,
     ) -> Result<DialogsPage, BackendError> {
-        self.0.dialogs(cursor, limit).await
+        self.calls.dialogs(cursor, limit).await
     }
 
     async fn history(
@@ -266,7 +276,7 @@ impl Client for GrammersClient {
         query: HistoryQuery,
         limit: u32,
     ) -> Result<HistoryPage, BackendError> {
-        self.0.history(chat, query, limit).await
+        self.calls.history(chat, query, limit).await
     }
 
     async fn send_text(
@@ -275,11 +285,15 @@ impl Client for GrammersClient {
         text: String,
         random_id: i64,
     ) -> Result<MsgId, BackendError> {
-        self.0.send_text(chat, text, random_id).await
+        self.calls.send_text(chat, text, random_id).await
     }
 
     async fn read_history(&self, chat: ChatId, max_id: MsgId) -> Result<(), BackendError> {
-        self.0.read_history(chat, max_id).await
+        self.calls.read_history(chat, max_id).await
+    }
+
+    fn retain_peers(&self, required: &[ChatId]) {
+        self.calls.retain(required);
     }
 }
 

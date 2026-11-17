@@ -1,6 +1,7 @@
-//! The password's only plaintext home: a fixed-capacity buffer that never
-//! reallocates, edited in place, wiped on submit, cancel and drop (plan
-//! section 10). No GPUI here, so it is unit-tested directly.
+//! A masked secret's only plaintext home (the 2FA password, the `api_hash`):
+//! a fixed-capacity buffer that never reallocates, edited in place, wiped on
+//! submit, cancel and drop (plan section 10). No GPUI here, so it is
+//! unit-tested directly.
 //!
 //! Positions are in chars. The field displays one `•` per char and `•` is one
 //! UTF-16 unit, so a char index is also the UTF-16 offset the platform sees
@@ -20,10 +21,41 @@ pub(crate) const BULLET: char = '•';
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Overflow;
 
+/// What a secret field accepts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Filter {
+    /// Any non-control char, up to [`SECRET_CAPACITY`] bytes.
+    #[default]
+    Password,
+    /// ASCII hex digits, at most [`API_HASH_LEN`] (a pasted hash loses its
+    /// spaces, quotes and line breaks).
+    ApiHash,
+}
+
+/// Length of an `api_hash` in hex digits.
+pub(crate) const API_HASH_LEN: usize = 32;
+
+impl Filter {
+    fn admits(self, ch: char) -> bool {
+        match self {
+            Self::Password => !ch.is_control(),
+            Self::ApiHash => ch.is_ascii_hexdigit(),
+        }
+    }
+
+    fn max_chars(self) -> usize {
+        match self {
+            Self::Password => SECRET_CAPACITY,
+            Self::ApiHash => API_HASH_LEN,
+        }
+    }
+}
+
 pub(crate) struct SecretBuf {
     bytes: Box<[u8; SECRET_CAPACITY]>,
     /// Bytes in use; always a valid UTF-8 prefix.
     len: usize,
+    filter: Filter,
 }
 
 impl std::fmt::Debug for SecretBuf {
@@ -38,17 +70,16 @@ impl Default for SecretBuf {
     }
 }
 
-/// Characters a password may contain: no control characters (line breaks from
-/// a paste, escape sequences).
-fn admit(ch: char) -> bool {
-    !ch.is_control()
-}
-
 impl SecretBuf {
     pub(crate) fn new() -> Self {
+        Self::with_filter(Filter::Password)
+    }
+
+    pub(crate) fn with_filter(filter: Filter) -> Self {
         Self {
             bytes: Box::new([0; SECRET_CAPACITY]),
             len: 0,
+            filter,
         }
     }
 
@@ -78,18 +109,25 @@ impl SecretBuf {
     /// place. Returns the number of chars inserted. An edit that would not fit
     /// changes nothing.
     pub(crate) fn replace(&mut self, range: &Range<usize>, text: &str) -> Result<usize, Overflow> {
+        let filter = self.filter;
+        let admit = |ch: &char| filter.admits(*ch);
         let start = self.byte_offset(range.start);
         let end = self.byte_offset(range.end.max(range.start));
-        let insert: usize = text.chars().filter(|c| admit(*c)).map(char::len_utf8).sum();
+        let insert: usize = text.chars().filter(admit).map(char::len_utf8).sum();
         let new_len = self.len - (end - start) + insert;
-        if new_len > SECRET_CAPACITY {
+        let removed = self
+            .as_str()
+            .get(start..end)
+            .map_or(0, |s| s.chars().count());
+        let new_chars = self.char_len() - removed + text.chars().filter(admit).count();
+        if new_len > SECRET_CAPACITY || new_chars > filter.max_chars() {
             return Err(Overflow);
         }
         // Shift the tail into place, then write the new chars over the gap.
         self.bytes.copy_within(end..self.len, start + insert);
         let mut at = start;
         let mut inserted = 0;
-        for ch in text.chars().filter(|c| admit(*c)) {
+        for ch in text.chars().filter(admit) {
             let n = ch.len_utf8();
             if let Some(dst) = self.bytes.get_mut(at..at + n) {
                 ch.encode_utf8(dst);
@@ -113,11 +151,24 @@ impl SecretBuf {
 
     /// Copies the secret into an exactly sized zeroizing buffer for core, then
     /// wipes this one.
+    #[cfg(test)]
     pub(crate) fn take(&mut self) -> Zeroizing<Vec<u8>> {
-        let mut out = Zeroizing::new(Vec::with_capacity(self.len));
-        out.extend_from_slice(self.as_bytes());
+        let out = self.copy();
         self.wipe();
         out
+    }
+
+    /// Copies the secret into an exactly sized zeroizing buffer, keeping it
+    /// (a submission core may refuse; the field is wiped once it accepts).
+    pub(crate) fn copy(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::with_capacity(self.len));
+        out.extend_from_slice(self.as_bytes());
+        out
+    }
+
+    /// The plaintext, for drawing a revealed `api_hash` only.
+    pub(crate) fn reveal(&self) -> &str {
+        self.as_str()
     }
 
     #[cfg(test)]
@@ -145,6 +196,27 @@ pub(crate) struct MaskedEdit {
 }
 
 impl MaskedEdit {
+    pub(crate) fn new(filter: Filter) -> Self {
+        Self {
+            secret: SecretBuf::with_filter(filter),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn filter(&self) -> Filter {
+        self.secret.filter
+    }
+
+    /// See [`SecretBuf::copy`].
+    pub(crate) fn copy(&self) -> Zeroizing<Vec<u8>> {
+        self.secret.copy()
+    }
+
+    /// See [`SecretBuf::reveal`].
+    pub(crate) fn reveal(&self) -> &str {
+        self.secret.reveal()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.secret.char_len()
     }
@@ -266,6 +338,7 @@ impl MaskedEdit {
     }
 
     /// Hands the secret to the caller and wipes the field (submit).
+    #[cfg(test)]
     pub(crate) fn take(&mut self) -> Zeroizing<Vec<u8>> {
         let out = self.secret.take();
         self.clear();
@@ -275,6 +348,32 @@ impl MaskedEdit {
     #[cfg(test)]
     pub(crate) fn secret(&self) -> &SecretBuf {
         &self.secret
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    #[test]
+    fn api_hash_filter_keeps_hex_and_caps_at_32() {
+        let mut m = MaskedEdit::new(Filter::ApiHash);
+        m.replace(None, " 0123456789abcdef\n0123456789ABCDEF \"")
+            .unwrap();
+        assert_eq!(m.reveal(), "0123456789abcdef0123456789ABCDEF");
+        assert_eq!(m.replace(None, "a"), Err(Overflow), "33 digits");
+        assert_eq!(m.len(), API_HASH_LEN);
+        let (masked, _) = m.text_for_range(&(0..API_HASH_LEN));
+        assert_eq!(masked, bullets(API_HASH_LEN), "platform text is bullets");
+        let copy = m.copy();
+        assert_eq!(
+            copy.as_slice(),
+            m.reveal().as_bytes(),
+            "copy keeps the field"
+        );
+        assert!(!format!("{m:?}").contains("abcdef"), "Debug is redacted");
+        m.clear();
+        assert!(m.secret().raw().iter().all(|b| *b == 0), "cleared is wiped");
     }
 }
 

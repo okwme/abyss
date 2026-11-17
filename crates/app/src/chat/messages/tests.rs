@@ -1,6 +1,7 @@
 use abyss_core::model::{Body, PeerKind, ThreadKey};
 use abyss_core::rich_text::RichText;
 
+use super::super::retry::FIRST_DELAY;
 use super::*;
 
 const CHAT: ChatId = ChatId {
@@ -187,24 +188,33 @@ fn live_message_appends_in_order() {
 
 #[test]
 fn scroll_loads_once_until_answered() {
+    let now = Instant::now();
     let mut w = MessageWindow::new(CHAT);
-    assert!(!w.wants_older(0), "nothing loaded yet");
+    assert!(!w.wants_older(0, now), "nothing loaded yet");
     w.apply(batch(1, HistoryDir::Tail, 51..=100, More::Yes));
-    assert!(!w.wants_older(LOAD_MARGIN), "not near the top");
-    assert!(w.wants_older(3));
-    assert!(!w.wants_older(0), "already asked");
+    assert!(!w.wants_older(LOAD_MARGIN, now), "not near the top");
+    assert!(w.wants_older(3, now));
+    assert!(
+        w.wants_older(3, now),
+        "asking is free until core admits the load"
+    );
+    w.requested(HistoryDir::Older);
+    assert!(!w.wants_older(0, now), "already asked");
     w.apply(batch(1, HistoryDir::Older, 1..=50, More::No));
-    assert!(!w.wants_older(0), "start of history");
-    assert!(!w.wants_newer(99), "attached to the live tail");
+    assert!(!w.wants_older(0, now), "start of history");
+    assert!(!w.wants_newer(99, now), "attached to the live tail");
     // Detach, then scroll back down.
     let mut older = batch(1, HistoryDir::Older, [], More::No);
     older.removed = vec![MsgId(100)];
     w.apply(older);
-    assert!(!w.wants_newer(10));
-    assert!(w.wants_newer(95));
-    assert!(!w.wants_newer(98), "already asked");
-    w.clear_pending();
-    assert!(w.wants_newer(98), "a failed load can be retried");
+    assert!(!w.wants_newer(10, now));
+    assert!(w.wants_newer(95, now));
+    w.requested(HistoryDir::Newer);
+    assert!(!w.wants_newer(98, now), "already asked");
+    w.load_ended(HistoryDir::Newer, Some(UserError::Network), now);
+    assert!(!w.wants_newer(98, now), "a failed load waits a moment");
+    assert_eq!(w.retry_due(now), Some(now + FIRST_DELAY));
+    assert!(w.wants_newer(98, now + FIRST_DELAY), "then is asked again");
 }
 
 #[test]

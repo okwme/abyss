@@ -4,10 +4,14 @@
 //! server-provided password hint).
 
 use abyss_core::StartError;
-use abyss_core::api::{CredentialError, LocalDeletion, RemoteLogout, StorageError, UserError};
+use abyss_core::api::{LocalDeletion, RemoteLogout, StorageError, UserError};
 use gpui::SharedString;
 
-use crate::launch::{API_HASH_VAR, API_ID_VAR, LaunchError};
+use crate::launch::LaunchError;
+
+pub(crate) mod onboarding;
+
+pub(crate) use onboarding::PHONE_DETAIL;
 
 /// The tagline, shown with the wordmark on the sign-in screens.
 pub(crate) const TAGLINE: &str = "Look in. Nothing looks back.";
@@ -33,15 +37,10 @@ pub(crate) const CONNECTING: &str = "Connecting…";
 pub(crate) const CONTINUE: &str = "Continue";
 
 pub(crate) const PHONE_TITLE: &str = "Sign in to Telegram";
-pub(crate) const PHONE_DETAIL: &str = "Your phone number, in international format.";
 pub(crate) const PHONE_PLACEHOLDER: &str = "Phone number, e.g. +44 20 7946 0000";
 
 pub(crate) const CODE_TITLE: &str = "Enter the code";
 pub(crate) const CODE_PLACEHOLDER: &str = "Code";
-
-pub(crate) fn code_detail(phone_hint: &str) -> SharedString {
-    format!("Telegram sent a code to {phone_hint}.").into()
-}
 
 pub(crate) const PASSWORD_TITLE: &str = "Two-step verification";
 pub(crate) const PASSWORD_PLACEHOLDER: &str = "Password";
@@ -53,7 +52,6 @@ pub(crate) const PASSWORD_PARAMS: &str =
     "Press Enter to get new sign-in parameters, then enter your password again.";
 pub(crate) const SIGNED_IN_UNSAVED: &str =
     "Signed in, but the session couldn't be saved. You'll need to sign in again next time.";
-pub(crate) const LOGGING_OUT: &str = "Signing out…";
 
 /// The result of a logout, as a notice.
 pub(crate) fn logged_out(remote: RemoteLogout, local: LocalDeletion) -> SharedString {
@@ -63,14 +61,44 @@ pub(crate) fn logged_out(remote: RemoteLogout, local: LocalDeletion) -> SharedSt
             " Telegram didn't confirm it: end the session from Active Sessions on another device."
         }
     };
-    let local = match local {
-        LocalDeletion::Deleted => "",
-        LocalDeletion::Failed(_) => {
-            " Some local data couldn't be deleted; signing out again retries."
-        }
-    };
-    format!("Signed out.{remote}{local}").into()
+    match local {
+        LocalDeletion::Deleted => format!("Signed out.{remote}").into(),
+        LocalDeletion::Failed(_) => format!("{LOGOUT_INCOMPLETE_TITLE}.{remote}").into(),
+    }
 }
+
+/// A logout whose local deletion failed (plan section 5).
+pub(crate) const LOGOUT_INCOMPLETE_TITLE: &str = "Logout incomplete";
+pub(crate) const LOGOUT_INCOMPLETE_DETAIL: &str = "Some of this account's data couldn't be \
+     deleted from this Mac, and the session key may remain in the Keychain. Retry to finish \
+     before signing in again.";
+/// The remote half of an incomplete logout failed too.
+pub(crate) const LOGOUT_REMOTE_UNCONFIRMED: &str = "Telegram didn't confirm the sign-out: end \
+     the session from Active Sessions on another device.";
+
+/// The logout-pending marker could not be written, so nothing was done
+/// (review round 19).
+pub(crate) const LOGOUT_NOT_STARTED_TITLE: &str = "Couldn't start logout";
+pub(crate) const LOGOUT_NOT_STARTED_USER: &str = "abyss couldn't record the logout in the \
+     Keychain, so nothing was changed: you're still signed in on this Mac. Unlock the Keychain \
+     and retry.";
+pub(crate) const LOGOUT_NOT_STARTED_SERVER: &str = "Telegram ended this session, but abyss \
+     couldn't record the logout in the Keychain, so nothing was deleted from this Mac yet. \
+     Unlock the Keychain and retry.";
+pub(crate) const STAY_SIGNED_IN: &str = "Stay signed in";
+
+/// Startup couldn't read the logout-pending marker (review round 19). This
+/// is not a logout: nothing is deleted on it.
+pub(crate) const STARTUP_BLOCKED_TITLE: &str = "Couldn't read Keychain";
+pub(crate) const STARTUP_BLOCKED_DETAIL: &str = "abyss couldn't read its Keychain items, so it \
+     can't tell whether a logout is unfinished. Nothing was loaded or deleted. Unlock the \
+     Keychain and retry.";
+
+/// Logout asks first: it deletes local data (plan section 17.3, task 6c).
+pub(crate) const LOGOUT_CONFIRM_TITLE: &str = "Log out?";
+pub(crate) const LOGOUT_CONFIRM_DETAIL: &str = "This ends the session with Telegram and deletes \
+     this account's session and cached messages from this Mac.";
+pub(crate) const CANCEL: &str = "Cancel";
 
 pub(crate) fn password_detail(hint: Option<&str>) -> SharedString {
     match hint {
@@ -92,6 +120,9 @@ pub(crate) const CORE_GONE: &str = "abyss's core has stopped.";
 pub(crate) const CLOSING: &str = "Closing…";
 pub(crate) const UNCONFIRMED_TITLE: &str = "Couldn't confirm the session was saved";
 pub(crate) const UNCONFIRMED_DETAIL: &str = "You may need to sign in again next time.";
+pub(crate) const LOGOUT_UNFINISHED_TITLE: &str = LOGOUT_INCOMPLETE_TITLE;
+pub(crate) const LOGOUT_UNFINISHED_DETAIL: &str = "Some of this account's data may still be on \
+     this Mac. Open abyss again and sign out to finish deleting it.";
 pub(crate) const QUIT: &str = "Quit";
 
 /// A sentence for a core error.
@@ -124,26 +155,27 @@ pub(crate) fn user_error(error: UserError) -> SharedString {
         UserError::SessionRevoked => {
             "This session was ended (signed out elsewhere). Sign in again.".into()
         }
-        UserError::Credentials(e) => credential_error(e),
+        UserError::Credentials(e) => onboarding::credential_error(e, None),
+        UserError::PhoneFlood => {
+            "Too many sign-in attempts for this number. Try again later.".into()
+        }
+        UserError::CredentialsNotSaved(e) => format!(
+            "Your API credentials couldn't be saved to the Keychain ({}). abyss retries \
+             after the next sign-in step.",
+            storage_error(e)
+        )
+        .into(),
+        UserError::CredentialsNotForgotten(e) => format!(
+            "The saved API credentials couldn't be deleted ({}).",
+            storage_error(e)
+        )
+        .into(),
+        UserError::SignOutFirst => "Sign out first to change the API credentials.".into(),
         UserError::Storage(e) => storage_error(e),
     }
 }
 
-fn credential_error(error: CredentialError) -> SharedString {
-    match error {
-        CredentialError::ApiIdInvalid => format!(
-            "Telegram doesn't recognize these API credentials. Check {API_ID_VAR} and \
-             {API_HASH_VAR}, then restart abyss."
-        )
-        .into(),
-        CredentialError::ApiIdPublishedFlood => "Telegram blocked these API credentials because \
-                                                 they were published. Create your own at \
-                                                 my.telegram.org."
-            .into(),
-    }
-}
-
-fn storage_error(error: StorageError) -> SharedString {
+pub(crate) fn storage_error(error: StorageError) -> SharedString {
     match error {
         StorageError::Keychain => "The Keychain refused the request.".into(),
         StorageError::Corrupt => "Saved data was unreadable and was ignored.".into(),
@@ -161,38 +193,6 @@ fn storage_error(error: StorageError) -> SharedString {
 /// Title and paragraphs for a launch problem.
 pub(crate) fn launch_error(error: &LaunchError) -> (&'static str, Vec<SharedString>) {
     match error {
-        LaunchError::MissingCredentials(missing) => (
-            "Telegram API credentials are missing",
-            vec![
-                format!("Not set: {}.", missing.join(", ")).into(),
-                format!(
-                    "abyss connects with your own API credentials. Create them at \
-                     my.telegram.org (API development tools), then launch with \
-                     {API_ID_VAR} and {API_HASH_VAR} set in the environment."
-                )
-                .into(),
-                "To try abyss without an account, run a development build with --fake \
-                 (`cargo dev`)."
-                    .into(),
-            ],
-        ),
-        LaunchError::InvalidApiId => (
-            "ABYSS_API_ID is not valid",
-            vec![
-                format!("{API_ID_VAR} must be the positive number shown on my.telegram.org.")
-                    .into(),
-            ],
-        ),
-        LaunchError::InvalidApiHash => (
-            "ABYSS_API_HASH is not valid",
-            vec![
-                format!(
-                    "{API_HASH_VAR} must be the 32-character hexadecimal hash shown on \
-                     my.telegram.org."
-                )
-                .into(),
-            ],
-        ),
         LaunchError::FakeNotBuilt => (
             "This build has no demo backend",
             vec!["--fake needs a build with the `fake` feature. Use `cargo dev`.".into()],

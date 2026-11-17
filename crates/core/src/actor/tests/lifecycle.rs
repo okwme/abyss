@@ -181,7 +181,10 @@ async fn second_migration_halts_offline() {
     h.until(|e| matches!(e, Event::Connection(ConnState::Offline)))
         .await;
     tokio::time::sleep(Duration::from_secs(300)).await;
-    assert_eq!(h.fake.builds(), 2, "no rebuild after a repeated migration");
+    // Task 6c: no signed-in rebuild; the account is torn down and one
+    // signed-out instance waits for a new login.
+    assert_eq!(h.fake.builds(), 3, "no rebuild after a repeated migration");
+    assert!(h.fake.seeds().last().unwrap().session.is_stored());
     assert_eq!(h.fake.runners_finished(), 2);
     h.stop().await;
 }
@@ -281,7 +284,12 @@ async fn rebuild_carries_the_live_session_and_peers() {
     // A write arriving on the retired instance after retirement is dropped.
     assert!(h.fake.late_critical_write().await);
     assert_eq!(snapshot.rev().unwrap(), 2);
-    let peers = seeds[1].peers.as_slice();
+    // The peers come with the session: core hands the rebuilt instance the
+    // open window and the pending send's chat to keep pinned.
+    let peers = h
+        .fake
+        .retained_peers()
+        .expect("core reconciled the rebuilt instance");
     assert!(peers.contains(&chat(2)) && peers.contains(&chat(1)));
     h.stop().await;
 }
@@ -304,6 +312,7 @@ async fn stale_generation_completions_are_dropped() {
         persist,
         account,
         cache_parts: None,
+        pending_logout: None,
     });
     let view = actor.windows.open(chat(1));
     let stale = ClientGen(actor.cgen.0 - 1);
@@ -327,10 +336,14 @@ async fn stale_generation_completions_are_dropped() {
             cgen: stale,
             parked: None,
             outcome: Outcome::History {
-                chat: chat(1),
-                view,
+                load: crate::actor::jobs::Load {
+                    chat: chat(1),
+                    view,
+                    req: crate::actor::jobs::ReqId(1),
+                },
                 dir: HistoryDir::Tail,
                 query: HistoryQuery::Tail,
+                floor: None,
                 res: Ok(HistoryPage {
                     messages,
                     has_more: false,

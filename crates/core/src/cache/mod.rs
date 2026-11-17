@@ -21,10 +21,16 @@ use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
 
+mod census;
 mod worker;
-pub use db::{Cache, EraseError};
-pub(crate) use worker::CacheCmd;
+#[cfg(feature = "fake")]
+#[doc(hidden)]
+pub use census::leak_lock_for_tests;
+pub use census::{EXIT_CACHE_BUSY, EXIT_WAIT, InitError, Refused, begin_exit, init, wait_closed};
+pub(crate) use census::{close_admission, hold};
+pub use db::{Binding, Cache, EraseError};
 pub use worker::{CACHE_QUEUE, CacheHandle, DeleteKey, EraseFailure, KeyError, WorkerError};
+pub(crate) use worker::{CacheCmd, open_blocking};
 
 /// Maximum logical bytes of cached message bodies.
 pub const MAX_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -95,8 +101,13 @@ pub enum CacheError {
     /// Eviction could not bring the cache under its byte budget.
     OverBudget,
     Random,
+    /// SQLCipher could not be readied for safe use (see `census::init`).
+    Init(InitError),
+    /// Admission is closed (core shutdown, process exit) or full.
+    Refused(Refused),
     Io(std::io::Error),
-    Sql(rusqlite::Error),
+    /// A SQLite error, without its message (round 29).
+    Sql(SqlError),
     Encode(postcard::Error),
 }
 
@@ -108,6 +119,9 @@ impl std::fmt::Display for CacheError {
             Self::WrongProvider(p) => write!(f, "unexpected crypto provider {p:?}"),
             Self::OverBudget => f.write_str("cache is over its byte budget"),
             Self::Random => f.write_str("system random number generator failed"),
+            Self::Init(e) => write!(f, "cache unavailable: {e}"),
+            Self::Refused(Refused::Closing) => f.write_str("cache closed for shutdown"),
+            Self::Refused(Refused::Full) => f.write_str("too many open cache directories"),
             Self::Io(e) => write!(f, "cache io: {e}"),
             Self::Sql(e) => write!(f, "cache sql: {e}"),
             Self::Encode(e) => write!(f, "cache encode: {e}"),
@@ -119,7 +133,6 @@ impl std::error::Error for CacheError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            Self::Sql(e) => Some(e),
             Self::Encode(e) => Some(e),
             _ => None,
         }
@@ -128,7 +141,41 @@ impl std::error::Error for CacheError {
 
 impl From<rusqlite::Error> for CacheError {
     fn from(e: rusqlite::Error) -> Self {
-        Self::Sql(e)
+        Self::Sql(SqlError::from(&e))
+    }
+}
+
+/// What is kept of a `rusqlite::Error` (round 29): its SQLite result codes
+/// only. Its message is dropped, because SQLite names the database file in
+/// some (`unable to open database file: <path>`), and paths hold the user
+/// name (plan section 11). `None` codes: an error raised by rusqlite itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlError {
+    pub code: Option<rusqlite::ErrorCode>,
+    pub extended: Option<i32>,
+}
+
+impl From<&rusqlite::Error> for SqlError {
+    fn from(e: &rusqlite::Error) -> Self {
+        match e {
+            rusqlite::Error::SqliteFailure(f, _) => Self {
+                code: Some(f.code),
+                extended: Some(f.extended_code),
+            },
+            _ => Self {
+                code: None,
+                extended: None,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for SqlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.code, self.extended) {
+            (Some(code), Some(ext)) => write!(f, "{code:?} ({ext})"),
+            _ => f.write_str("rusqlite error"),
+        }
     }
 }
 
@@ -168,13 +215,21 @@ fn remove_files(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Creates the cache directory (0700) and excludes it from backups.
+/// Creates the cache directory (0700) and excludes it from backups. A
+/// symlink in its place is refused (task 9b): the mode and the xattr would
+/// otherwise land on the link's target.
 fn prepare_dir(dir: &Path) -> Result<(), CacheError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
+    if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        return Err(CacheError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the cache directory is a symlink",
+        )));
+    }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     backup::exclude_from_backup(dir)?;
     Ok(())

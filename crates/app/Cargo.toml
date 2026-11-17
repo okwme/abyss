@@ -13,6 +13,8 @@ gpui_platform.workspace = true
 futures = { version = "0.3", default-features = false, features = ["std"] }
 # Local times and dates (plan section 8); already in the tree via grammers.
 jiff = "0.2.40"
+# getpwuid_r, getuid (cache location, task 9c); already in the tree via core.
+libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
 unicode-segmentation = "1"
@@ -21,6 +23,7 @@ zeroize = "1"
 [dev-dependencies]
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 gpui = { workspace = true, features = ["test-support"] }
+tempfile = "3"
 
 [features]
 # Compile Metal shaders at runtime so dev builds don't need Xcode's Metal toolchain

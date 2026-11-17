@@ -43,6 +43,11 @@ pub struct Window {
     /// Newer history exists outside the window: the window does not reach the
     /// live tail, so live messages are not appended to it.
     has_newer: bool,
+    /// The chat's disk cache is known to be contiguous with the live tail
+    /// (set once a server tail was written through), so older and newer pages
+    /// may be served from it. Lives and dies with the window, so it is bounded
+    /// by [`MAX_WINDOWS`]; cleared on reopen and invalidation.
+    cache_contiguous: bool,
 }
 
 impl Window {
@@ -53,7 +58,12 @@ impl Window {
             bytes: 0,
             has_older: true,
             has_newer: false,
+            cache_contiguous: false,
         }
+    }
+
+    pub fn cache_contiguous(&self) -> bool {
+        self.cache_contiguous
     }
 
     fn reset(&mut self, view_gen: ViewGen) {
@@ -127,9 +137,22 @@ pub struct Windows {
     next_gen: u64,
     bytes: usize,
     account_index: HashMap<MsgId, ChatId>,
+    /// Bumped whenever the set or recency order of windowed chats changes.
+    rev: u64,
+    /// The chat whose view is open (set by [`Windows::open`], cleared by
+    /// [`Windows::close`]). The byte budget never evicts its window: the
+    /// actor's open view, its loads and what they owe the UI all rely on
+    /// it being retained (task 10g). Only its own growth trims it, within
+    /// itself.
+    shown: Option<ChatId>,
 }
 
 impl Windows {
+    /// Changes whenever [`Windows::chats`] may have changed.
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
     pub fn get(&self, chat: ChatId) -> Option<&Window> {
         self.by_chat.get(&chat)
     }
@@ -147,12 +170,17 @@ impl Windows {
     /// generation that history completions for this view must carry.
     pub fn open(&mut self, chat: ChatId) -> ViewGen {
         let view_gen = self.bump_gen();
-        self.by_chat
+        let w = self
+            .by_chat
             .entry(chat)
-            .or_insert_with(|| Window::new(view_gen))
-            .view_gen = view_gen;
+            .or_insert_with(|| Window::new(view_gen));
+        w.view_gen = view_gen;
+        // Re-established by the tail this opening fetches.
+        w.cache_contiguous = false;
+        self.shown = Some(chat);
         self.lru.retain(|c| *c != chat);
         self.lru.push(chat);
+        self.rev = self.rev.wrapping_add(1);
         while self.lru.len() > MAX_WINDOWS {
             let evicted = self.lru.remove(0);
             self.drop_window(evicted);
@@ -166,7 +194,31 @@ impl Windows {
         let view_gen = self.bump_gen();
         if let Some(w) = self.by_chat.get_mut(&chat) {
             w.view_gen = view_gen;
+            w.cache_contiguous = false;
         }
+        if self.shown == Some(chat) {
+            self.shown = None;
+        }
+    }
+
+    /// The chat whose view is open, if any (see [`Windows::open`]).
+    pub fn shown(&self) -> Option<ChatId> {
+        self.shown
+    }
+
+    /// Marks `chat`'s disk cache as contiguous with the live tail (see
+    /// [`Window::cache_contiguous`]). No-op without a window.
+    pub fn set_cache_contiguous(&mut self, chat: ChatId) {
+        if let Some(w) = self.by_chat.get_mut(&chat) {
+            w.cache_contiguous = true;
+        }
+    }
+
+    /// Whether `chat` has a window whose disk cache is contiguous.
+    pub fn is_cache_contiguous(&self, chat: ChatId) -> bool {
+        self.by_chat
+            .get(&chat)
+            .is_some_and(Window::cache_contiguous)
     }
 
     /// Clears all messages of `chat` in place (keeping its LRU position) and
@@ -198,6 +250,8 @@ impl Windows {
     }
 
     fn drop_window(&mut self, chat: ChatId) {
+        debug_assert_ne!(self.shown, Some(chat), "the open window is never dropped");
+        self.rev = self.rev.wrapping_add(1);
         if let Some(w) = self.by_chat.remove(&chat) {
             self.bytes = self.bytes.saturating_sub(w.bytes);
             for m in &w.messages {
@@ -276,6 +330,40 @@ impl Windows {
         }
         self.trim(chat, End::Newest, &mut change);
         self.enforce_byte_budget(chat, End::Newest, &mut change);
+        Ok(change)
+    }
+
+    /// Adds a page of older history without ever dropping a message: of the
+    /// page's messages older than the window, only the newest ones (adjacent
+    /// to the window, so it stays contiguous) that fit under the per-chat cap
+    /// and the byte budget are inserted. For pages core fetches on its own,
+    /// which must never move the end the user is looking at. When some did
+    /// not fit, older history is still marked as existing.
+    pub fn prepend_fitting(
+        &mut self,
+        chat: ChatId,
+        view_gen: ViewGen,
+        page: HistoryPage,
+    ) -> Result<Change, Stale> {
+        let w = self.current(chat, view_gen)?;
+        let bound = w.oldest();
+        let room = MAX_MESSAGES_PER_CHAT.saturating_sub(w.messages.len());
+        let more = page.has_more;
+        let older = sorted_unique(page.messages, |id| bound.is_none_or(|o| id < o));
+        let mut change = Change::default();
+        let mut fitted = true;
+        for m in older.into_iter().rev() {
+            let bytes = self.bytes.saturating_add(m.retained_bytes());
+            if change.inserted.len() >= room || bytes > MAX_STORE_BYTES {
+                fitted = false;
+                break;
+            }
+            self.insert_sorted(chat, 0, m, &mut change);
+        }
+        if let Some(w) = self.by_chat.get_mut(&chat) {
+            w.has_older = more || !fitted;
+            debug_assert!(w.messages.len() <= MAX_MESSAGES_PER_CHAT);
+        }
         Ok(change)
     }
 
@@ -384,18 +472,27 @@ impl Windows {
             .collect()
     }
 
-    /// Evicts least recently used windows other than `keep`; if `keep` alone is
-    /// over budget, trims it from `end` (the side the user is not looking at).
+    /// Evicts least recently used windows other than `keep` (the chat just
+    /// mutated) and the open one, then trims `keep` from `end` (the side the
+    /// user is not looking at). The open window is never evicted for another
+    /// chat's growth (task 10g). When it is `keep`, it is trimmed within
+    /// itself. Otherwise trimming `keep` always suffices: only `keep` grew,
+    /// and the budget held before, so the open window alone fits.
     fn enforce_byte_budget(&mut self, keep: ChatId, end: End, change: &mut Change) {
+        let shown = self.shown;
         while self.bytes > MAX_STORE_BYTES {
-            if let Some(victim) = self.lru.iter().copied().find(|c| *c != keep) {
+            let background = self
+                .lru
+                .iter()
+                .copied()
+                .find(|c| *c != keep && Some(*c) != shown);
+            if let Some(victim) = background {
                 self.drop_window(victim);
-                continue;
-            }
-            if !self.pop_one(keep, end, change) {
-                return;
+            } else if !self.pop_one(keep, end, change) {
+                break;
             }
         }
+        debug_assert!(self.bytes <= MAX_STORE_BYTES, "open window over budget");
     }
 }
 

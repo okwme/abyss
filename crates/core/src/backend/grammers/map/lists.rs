@@ -17,10 +17,11 @@ pub(crate) const MAX_DELETED_IDS: usize = 10_000;
 /// Items a response may carry beyond the requested limit (folder entries,
 /// a message sent while the page was being built) before it is rejected.
 pub(crate) const RESPONSE_SLACK: usize = 16;
-/// Users plus chats a response may carry per requested item: a message's
-/// chat, sender, forward source, reply peer and the users a service message
-/// names. Capped by [`MAX_DIRECTORY`].
-pub(crate) const PEERS_PER_ITEM: usize = 16;
+/// Users plus chats one response may carry. Auxiliary peers are not
+/// proportional to the requested items (one service message can add hundreds
+/// of users; mentions, forwards and replies name more), so they are bounded
+/// on their own, by what a [`Directory`] holds.
+pub(crate) const MAX_RESPONSE_PEERS: usize = MAX_DIRECTORY;
 
 /// A response carrying more than its request allows. It is rejected as a
 /// whole: mapping a truncated prefix would present partial data as the
@@ -30,14 +31,6 @@ pub(crate) struct Oversized;
 
 fn at_most(n: usize, max: usize) -> Result<(), Oversized> {
     if n <= max { Ok(()) } else { Err(Oversized) }
-}
-
-/// Users plus chats allowed for a request of `limit` items.
-fn peer_budget(limit: usize) -> usize {
-    limit
-        .saturating_mul(PEERS_PER_ITEM)
-        .saturating_add(RESPONSE_SLACK)
-        .min(MAX_DIRECTORY)
 }
 
 /// The parts of a `messages.Dialogs` response, checked against the request.
@@ -77,7 +70,7 @@ pub(crate) fn dialogs_parts(
     at_most(parts.messages.len(), items.saturating_mul(2))?;
     at_most(
         parts.users.len().saturating_add(parts.chats.len()),
-        peer_budget(limit),
+        MAX_RESPONSE_PEERS,
     )?;
     Ok(parts)
 }
@@ -200,6 +193,9 @@ fn summarize(d: &tl::types::Dialog, tops: &Tops<'_>, dir: &Directory, out: &mut 
         unread_mentions: count(d.unread_mentions_count),
         last: last_message.as_ref().map(Preview::of),
         last_date: last_message.as_ref().map_or(0, |m| m.date),
+        // The top message id is authoritative even when the message itself
+        // did not map (excluded or invalid).
+        last_id: (d.top_message > 0).then_some(MsgId(d.top_message)),
         can_send: entry.can_send,
     };
     if summary.is_valid() {
@@ -242,7 +238,7 @@ pub(crate) fn messages_parts(
     at_most(parts.messages.len(), limit.saturating_add(RESPONSE_SLACK))?;
     at_most(
         parts.users.len().saturating_add(parts.chats.len()),
-        peer_budget(limit),
+        MAX_RESPONSE_PEERS,
     )?;
     Ok(parts)
 }
@@ -335,6 +331,11 @@ pub(crate) fn update(raw: &tl::enums::Update, dir: &Directory) -> Option<Update>
         U::ReadChannelInbox(u) => Some(Update::ReadInbox {
             chat: channel_chat(u.channel_id)?,
             still_unread: count(u.still_unread_count),
+        }),
+        // Correlated with the pending-send table by core (plan section 9).
+        U::MessageId(u) if u.id > 0 && u.random_id != 0 => Some(Update::MessageId {
+            random_id: u.random_id,
+            id: MsgId(u.id),
         }),
         _ => None,
     }

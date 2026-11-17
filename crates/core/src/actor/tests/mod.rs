@@ -3,13 +3,31 @@
 
 #![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
+    clippy::panic,
     reason = "test harness helpers are not #[test] items, so allow-*-in-tests does not cover them"
 )]
 
 mod auth;
 mod lifecycle;
 mod logout;
+mod onboarding;
+mod review10c;
+mod review10d;
+mod review10e;
+mod review10f;
+mod review10g;
+mod review23;
+mod review4b;
+mod review4c;
+mod review6c;
+mod review6d;
+mod review6e;
+mod review6f;
+mod review6g;
+mod review6h;
+mod review6i;
+mod review6j;
+mod watchdog;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,7 +37,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{Actor, ActorInit, CacheParts, Internal, open_cache};
+use super::{Actor, ActorInit, Identity, Internal, Stamped, provision_cache};
 use crate::ShutdownReport;
 use crate::api::{AuthState, Command, ConnState, Event, HistoryDir, SendState, UserError};
 use crate::backend::fake::{
@@ -33,9 +51,12 @@ use crate::secret::{FaultControl, FaultyStore, MemoryStore, SecretItem, SecretSt
 use crate::session::{PersistHandle, signed_in_blob};
 
 const WAIT: Duration = Duration::from_secs(600);
+/// Wall-clock bound of one wait, whatever the test's clock does (a
+/// [`watchdog::Watchdog`] thread enforces it).
+const REAL_WAIT: Duration = Duration::from_secs(120);
 
 struct Harness {
-    cmd: mpsc::Sender<Command>,
+    cmd: mpsc::Sender<Stamped>,
     internal: mpsc::Sender<Internal>,
     events: EventReceiver,
     fake: FakeHandle,
@@ -46,6 +67,7 @@ struct Harness {
     /// Shares storage with the persistence worker's store.
     store: MemoryStore,
     faults: FaultControl,
+    watchdog: watchdog::Watchdog,
 }
 
 fn chat(id: i64) -> ChatId {
@@ -57,6 +79,7 @@ fn chat(id: i64) -> ChatId {
 
 /// How the harness prepares storage before the actor starts.
 #[derive(Default)]
+#[expect(clippy::struct_excessive_bools, reason = "independent test switches")]
 struct Setup {
     /// No stored session: the actor starts signed out.
     signed_out: bool,
@@ -66,6 +89,61 @@ struct Setup {
     cache_dir: Option<PathBuf>,
     /// Hold the store after the startup reads: every later write stalls.
     hold_store: bool,
+    /// A stored API credential item (task 6b).
+    stored_creds: Option<crate::api::ApiCredentials>,
+    /// Reading the credential item fails (a locked Keychain).
+    creds_locked: bool,
+    /// Reuse this store (a restart) instead of a new one; `signed_out` and
+    /// a `StoredSession::Blob` are then ignored.
+    store: Option<MemoryStore>,
+    session: StoredSession,
+    /// Reading the logout-pending marker fails (round 15, A).
+    marker_unreadable: bool,
+    /// A cache re-binding reports, then waits for a permit here.
+    hold_settle: Option<Arc<Semaphore>>,
+}
+
+/// The session item at startup (task 6c).
+#[derive(Default)]
+enum StoredSession {
+    /// The default signed-in one (unless `signed_out`).
+    #[default]
+    Default,
+    /// This item instead.
+    Blob(zeroize::Zeroizing<Vec<u8>>),
+    /// Reading it fails at startup (an unreadable Keychain).
+    Unreadable,
+}
+
+/// The store the harness starts over.
+fn prepare_store(setup: &Setup) -> MemoryStore {
+    let Some(store) = setup.store.clone() else {
+        let store = MemoryStore::new();
+        if !setup.signed_out {
+            let blob = match &setup.session {
+                StoredSession::Blob(blob) => blob.clone(),
+                _ => signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH),
+            };
+            store.set(SecretItem::Session, &blob).unwrap();
+        }
+        return store;
+    };
+    store
+}
+
+/// Loads the session as `core::prepare` does.
+async fn load(persist: &PersistHandle) -> (crate::session::SessionSnapshot, Identity) {
+    match persist.load_session().await {
+        Ok(loaded) => {
+            let identity = loaded
+                .snapshot
+                .self_id()
+                .unwrap()
+                .map_or(Identity::SignedOut, Identity::Verified);
+            (loaded.snapshot, identity)
+        }
+        Err(_) => (persist.fresh_session(), Identity::Unknown),
+    }
 }
 
 async fn harness(script: FakeScript, cache: Option<CacheHandle>) -> Harness {
@@ -86,27 +164,59 @@ async fn harness_with(
     start(backend, fake, setup).await
 }
 
-async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness {
-    let store = MemoryStore::new();
-    if !setup.signed_out {
+/// The store faults that apply to the startup reads.
+fn startup_faults(setup: &Setup, faults: &FaultControl) {
+    if setup.creds_locked {
+        faults.fail_get_of(SecretItem::ApiCredentials);
+    }
+    if setup.marker_unreadable {
+        faults.fail_get_of(SecretItem::LogoutPending);
+    }
+    if matches!(setup.session, StoredSession::Unreadable) {
+        faults.fail_get_of(SecretItem::Session);
+    }
+}
+
+/// Writes the stored API credential item, if the setup has one.
+fn store_creds(setup: &Setup, store: &MemoryStore) {
+    if let Some(creds) = &setup.stored_creds {
         store
             .set(
-                SecretItem::Session,
-                &signed_in_blob(FAKE_SELF_ID, FAKE_SELF_HASH),
+                SecretItem::ApiCredentials,
+                &crate::credentials::encode(creds),
             )
             .unwrap();
     }
+}
+
+async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness {
+    let store = prepare_store(&setup);
+    let unreadable = matches!(setup.session, StoredSession::Unreadable);
+    store_creds(&setup, &store);
     let (wrapped, faults) = FaultyStore::new(store.clone());
+    startup_faults(&setup, &faults);
     let persist = PersistHandle::spawn(wrapped).unwrap();
-    let account = persist.load_session().await.unwrap().snapshot;
+    let pending_logout = super::read_pending_logout(&persist).await;
+    let (account, identity) = match pending_logout {
+        Some(_) => (persist.fresh_session(), Identity::Unknown),
+        None => load(&persist).await,
+    };
+    if unreadable {
+        faults.heal_item(SecretItem::Session);
+    }
+    let unread_marker = matches!(pending_logout, Some(super::PendingLogout::Unreadable(_)));
     let (cache, cache_parts) = match setup.cache_dir {
+        // As `core::prepare`: an unreadable marker opens no cache.
+        Some(dir) if unread_marker => {
+            let mut parts = super::CacheParts::closed(dir);
+            parts.hold_settle.clone_from(&setup.hold_settle);
+            (None, Some(parts))
+        }
         Some(dir) => {
-            let (handle, key) = open_cache(&persist, dir.clone()).await.unwrap();
-            let parts = CacheParts {
-                dir,
-                key: Some(key),
-            };
-            (Some(handle), Some(parts))
+            let provisioned = provision_cache(&persist, dir, identity).await;
+            let mut parts = provisioned.parts;
+            parts.hold_settle.clone_from(&setup.hold_settle);
+            (provisioned.served, Some(parts))
         }
         None => (setup.cache, None),
     };
@@ -127,9 +237,12 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
         persist,
         account,
         cache_parts,
+        pending_logout,
     });
+
     let permits = actor.admission.probe();
     let join = tokio::spawn(actor.run(channels));
+    let watchdog = watchdog::Watchdog::new(faults.clock_gate(), REAL_WAIT);
     Harness {
         cmd,
         internal,
@@ -140,29 +253,43 @@ async fn start(backend: FakeBackend, fake: FakeHandle, setup: Setup) -> Harness 
         join,
         store,
         faults,
+        watchdog,
     }
 }
 
 impl Harness {
+    /// Sends a command stamped with the epoch of the last event taken, as
+    /// `CoreSender` does.
     async fn send(&self, c: Command) {
-        self.cmd.send(c).await.unwrap();
+        let epoch = self.events.observer().get();
+        self.cmd.send(Stamped { epoch, cmd: c }).await.unwrap();
     }
 
     /// Waits for an event matching `pred`, returning it and everything skipped.
+    /// Bounded twice: [`WAIT`] on the test's clock (paused tests advance it
+    /// freely) and the watchdog's wall-time bound, which holds even while the
+    /// store's clock gate keeps a paused clock still (review round 32), so a
+    /// hang fails the test with the events seen instead of stalling the run.
     async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> (Event, Vec<Event>) {
         let mut skipped = Vec::new();
-        let found = tokio::time::timeout(WAIT, async {
-            loop {
-                let ev = self.events.recv().await.expect("actor stopped");
-                if pred(&ev) {
-                    return ev;
+        let deadline = tokio::time::Instant::now() + WAIT;
+        let fired = self.watchdog.fired();
+        let _armed = self.watchdog.arm();
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = fired.cancelled() => {
+                    panic!("wall-clock watchdog fired waiting for an event; seen: {skipped:?}")
                 }
-                skipped.push(ev);
+                next = tokio::time::timeout_at(deadline, self.events.recv()) => next,
+            };
+            match next {
+                Ok(Some(ev)) if pred(&ev) => return (ev, skipped),
+                Ok(Some(ev)) => skipped.push(ev),
+                Ok(None) => panic!("actor stopped; seen: {skipped:?}"),
+                Err(elapsed) => panic!("{elapsed} waiting for an event; seen: {skipped:?}"),
             }
-        })
-        .await
-        .expect("timed out waiting for event");
-        (found, skipped)
+        }
     }
 
     /// Waits until the instance is online; returns the events before it.
@@ -183,9 +310,17 @@ impl Harness {
         std::iter::from_fn(|| self.events.try_recv()).collect()
     }
 
-    async fn stop(self) -> ShutdownReport {
+    /// Shuts the actor down; fails past the watchdog's wall-time bound
+    /// rather than hang (review rounds 28 and 32).
+    async fn stop(mut self) -> ShutdownReport {
         self.cancel.cancel();
-        self.join.await.unwrap()
+        let fired = self.watchdog.fired();
+        let _armed = self.watchdog.arm();
+        tokio::select! {
+            biased;
+            () = fired.cancelled() => panic!("the actor did not shut down"),
+            report = &mut self.join => report.unwrap(),
+        }
     }
 
     /// Waits for an auth state matching `pred`.
@@ -240,19 +375,43 @@ async fn refresh_merges_the_first_page_into_loaded_pages() {
         let (ev, _) = h.until(|e| matches!(e, Event::DialogsAppended(_))).await;
         assert_eq!(dialogs_len(&ev), expected);
     }
+    h.until(|e| matches!(e, Event::DialogsPaging { has_more: false }))
+        .await;
+    // While the app was away, a chat appeared below the first page.
+    let newcomer = chat(9999);
+    h.fake.edit_dialogs(|d| {
+        d.insert(150, crate::backend::fake::summary(newcomer, "new"));
+    });
     tokio::time::sleep(Duration::from_secs(16)).await;
     h.send(Command::Window(crate::api::WindowState::Active))
         .await;
     let (ev, _) = h.until(|e| matches!(e, Event::DialogsReset(_))).await;
     assert_eq!(dialogs_len(&ev), 250, "later pages survive a refresh");
+    // Pagination restarts from the fresh cursor instead of staying terminal.
+    h.until(|e| matches!(e, Event::DialogsPaging { has_more: true }))
+        .await;
+    // The newcomer is placed in server order ahead of provisional rows, so
+    // that page resends the whole list.
+    let mut appended = Vec::new();
+    for _ in 0..2 {
+        h.send(Command::LoadDialogs).await;
+        let (ev, _) = h
+            .until(|e| matches!(e, Event::DialogsAppended(_) | Event::DialogsReset(_)))
+            .await;
+        if let Event::DialogsAppended(v) | Event::DialogsReset(v) = ev {
+            appended.extend(v);
+        }
+    }
+    assert!(
+        appended.iter().any(|c| c.id == newcomer),
+        "the chat below the first page is found"
+    );
+    let (ev, _) = h.until(|e| matches!(e, Event::DialogsPaging { .. })).await;
+    assert!(matches!(ev, Event::DialogsPaging { has_more: false }));
     let calls = h.fake.calls(Op::Dialogs);
     h.send(Command::LoadDialogs).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        h.fake.calls(Op::Dialogs),
-        calls,
-        "the cursor still points past the last page"
-    );
+    assert_eq!(h.fake.calls(Op::Dialogs), calls, "every page is loaded");
     h.stop().await;
 }
 
@@ -391,14 +550,16 @@ async fn rejected_send_fails_and_empty_text_is_refused() {
         local_id: LocalId(2),
     })
     .await;
-    let (ev, _) = h.until(send_state(LocalId(2))).await;
-    assert!(matches!(
-        ev,
-        Event::SendState {
-            state: SendState::Failed,
-            ..
-        }
-    ));
+    // Refused: core holds nothing for it (task 6j).
+    let (_, seen) = h
+        .until(|e| matches!(e, Event::SendRefused { local_id } if *local_id == LocalId(2)))
+        .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, Event::SendState { local_id, .. } if *local_id == LocalId(2))),
+        "{seen:?}"
+    );
     assert_eq!(h.fake.calls(Op::Send), 1);
     h.stop().await;
 }
@@ -449,6 +610,33 @@ async fn mark_read_coalesces_per_flush() {
 
 // ---- disk cache (real time) ----
 
+/// A temporary cache directory. Declared before the handles, it drops after
+/// them, and its drop waits until every worker on it has closed its
+/// database: the test's own handles, which `close_caches` only flushes, the
+/// actor's, and any open still on a blocking thread. So no SQLCipher close
+/// outlives its test and races the harness's exit (plan section 13, exit
+/// SIGSEGV fix).
+struct CacheDir(tempfile::TempDir);
+
+impl CacheDir {
+    fn new() -> Self {
+        Self(tempfile::tempdir().unwrap())
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+impl Drop for CacheDir {
+    fn drop(&mut self) {
+        let closed = crate::cache::wait_closed(Some(self.path()), Duration::from_secs(10));
+        if !std::thread::panicking() {
+            assert!(closed, "a cache worker outlived its test");
+        }
+    }
+}
+
 fn cache_at(dir: &std::path::Path, key: &CacheKey) -> CacheHandle {
     CacheHandle::spawn(dir.to_path_buf(), key).unwrap()
 }
@@ -480,7 +668,7 @@ async fn session(script: FakeScript, cache: CacheHandle, older: usize) -> FakeHa
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_serves_history_offline_then_reconciles() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     session(FakeScript::demo(1, 200), cache_at(dir.path(), &key), 2).await;
 
@@ -527,7 +715,7 @@ async fn cache_serves_history_offline_then_reconciles() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contiguous_cache_serves_older_pages_without_the_server() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     session(FakeScript::demo(1, 300), cache_at(dir.path(), &key), 3).await;
 
@@ -548,7 +736,7 @@ async fn contiguous_cache_serves_older_pages_without_the_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gap_in_cache_is_replaced_by_server_tail() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     session(FakeScript::demo(1, 100), cache_at(dir.path(), &key), 1).await;
 
@@ -565,7 +753,7 @@ async fn gap_in_cache_is_replaced_by_server_tail() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn erase_runs_after_queued_writes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     let cache = cache_at(dir.path(), &key);
     for i in 1..=100 {
@@ -594,7 +782,7 @@ async fn erase_runs_after_queued_writes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_chat_list_keeps_every_loaded_page() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = CacheDir::new();
     let key = CacheKey::generate().unwrap();
     let cache = cache_at(dir.path(), &key);
     let mut h = harness(FakeScript::demo(150, 1), Some(cache.clone())).await;

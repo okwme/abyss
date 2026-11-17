@@ -22,6 +22,8 @@ pub(crate) enum Closing {
     Waiting,
     /// Core could not confirm the session was saved; the user decides when to quit.
     Unconfirmed,
+    /// A logout did not finish deleting the account's local data.
+    LogoutUnfinished,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,26 +56,33 @@ pub(crate) enum Next {
     Quit,
     /// Show the unconfirmed-save message and wait for the user.
     ShowUnconfirmed,
+    /// Show that the logout did not finish, and wait for the user.
+    ShowLogoutUnfinished,
 }
 
 pub(crate) fn next(outcome: Outcome) -> Next {
     match outcome {
         // A confirmed save quits; so does the UI timeout (plan section 5).
         Outcome::Ack(report) if confirmed(report) => Next::Quit,
+        Outcome::Ack(report) if !logout_done(report) => Next::ShowLogoutUnfinished,
         Outcome::TimedOut => Next::Quit,
         // We never claim a save (or a logout's deletion) we didn't observe.
         Outcome::Ack(_) | Outcome::NoAck => Next::ShowUnconfirmed,
     }
 }
 
-/// The session is saved and any logout that ran finished its local deletion.
-fn confirmed(report: ShutdownReport) -> bool {
-    let logout_done = match report.logout {
+/// Any logout that ran finished its local deletion.
+fn logout_done(report: ShutdownReport) -> bool {
+    match report.logout {
         None => true,
         Some(LogoutStatus::Done { local, .. }) => local == LocalDeletion::Deleted,
         Some(LogoutStatus::Incomplete) => false,
-    };
-    report.save == SaveStatus::Confirmed && logout_done
+    }
+}
+
+/// The session is saved and any logout that ran finished its local deletion.
+fn confirmed(report: ShutdownReport) -> bool {
+    report.save == SaveStatus::Confirmed && logout_done(report)
 }
 
 #[cfg(test)]
@@ -102,7 +111,7 @@ mod tests {
             logout: Some(LogoutStatus::Incomplete),
             ..CONFIRMED
         };
-        assert_eq!(next(Outcome::Ack(incomplete)), Next::ShowUnconfirmed);
+        assert_eq!(next(Outcome::Ack(incomplete)), Next::ShowLogoutUnfinished);
         let done = ShutdownReport {
             logout: Some(LogoutStatus::Done {
                 remote: RemoteLogout::TimedOut,

@@ -22,12 +22,12 @@ use super::jobs::{self, CallError, Done, Outcome, TaskKind};
 use super::logout::LocalDone;
 use super::{Actor, admission::MAX_CONCURRENT};
 use crate::api::{
-    ClientGen, ConnState, Event, LogoutStatus, RemoteLogout, StorageError, UserError,
+    ClientGen, ConnState, Event, HistoryDir, LogoutStatus, RemoteLogout, StorageError, UserError,
 };
 use crate::backend::{
-    Backend, BackendError, CarriedPeers, Instance, InstanceControl, Seed, SessionSeed,
-    SessionSnapshot,
+    Backend, BackendError, Instance, InstanceControl, Seed, SessionSeed, SessionSnapshot,
 };
+use crate::model::ChatId;
 
 /// First rebuild delay; doubles per attempt.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -94,6 +94,12 @@ pub(super) enum LogoutStage {
     Remote,
     /// Deleting the session item, then crypto-erasing the cache.
     Local,
+    /// The local step failed: "Logout incomplete" until a Retry succeeds.
+    /// No instance, no login.
+    Unfinished,
+    /// Startup could not read the logout-pending marker: nothing loaded,
+    /// served, built or deleted until `Command::RetryStartup` reads it.
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,7 +353,12 @@ fn keep(
     match joined {
         Ok((id, done)) => {
             kinds.remove(&id);
-            if done.parked.is_some() || matches!(done.outcome, Outcome::Send { .. }) {
+            if done.parked.is_some()
+                || matches!(
+                    done.outcome,
+                    Outcome::Send { .. } | Outcome::SendExpired { .. }
+                )
+            {
                 dones.push(done);
             }
         }
@@ -374,22 +385,13 @@ impl<B: Backend> Actor<B> {
             .session
             .clone()
             .map_or(SessionSeed::Stored, SessionSeed::Live);
-        let seed = Seed {
-            session,
-            peers: self.carried_peers(),
-        };
+        let seed = Seed { session };
         let backend = Arc::clone(&self.backend);
         self.life.phase = Phase::Building;
         self.life.step = Some(tokio::spawn(async move {
             tokio::time::sleep(delay).await;
             Step::Built(backend.build(seed).await)
         }));
-    }
-
-    fn carried_peers(&self) -> CarriedPeers {
-        let mut sends = self.sends.chats();
-        sends.sort_unstable();
-        CarriedPeers::new(self.windows.chats().chain(sends))
     }
 
     pub(super) async fn on_step(&mut self, res: Result<Step<B>, JoinError>) {
@@ -494,7 +496,12 @@ impl<B: Backend> Actor<B> {
             return;
         };
         let after = self.after_for(reason);
-        self.begin_retire();
+        for (chat, dir) in self.begin_retire() {
+            // The UI keeps its window across a rebuild: tell it the loads it
+            // waits on are gone, so its backoff and Retry take over (rounds
+            // 20 and 22).
+            self.history_ended(chat, dir, Some(UserError::Busy)).await;
+        }
         self.life.phase = Phase::Retiring(after);
         if after == After::Rebuild {
             let (attempt, delay) = self.life.backoff.next(Instant::now());
@@ -525,7 +532,13 @@ impl<B: Backend> Actor<B> {
 
     /// Rebuild step 1: stop admission and make every completion of the old
     /// instance stale. Parked permits stay parked until retirement completes.
-    pub(super) fn begin_retire(&mut self) {
+    /// Returns the loads the UI waits on, which retirement abandons: the
+    /// owed one, queued or running (its late result is stale), and the
+    /// deferred ones, which could only queue for an instance that may never
+    /// come (round 22). Each is taken here, so nothing answers or starts it
+    /// again (task 10g). Distinct, at most `1 + MAX_DEFERRED`.
+    #[must_use]
+    pub(super) fn begin_retire(&mut self) -> Vec<(ChatId, HistoryDir)> {
         self.cgen = ClientGen(self.cgen.0 + 1);
         self.boot = None;
         self.life.timeouts.clear();
@@ -533,6 +546,15 @@ impl<B: Backend> Actor<B> {
         self.dialogs_busy = false;
         self.dialogs_queued = false;
         self.purge_queued();
+        let mut waiting = Vec::with_capacity(self.deferred.len().saturating_add(1));
+        let owed = self.owed.take().map(|o| (o.load.chat, o.dir));
+        let deferred = self.deferred.drain(..).map(|d| (d.chat, d.dir));
+        for target in owed.into_iter().chain(deferred) {
+            if !waiting.contains(&target) {
+                waiting.push(target);
+            }
+        }
+        waiting
     }
 
     async fn finish_retire(&mut self, retired: Retired, after: After) {
@@ -552,7 +574,7 @@ impl<B: Backend> Actor<B> {
             After::Halt => {
                 self.life.phase = Phase::Halted;
                 self.emit(Event::Connection(ConnState::Offline)).await;
-                self.require_relogin().await;
+                self.abandon_account().await;
             }
         }
     }
@@ -646,6 +668,9 @@ impl<B: Backend> Actor<B> {
             retire(live, SHUTDOWN_CAPS, &shutdown).await;
             out.retired &= Instant::now() <= deadline;
         }
+        if out.logout.is_none() {
+            out.logout = self.unfinished_logout_status();
+        }
         out
     }
 }
@@ -657,4 +682,28 @@ pub(super) struct LifeAtShutdown {
     /// deadline.
     pub(super) retired: bool,
     pub(super) logout: Option<LogoutStatus>,
+}
+
+impl<B: Backend> Actor<B> {
+    /// Retires the signed-out instance: one built for API credentials no
+    /// longer in use (Back, Forget, new or rejected credentials; task 6b), or
+    /// one an ambiguous sign-in may still be queued on, before the probe
+    /// (task 6d). Like a rebuild, without backoff or a `Rebuilding` event:
+    /// the next build waits for the credential slot to hold a pair.
+    pub(super) fn retire_signed_out(&mut self) {
+        if self.life.phase != Phase::SignedOut {
+            return;
+        }
+        let Some(live) = self.live.take() else {
+            return;
+        };
+        // Signed out: no chat is open, so no load is waited on.
+        let _ = self.begin_retire();
+        self.life.phase = Phase::Retiring(After::Rebuild);
+        self.life.pending_delay = Duration::ZERO;
+        let shutdown = self.cancel.clone();
+        self.life.step = Some(tokio::spawn(async move {
+            Step::Retired(retire(live, REBUILD_CAPS, &shutdown).await)
+        }));
+    }
 }

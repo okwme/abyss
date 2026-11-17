@@ -132,6 +132,7 @@ impl Shot {
     fn sign_in(&mut self) -> Result<()> {
         self.core_says(Event::Auth(AuthState::SignedIn {
             display_name: "Demo User".into(),
+            new_login: None,
         }))?;
         let script = demo::script(format::now());
         self.core_says(Event::DialogsReset(script.dialogs))?;
@@ -189,13 +190,14 @@ impl Shot {
 
 fn signin(dir: &Path) -> Result<()> {
     let mut shot = Shot::open(dir)?;
-    shot.core_says(Event::Auth(AuthState::Phone { error: None }))?;
+    // No credentials on first launch: onboarding starts at Welcome.
+    shot.core_says(Event::Auth(AuthState::NeedCredentials {
+        error: None,
+        source: None,
+    }))?;
     shot.save(Mode::Day, "welcome-day.png")?;
     shot.save(Mode::Night, "welcome-night.png")?;
-    shot.root.update(&mut shot.cx, |root, window, cx| {
-        root.with_session(|s, cx| s.accept_welcome(window, cx), cx);
-    })?;
-    shot.cx.run_until_parked();
+    shot.core_says(Event::Auth(AuthState::Phone { error: None }))?;
     shot.save(Mode::Day, "signin-day.png")?;
     shot.save(Mode::Night, "signin-night.png")
 }

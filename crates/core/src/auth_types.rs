@@ -123,13 +123,250 @@ impl Drop for ApiHash {
     }
 }
 
-/// Telegram rejected the API credentials (plan section 17.2).
+/// Why API credentials are missing or unusable (plan sections 17.2, 17.2a).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialError {
     /// `API_ID_INVALID`: the id/hash pair is unknown.
     ApiIdInvalid,
-    /// `API_ID_PUBLISHED_FLOOD`: the pair was published and is blocked.
+    /// `API_ID_PUBLISHED_FLOOD`: the id is unusable (for example, it was
+    /// published). Not a timed wait: use a different application.
     ApiIdPublishedFlood,
+    /// Only one of the two environment variables is set. Never falls through
+    /// to the Keychain.
+    EnvPartial { missing: EnvVar },
+    /// An environment variable is set but malformed.
+    EnvMalformed { var: EnvVar },
+    /// The Keychain could not be read (locked, denied). Not the same as "no
+    /// pair stored": retry, never re-onboard.
+    KeychainUnavailable,
+    /// The stored pair is unreadable. Entering a new pair replaces it.
+    StoredUnreadable,
+    /// A submitted `api_id` is not a positive 32-bit number.
+    InvalidApiId,
+}
+
+impl CredentialError {
+    /// Whether the user may enter a new pair while this error is shown.
+    pub fn allows_entry(self) -> bool {
+        !matches!(
+            self,
+            Self::EnvPartial { .. } | Self::EnvMalformed { .. } | Self::KeychainUnavailable
+        )
+    }
+}
+
+/// The two credential environment variables (plan section 17.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvVar {
+    ApiId,
+    ApiHash,
+}
+
+impl EnvVar {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ApiId => "ABYSS_API_ID",
+            Self::ApiHash => "ABYSS_API_HASH",
+        }
+    }
+}
+
+/// Where the API credentials in use came from (plan section 17.2a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// `ABYSS_API_ID` + `ABYSS_API_HASH`: a dev override, never persisted.
+    Env,
+    /// The Keychain item `dev.abyss.apicreds`.
+    Stored,
+    /// Compiled in at build time.
+    Embedded,
+    /// Typed into the onboarding screen this run.
+    Entered,
+}
+
+/// A validated `api_id`: a positive 32-bit number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApiId(i32);
+
+/// Why a string is not an `api_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiIdError {
+    Empty,
+    /// A character other than `0-9`.
+    NotDigits,
+    /// More than [`ApiId::MAX_DIGITS`] digits.
+    TooLong,
+    /// Zero, or above `i32::MAX`.
+    OutOfRange,
+}
+
+impl ApiId {
+    /// The most digits an `api_id` has (`i32::MAX` has 10).
+    pub const MAX_DIGITS: usize = 10;
+
+    pub fn new(id: i32) -> Result<Self, ApiIdError> {
+        if id > 0 {
+            Ok(Self(id))
+        } else {
+            Err(ApiIdError::OutOfRange)
+        }
+    }
+
+    /// Trims surrounding whitespace, then expects 1 to 10 ASCII digits.
+    pub fn parse(input: &str) -> Result<Self, ApiIdError> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(ApiIdError::Empty);
+        }
+        if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ApiIdError::NotDigits);
+        }
+        if trimmed.len() > Self::MAX_DIGITS {
+            return Err(ApiIdError::TooLong);
+        }
+        let id = trimmed.parse::<i32>().map_err(|_| ApiIdError::OutOfRange)?;
+        Self::new(id)
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// A Telegram application's `api_id` and `api_hash`. `Debug` redacts both.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiCredentials {
+    pub api_id: ApiId,
+    pub api_hash: ApiHash,
+}
+
+impl ApiCredentials {
+    /// A pair for the fake backend and tests: `api_id` (made positive) and a
+    /// fixed hash.
+    #[cfg(any(test, feature = "fake"))]
+    pub fn fake(api_id: i32) -> Self {
+        Self {
+            api_id: ApiId(api_id.max(1)),
+            api_hash: ApiHash("0123456789abcdef0123456789abcdef".to_owned()),
+        }
+    }
+}
+
+impl std::fmt::Debug for ApiCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiCredentials(<redacted>)")
+    }
+}
+
+/// The longest login code any delivery takes: a flash call's code is the
+/// whole calling number, and E.164 numbers have at most 15 digits.
+pub const MAX_CODE_DIGITS: usize = 15;
+/// Bound on server-supplied delivery text (a flash-call pattern, a
+/// missed-call prefix, a Fragment URL), in bytes.
+pub const MAX_DELIVERY_TEXT: usize = 256;
+
+/// How Telegram delivered a login code (`auth.SentCodeType`, the supported
+/// subset; plan section 17.2a). Server-supplied text is sanitized by the
+/// backend: a pattern or prefix keeps digits, `+`, `*`, spaces and dashes
+/// only, a URL must be `https://` and printable ASCII, each at most
+/// [`MAX_DELIVERY_TEXT`] bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeDelivery {
+    /// A message in the user's other Telegram sessions.
+    App,
+    Sms,
+    /// A voice call that reads the code.
+    Call,
+    /// A flash call: the code is the whole calling number, which matches
+    /// `pattern` (`*` stands for a digit not given in advance).
+    FlashCall {
+        pattern: String,
+    },
+    /// A missed call from a number starting with `prefix`: the code is the
+    /// last [`SentCodeInfo::length`] digits of that number.
+    MissedCall {
+        prefix: String,
+    },
+    /// An SMS to an anonymous number, read on fragment.com. Core never shows
+    /// a code screen for it: it routes to [`AuthState::OfficialAppRequired`]
+    /// with this `url`, which is shown as text and never opened by abyss.
+    Fragment {
+        url: Option<String>,
+    },
+}
+
+/// How the next code would be delivered after a resend (`auth.CodeType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextDelivery {
+    Sms,
+    Call,
+    FlashCall,
+    MissedCall,
+    FragmentSms,
+}
+
+/// Where the login code went, for the code screen (plan section 17.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SentCodeInfo {
+    pub delivery: CodeDelivery,
+    /// Digits in the code, when the server said. For a missed call: how many
+    /// trailing digits of the calling number to enter.
+    pub length: Option<u8>,
+    /// What a resend would use, if the server offers one.
+    pub next: Option<NextDelivery>,
+    /// The server asks not to resend before this time.
+    pub resend_at: Option<SystemTime>,
+}
+
+impl SentCodeInfo {
+    /// The most digits the code entry takes for this delivery: a flash
+    /// call's pattern length (the whole calling number), else the stated
+    /// length, else [`MAX_CODE_DIGITS`]; never more than that. A pattern
+    /// that is a lone `*` accepts a number of any length
+    /// (<https://core.telegram.org/api/pattern>), so it gets the full
+    /// allowance; `*` among digits stands for one digit.
+    pub fn max_code_digits(&self) -> usize {
+        let digits = match &self.delivery {
+            CodeDelivery::FlashCall { pattern } if pattern.trim() == "*" => None,
+            CodeDelivery::FlashCall { pattern } => {
+                let n = pattern
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '*')
+                    .count();
+                (n > 0).then_some(n)
+            }
+            _ => self.length.map(usize::from).filter(|n| *n > 0),
+        };
+        digits.map_or(MAX_CODE_DIGITS, |n| n.min(MAX_CODE_DIGITS))
+    }
+}
+
+/// The Keychain item of entered API credentials, as far as core knows
+/// (plan section 17.2a): what the Retry controls act on. A pair is claimed
+/// absent only once its deletion succeeded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CredentialItem {
+    /// No save or delete is running or failed.
+    #[default]
+    Settled,
+    /// The proven entered pair is being saved.
+    Saving,
+    /// Saving the proven entered pair failed; it stays in memory.
+    /// `Command::RetryCredentialSave` tries again.
+    SaveFailed(StorageError),
+    /// The stored pair is being deleted; it still counts as stored.
+    Deleting,
+    /// Deleting the stored pair failed; it may still be in the Keychain.
+    /// `Command::ForgetStoredCredentials` tries again.
+    DeleteFailed(StorageError),
+}
+
+/// What the Done screen shows after a login in this run (plan section 17.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewLogin {
+    /// `Some(false)`: the account has no 2FA password; recommend one.
+    /// `None`: unknown (a login confirmed by the probe).
+    pub has_password: Option<bool>,
 }
 
 /// A device-local storage failure, without OS detail (that may be logged
@@ -254,12 +491,15 @@ pub enum LogoutStatus {
     Incomplete,
 }
 
-/// Login state (plan sections 4 and 17.2).
+/// Login state (plan sections 4, 17.2 and 17.2a).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthState {
-    /// No usable API credentials. `error` says why the last pair failed.
+    /// No usable API credentials. `error` says why; `source` says which
+    /// source is in control (an env override disables entering a pair;
+    /// `Stored` after Back means a pair is still saved).
     NeedCredentials {
         error: Option<CredentialError>,
+        source: Option<CredentialSource>,
     },
     Connecting,
     Phone {
@@ -268,6 +508,8 @@ pub enum AuthState {
     Code {
         /// Masked, e.g. `+44 •••• ••12`; see [`mask_phone`].
         phone_hint: String,
+        /// Where the code went.
+        sent: Option<SentCodeInfo>,
         error: Option<UserError>,
     },
     Password {
@@ -284,22 +526,68 @@ pub enum AuthState {
         until: SystemTime,
         resume: Box<AuthState>,
     },
+    /// A sign-in may have gone through but its answer was lost. Core asks
+    /// the server (and retries by itself) before it accepts another attempt.
+    /// `error` is why the last check failed.
+    Verifying {
+        error: Option<UserError>,
+    },
     /// The number has no account; create it in an official app.
     SignUpRequired,
+    /// Telegram asked for a step abyss does not implement (email setup,
+    /// `auth.sentCodeSuccess`, a Fragment code, …): finish it in an official
+    /// app, then retry. `url` is a server-supplied page for the step (the
+    /// Fragment number's page), sanitized; shown as text, never opened.
+    OfficialAppRequired {
+        url: Option<String>,
+    },
     /// `display_name` is empty until the server has answered once.
+    /// `new_login` is set for a login completed in this run.
     SignedIn {
         display_name: String,
+        new_login: Option<NewLogin>,
     },
     /// Signed in, but the session could not be saved: the user signs in again
     /// next launch.
     SignedInUnsaved {
         display_name: String,
+        new_login: Option<NewLogin>,
     },
     LoggingOut,
+    /// A logout was asked for and its marker is being written (the
+    /// Keychain may prompt): nothing has changed yet and the account's data
+    /// stays, but sends and retries are refused until the write resolves
+    /// (review round 25, finding 1). Then `LoggingOut`, or
+    /// `LogoutNotStarted`.
+    LogoutStarting,
     LoggedOut {
         remote: RemoteLogout,
         local: LocalDeletion,
     },
+    /// The logout-pending marker could not be written, so the logout did
+    /// not start: nothing was ended or deleted, and the session is intact
+    /// (review round 19). `Command::Logout` retries; for a logout the user
+    /// asked for, `Command::Back` stays signed in.
+    LogoutNotStarted {
+        error: StorageError,
+        trigger: LogoutTrigger,
+    },
+    /// Startup could not read the logout-pending marker, so it cannot tell
+    /// whether a logout is pending: nothing is loaded or deleted until
+    /// `Command::RetryStartup` reads it (review round 19).
+    StartupBlocked {
+        error: StorageError,
+    },
+}
+
+/// Who started a logout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogoutTrigger {
+    /// The user: they may stay signed in instead.
+    User,
+    /// The server ended the session, or a repeated migration abandoned it:
+    /// the account cannot continue.
+    Server,
 }
 
 impl AuthState {
@@ -356,6 +644,87 @@ mod tests {
         assert_eq!(ApiHash::parse(&bad), Err(ApiHashError::NotHex));
         let inner = format!("{} {}", "a".repeat(15), "a".repeat(16));
         assert_eq!(ApiHash::parse(&inner), Err(ApiHashError::NotHex));
+    }
+
+    #[test]
+    fn api_id_validation() {
+        assert_eq!(ApiId::parse(" 42 ").unwrap().get(), 42);
+        assert_eq!(ApiId::parse("2147483647").unwrap().get(), i32::MAX);
+        assert_eq!(ApiId::parse("2147483648"), Err(ApiIdError::OutOfRange));
+        assert_eq!(ApiId::parse("0"), Err(ApiIdError::OutOfRange));
+        assert_eq!(ApiId::parse("00000000001"), Err(ApiIdError::TooLong));
+        assert_eq!(ApiId::parse("-1"), Err(ApiIdError::NotDigits));
+        assert_eq!(ApiId::parse("1 2"), Err(ApiIdError::NotDigits));
+        assert_eq!(ApiId::parse("١٢"), Err(ApiIdError::NotDigits));
+        assert_eq!(ApiId::parse("  "), Err(ApiIdError::Empty));
+        assert_eq!(ApiId::new(-5), Err(ApiIdError::OutOfRange));
+    }
+
+    #[test]
+    fn api_hash_boundaries_and_case() {
+        let upper = "ABCDEF0123456789".repeat(2);
+        assert_eq!(
+            ApiHash::parse(&upper).unwrap().expose(),
+            upper.to_lowercase()
+        );
+        assert!(ApiHash::parse(&format!("\t{}\n", "0".repeat(32))).is_ok());
+        assert_eq!(ApiHash::parse(&"é".repeat(16)), Err(ApiHashError::NotHex));
+    }
+
+    #[test]
+    fn credentials_debug_redacts_both_halves() {
+        let creds = ApiCredentials {
+            api_id: ApiId::new(123_456).unwrap(),
+            api_hash: ApiHash::parse(&"ab".repeat(16)).unwrap(),
+        };
+        let shown = format!("{creds:?}");
+        assert!(!shown.contains("123456") && !shown.contains("abab"));
+    }
+
+    #[test]
+    fn env_and_keychain_errors_block_entry() {
+        let partial = CredentialError::EnvPartial {
+            missing: EnvVar::ApiHash,
+        };
+        assert!(!partial.allows_entry());
+        assert!(!CredentialError::KeychainUnavailable.allows_entry());
+        assert!(CredentialError::ApiIdInvalid.allows_entry());
+        assert!(CredentialError::StoredUnreadable.allows_entry());
+        assert_eq!(EnvVar::ApiHash.name(), "ABYSS_API_HASH");
+    }
+
+    /// Round 11, finding 5: a flash call's code is the whole calling number
+    /// (up to 15 digits), a missed call's its stated tail.
+    #[test]
+    fn code_bounds_follow_the_delivery() {
+        let info = |delivery, length| SentCodeInfo {
+            delivery,
+            length,
+            next: None,
+            resend_at: None,
+        };
+        let flash = CodeDelivery::FlashCall {
+            pattern: "+44 7700 9*****".into(),
+        };
+        assert_eq!(info(flash, None).max_code_digits(), 12);
+        let long = CodeDelivery::FlashCall {
+            pattern: "*".repeat(40),
+        };
+        assert_eq!(info(long, None).max_code_digits(), MAX_CODE_DIGITS);
+        // Round 19, 3: a lone `*` is any number of digits, not one.
+        let any = CodeDelivery::FlashCall {
+            pattern: "*".into(),
+        };
+        assert_eq!(info(any, None).max_code_digits(), MAX_CODE_DIGITS);
+        let missed = CodeDelivery::MissedCall {
+            prefix: "+44 7700".into(),
+        };
+        assert_eq!(info(missed, Some(4)).max_code_digits(), 4);
+        assert_eq!(info(CodeDelivery::Sms, Some(5)).max_code_digits(), 5);
+        assert_eq!(
+            info(CodeDelivery::App, None).max_code_digits(),
+            MAX_CODE_DIGITS
+        );
     }
 
     #[test]

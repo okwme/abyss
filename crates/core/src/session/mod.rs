@@ -26,7 +26,9 @@ use grammers_session::{BoxFuture, Session};
 use tokio::sync::watch;
 
 pub use cell::SessionSnapshot;
-pub use peers::{MAX_PINNED_PEERS, MAX_UNPINNED_PEERS};
+pub use peers::{
+    MAX_HANDOFF_PEERS, MAX_HANDOFFS, MAX_PINNED_PEERS, MAX_UNPINNED_PEERS, PinRequest, Pinned,
+};
 pub use worker::{
     AccountGen, LoadStatus, LoadedSession, PERSIST_QUEUE, PersistError, PersistHandle,
 };
@@ -40,6 +42,33 @@ use peers::PeerMap;
 #[cfg(any(test, feature = "fake"))]
 pub fn signed_in_blob(self_id: i64, access_hash: i64) -> zeroize::Zeroizing<Vec<u8>> {
     let mut state = critical::CriticalState::default();
+    state.self_user = Some(critical::SelfUser {
+        id: self_id,
+        access_hash,
+        bot: false,
+    });
+    critical::encode(&state).unwrap_or_default()
+}
+
+/// Like [`signed_in_blob`], plus an auth key of `key_byte` repeated on every
+/// DC option, so a test can recognize the old account's keys in a later blob.
+#[cfg(test)]
+pub fn signed_in_blob_with_key(
+    self_id: i64,
+    access_hash: i64,
+    key_byte: u8,
+) -> zeroize::Zeroizing<Vec<u8>> {
+    let mut state = critical::CriticalState::default();
+    let options: Vec<DcOption> = (1..=5)
+        .filter_map(|id| state.dc_option(id))
+        .map(|mut o| {
+            o.auth_key = Some([key_byte; 256]);
+            o
+        })
+        .collect();
+    for option in &options {
+        let _ = state.set_dc_option(option);
+    }
     state.self_user = Some(critical::SelfUser {
         id: self_id,
         access_hash,
@@ -140,9 +169,54 @@ impl AbyssSession {
         self.peers().pin(infos)
     }
 
-    /// Replaces the pinned set, for example after `DialogsReset`.
-    pub fn replace_pinned_peers(&self, infos: impl IntoIterator<Item = PeerInfo>) -> usize {
-        self.peers().replace_pins(infos)
+    /// Makes `ids` (core's required set, in priority order, at most
+    /// [`MAX_PINNED_PEERS`]) the desired set and pins its addressable peers;
+    /// see [`Pinned`]. A desired peer learned later (by a response or an
+    /// update) is pinned on insertion.
+    pub fn retain_pinned(&self, ids: &[PeerId]) -> Pinned {
+        self.peers().set_pins(PinRequest {
+            required: ids,
+            transient: &[],
+        })
+    }
+
+    /// [`Self::retain_pinned`] for a [`PinRequest`] with transient ids, after
+    /// merging `info`, under the same peer-map lock: a peer resolved before
+    /// the caller took its own locks is pinned with that info even if the
+    /// map evicted it in between.
+    pub fn retain_pinned_with(&self, info: Option<PeerInfo>, request: PinRequest<'_>) -> Pinned {
+        self.peers().merge_and_pin(info, request)
+    }
+
+    /// Caches the peers of one response under one peer-map lock. `handoff`
+    /// (a dialogs page's chats and its cursor peer) stays held, safe from
+    /// eviction, until core's required set pins it or a newer handoff
+    /// displaces it (see the `peers` module). The self user goes to the
+    /// critical state, as with `cache_peer`.
+    pub fn cache_response(
+        &self,
+        handoff: &[PeerId],
+        infos: impl IntoIterator<Item = PeerInfo>,
+    ) -> Result<(), SessionError> {
+        let mut others = Vec::new();
+        for info in infos {
+            // The critical cell is a leaf lock: read without the peer map's.
+            if self.cell.read(|s| s.is_self(&info))? {
+                self.mutate(|s| {
+                    s.merge_self(&info);
+                    Ok(())
+                })?;
+            } else {
+                others.push(info);
+            }
+        }
+        self.peers().cache_response(handoff, others);
+        Ok(())
+    }
+
+    /// The pinned peer ids, in no particular order.
+    pub fn pinned_ids(&self) -> Vec<PeerId> {
+        self.peers().pinned_ids()
     }
 
     /// Becomes `true` on the first `UpdateState::All` for this instance: the
@@ -173,6 +247,12 @@ impl AbyssSession {
 
     /// Peer and update maps hold no invariant a panic could break halfway, so
     /// a poisoned lock is recovered.
+    ///
+    /// Lock order: a caller's own lock (the grammers pin tracker) before the
+    /// peer map, never the reverse: promoting a newly addressable desired
+    /// peer (`cache_peer`, `cache_response`) happens inside the peer map and
+    /// takes no other lock. The critical cell is a leaf, never held while
+    /// taking another lock and never taken under the peer map.
     fn peers(&self) -> MutexGuard<'_, PeerMap> {
         self.peers.lock().unwrap_or_else(PoisonError::into_inner)
     }

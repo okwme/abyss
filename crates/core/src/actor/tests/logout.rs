@@ -90,6 +90,86 @@ async fn key_delete_failure_keeps_the_cache_files() {
     h.stop().await;
 }
 
+/// A cached run leaves a key and files; the next run has no cache (an
+/// unusable directory, so no cache parts). Its logout restarts over the same
+/// store.
+async fn cached_then_disabled(dir: &Path) -> Harness {
+    let mut h = with_cache(dir).await;
+    h.online().await;
+    let store = h.store.clone();
+    h.stop().await;
+    assert!(store.contains(SecretItem::CacheKey));
+    assert!(files_in(dir) > 0);
+    let (backend, fake) = FakeBackend::new(FakeScript::demo(2, 5));
+    let setup = Setup {
+        store: Some(store),
+        ..Setup::default()
+    };
+    let mut h = start(backend, fake, setup).await;
+    h.online().await;
+    h
+}
+
+/// Round 26, finding 1: a logout in a run without a cache still deletes
+/// the cache key an earlier run left, so its files are undecryptable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_without_a_cache_still_deletes_the_cache_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = cached_then_disabled(dir.path()).await;
+    h.send(Command::Logout).await;
+    let (_, local) = h.logged_out().await;
+    assert_eq!(local, LocalDeletion::Deleted);
+    assert!(!h.store.contains(SecretItem::CacheKey), "the key is gone");
+    assert!(!h.store.contains(SecretItem::LogoutPending));
+    h.stop().await;
+}
+
+/// Round 26, finding 1: if that key delete fails, the logout is not done:
+/// the marker stays, so the next start resumes the deletion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_without_a_cache_keeps_the_marker_when_the_key_delete_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = cached_then_disabled(dir.path()).await;
+    h.faults.fail_delete_of(SecretItem::CacheKey);
+    h.send(Command::Logout).await;
+    let (_, local) = h.logged_out().await;
+    assert!(matches!(local, LocalDeletion::Failed(_)), "{local:?}");
+    assert!(h.store.contains(SecretItem::CacheKey));
+    assert!(h.store.contains(SecretItem::LogoutPending), "marker kept");
+    assert!(!stored_signed_in(&h.store).await, "the session is gone");
+    h.stop().await;
+}
+
+/// Round 29, item 4: cached run, then a cache-less logout (key deleted,
+/// files kept), then a cached restart: the new run makes a new key, cannot
+/// open the old database with it, and destroys and recreates it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cached_restart_after_a_cacheless_logout_recreates_the_database() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("cache.db");
+    let mut h = cached_then_disabled(dir.path()).await;
+    let old_inode = std::fs::metadata(&db).unwrap().ino();
+    h.send(Command::Logout).await;
+    assert_eq!(h.logged_out().await.1, LocalDeletion::Deleted);
+    let store = h.store.clone();
+    h.stop().await;
+    assert!(db.exists(), "the files outlive the key");
+    assert!(!store.contains(SecretItem::CacheKey));
+
+    let (backend, fake) = FakeBackend::new(FakeScript::demo(2, 5));
+    let setup = Setup {
+        store: Some(store),
+        cache_dir: Some(dir.path().to_path_buf()),
+        ..Setup::default()
+    };
+    let h = start(backend, fake, setup).await;
+    assert!(h.store.contains(SecretItem::CacheKey), "a new key");
+    let new_inode = std::fs::metadata(&db).unwrap().ino();
+    assert_ne!(old_inode, new_inode, "the old database was destroyed");
+    h.stop().await;
+}
+
 /// `AUTH_KEY_UNREGISTERED` mid-session: the local part of logout runs without
 /// a remote call, and the user is asked to sign in again.
 #[tokio::test(start_paused = true)]
@@ -157,7 +237,13 @@ async fn remote_timeout_still_deletes_local_data() {
 
 /// Shutdown during the remote step: the remote call is cut short, the local
 /// deletion still runs, and the report says so.
-#[tokio::test(start_paused = true)]
+///
+/// Real time (review round 28): the local deletion waits on the persistence
+/// worker, an OS thread the test clock cannot see. On a paused clock the
+/// idle runtime jumped straight to the shutdown deadline whenever that
+/// thread was slow to answer (a loaded machine), and the report read
+/// `Incomplete`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_during_remote_logout_still_deletes_local_data() {
     let mut h = harness(FakeScript::demo(2, 5), None).await;
     h.online().await;
@@ -199,11 +285,13 @@ async fn shutdown_during_a_stalled_local_logout_is_incomplete() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_reports_confirmed_when_saved() {
     let mut h = harness(FakeScript::demo(2, 5), None).await;
-    // The sign-in report and `Online` come from separate steps and can arrive
-    // in either order; `online` returns whatever it skipped.
+    // The startup check can confirm the session before or after the bootstrap
+    // goes online; waiting for it only after `online` hung when it came first.
     let before = h.online().await;
-    let signed_in = |e: &Event| matches!(e, Event::Auth(s) if s.is_signed_in());
-    if !before.iter().any(signed_in) {
+    if !before
+        .iter()
+        .any(|e| matches!(e, Event::Auth(s) if s.is_signed_in()))
+    {
         h.auth(AuthState::is_signed_in).await;
     }
     let report = h.stop().await;

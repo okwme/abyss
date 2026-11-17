@@ -4,10 +4,16 @@
 use grammers_session::Session as _;
 use grammers_session::types::{PeerAuth, PeerInfo};
 
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
 use super::{
-    Account, AuthError, BackendError, CheckPassword, FakeClient, FakeHandle, FakeLogin, Fault, Op,
-    PasswordBuf, PasswordChallenge, SignIn, injected_panic,
+    Account, AuthError, BackendError, CheckPassword, CodeDelivery, CodeRequest,
+    FAKE_INVALID_API_ID, FAKE_PUBLISHED_API_ID, FakeClient, FakeHandle, FakeLogin, Fault,
+    NextDelivery, Op, PasswordBuf, PasswordChallenge, SentCode, SignIn, injected_panic,
 };
+use crate::api::CredentialError;
 
 /// The fake account's user id and access hash.
 pub const FAKE_SELF_ID: i64 = 777_000;
@@ -123,11 +129,57 @@ impl ServerAuth {
     }
 }
 
+/// A flash call's pattern in the fake: a 12-digit number whose code is the
+/// whole number (`--fake --onboarding`'s flash-call screen).
+pub(crate) const FAKE_FLASH_PATTERN: &str = "+44 7700 9*****";
+
+/// The delivery a resend (or a scripted number) takes in the fake.
+fn delivery_of(next: Option<NextDelivery>) -> CodeDelivery {
+    match next {
+        Some(NextDelivery::Call) => CodeDelivery::Call,
+        Some(NextDelivery::FlashCall) => CodeDelivery::FlashCall {
+            pattern: FAKE_FLASH_PATTERN.into(),
+        },
+        Some(NextDelivery::MissedCall) => CodeDelivery::MissedCall {
+            prefix: "+44 7700 90".into(),
+        },
+        Some(NextDelivery::FragmentSms) => CodeDelivery::Fragment {
+            url: Some("https://fragment.com/number/888".into()),
+        },
+        Some(NextDelivery::Sms) | None => CodeDelivery::Sms,
+    }
+}
+
+/// Where the fake "sends" a code. Numbers starting `+999` script the
+/// unsupported email-setup flow; `+998` to `+994` an SMS, a call, a flash
+/// call, a missed call and a Fragment code, so `--fake --onboarding` can
+/// show each screen.
+fn delivery_for(digits: &str, scripted: Option<SentCode>) -> Option<SentCode> {
+    let with = |next| SentCode {
+        delivery: delivery_of(Some(next)),
+        length: Some(5),
+        next: Some(NextDelivery::Call),
+        timeout: Some(Duration::from_secs(90)),
+    };
+    match digits.get(..3) {
+        Some("999") => None,
+        Some("998") => Some(with(NextDelivery::Sms)),
+        Some("997") => Some(with(NextDelivery::Call)),
+        Some("996") => Some(with(NextDelivery::FlashCall)),
+        Some("995") => Some(with(NextDelivery::MissedCall)),
+        Some("994") => Some(with(NextDelivery::FragmentSms)),
+        _ => scripted,
+    }
+}
+
 /// Whether a call returns its answer or the answer is lost.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Answer {
     Deliver,
     Lose,
+    /// Applied by the server after this delay, detached from the caller
+    /// ([`Fault::Queued`]).
+    Queued(Duration),
 }
 
 fn to_backend(e: AuthError) -> BackendError {
@@ -160,6 +212,7 @@ impl FakeClient {
             Some(Fault::Auth(e)) => Err(e),
             Some(Fault::Hang) => std::future::pending().await,
             Some(Fault::CompleteThenHang) => Ok(Answer::Lose),
+            Some(Fault::Queued(d)) => Ok(Answer::Queued(d)),
             Some(Fault::Panic) => injected_panic("login call"),
         }
     }
@@ -167,8 +220,9 @@ impl FakeClient {
     /// Caches the self user like grammers' `complete_login`: a critical write.
     async fn cache_self(&self) -> Result<(), AuthError> {
         let session = &self.session;
+        let id = self.shared.with(|s| s.auth.login.self_id);
         let info = PeerInfo::User {
-            id: FAKE_SELF_ID,
+            id,
             auth: Some(PeerAuth::from_hash(FAKE_SELF_HASH)),
             bot: Some(false),
             is_self: Some(true),
@@ -186,6 +240,33 @@ impl FakeClient {
         value
     }
 
+    /// Applies `apply` to the server's login state: now, or for a queued
+    /// request, after its delay on a detached task (unless the instance was
+    /// retired by then, which drops it), whether or not this caller waits.
+    async fn on_server<T: Send + 'static>(
+        &self,
+        answer: Answer,
+        apply: impl FnOnce(&mut ServerAuth) -> T + Send + 'static,
+    ) -> T {
+        let Answer::Queued(delay) = answer else {
+            return self.shared.with(|s| apply(&mut s.auth));
+        };
+        let shared = Arc::clone(&self.shared);
+        let retired = Arc::clone(&self.retired);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if retired.load(Ordering::SeqCst) {
+                return;
+            }
+            let _ = tx.send(shared.with(|s| apply(&mut s.auth)));
+        });
+        match rx.await {
+            Ok(v) => v,
+            Err(_) => std::future::pending().await,
+        }
+    }
+
     pub(super) async fn auth_is_authorized(&self) -> Result<bool, BackendError> {
         let answer = self
             .auth_enter(Op::IsAuthorized)
@@ -195,13 +276,58 @@ impl FakeClient {
         Self::answer(answer, Ok(authorized)).await
     }
 
-    pub(super) async fn auth_request_code(&self, phone: &str) -> Result<FakeLoginToken, AuthError> {
+    pub(super) async fn auth_request_code(
+        &self,
+        phone: &str,
+    ) -> Result<CodeRequest<FakeLoginToken>, AuthError> {
         let answer = self.auth_enter(Op::RequestCode).await?;
-        if phone.chars().filter(char::is_ascii_digit).count() < MIN_PHONE_DIGITS {
+        match self.creds.api_id.get() {
+            FAKE_INVALID_API_ID => {
+                return Err(AuthError::Credentials(CredentialError::ApiIdInvalid));
+            }
+            FAKE_PUBLISHED_API_ID => {
+                return Err(AuthError::Credentials(CredentialError::ApiIdPublishedFlood));
+            }
+            _ => {}
+        }
+        let digits: String = phone.chars().filter(char::is_ascii_digit).collect();
+        if digits.len() < MIN_PHONE_DIGITS {
             return Err(AuthError::PhoneInvalid);
         }
+        let scripted = self.shared.with(|s| s.auth.login.sent.clone());
+        let sent = delivery_for(&digits, scripted).ok_or(AuthError::OfficialAppRequired)?;
         let id = self.shared.with(|s| s.auth.send_code());
-        Self::answer(answer, Ok(FakeLoginToken(id))).await
+        let request = CodeRequest {
+            token: FakeLoginToken(id),
+            sent,
+        };
+        Self::answer(answer, Ok(request)).await
+    }
+
+    /// `auth.resendCode`: the next delivery type, a fresh code request.
+    pub(super) async fn auth_resend_code(
+        &self,
+        token: &FakeLoginToken,
+    ) -> Result<CodeRequest<FakeLoginToken>, AuthError> {
+        let answer = self.auth_enter(Op::ResendCode).await?;
+        let resent = self.shared.with(|s| {
+            (s.auth.code_token == Some(token.0))
+                .then(|| (s.auth.send_code(), s.auth.login.sent.clone()))
+        });
+        // A stale or expired code request: Telegram's PHONE_CODE_EXPIRED.
+        let (id, sent) = resent.ok_or(AuthError::Backend(BackendError::Rejected))?;
+        let delivery = delivery_of(sent.and_then(|s| s.next));
+
+        let request = CodeRequest {
+            token: FakeLoginToken(id),
+            sent: SentCode {
+                delivery,
+                length: Some(5),
+                next: None,
+                timeout: None,
+            },
+        };
+        Self::answer(answer, Ok(request)).await
     }
 
     pub(super) async fn auth_sign_in(
@@ -210,7 +336,10 @@ impl FakeClient {
         code: &str,
     ) -> Result<SignIn<FakePasswordToken>, AuthError> {
         let answer = self.auth_enter(Op::SignIn).await?;
-        let verdict = self.shared.with(|s| s.auth.sign_in(token.0, code));
+        let (id, code) = (token.0, code.to_owned());
+        let verdict = self
+            .on_server(answer, move |auth| auth.sign_in(id, &code))
+            .await;
         let out = match verdict {
             SignInVerdict::InvalidCode => SignIn::InvalidCode,
             SignInVerdict::SignUpRequired => SignIn::SignUpRequired,
@@ -232,10 +361,13 @@ impl FakeClient {
         password: PasswordBuf,
     ) -> Result<CheckPassword<FakePasswordToken>, AuthError> {
         let answer = self.auth_enter(Op::CheckPassword).await?;
+        let id = token.0;
         let verdict = self
-            .shared
-            .with(|s| s.auth.check_password(token.0, password.as_bytes()));
-        drop(password);
+            .on_server(answer, move |auth| {
+                auth.check_password(id, password.as_bytes())
+            })
+            .await;
+
         let out = match verdict {
             PasswordVerdict::Consumed => return Err(AuthError::Backend(BackendError::Rejected)),
             PasswordVerdict::Invalid(id, hint) => {
@@ -290,6 +422,11 @@ impl FakeHandle {
     /// The server revokes the session (`AUTH_KEY_UNREGISTERED` from now on).
     pub fn revoke_session(&self) {
         self.shared.with(|s| s.auth.authorized = false);
+    }
+
+    /// The next login signs in to another account: the self user `self_id`.
+    pub fn sign_in_as(&self, self_id: i64) {
+        self.shared.with(|s| s.auth.login.self_id = self_id);
     }
 
     /// The last code expires (grammers folds `PHONE_CODE_EXPIRED` into

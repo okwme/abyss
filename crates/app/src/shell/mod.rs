@@ -6,10 +6,10 @@ mod auth;
 mod bridge;
 mod chat_view;
 mod chats;
+mod onboarding;
 mod session;
 mod shutdown;
 mod view;
-mod welcome;
 
 use abyss_core::StartError;
 use abyss_core::api::Event;
@@ -29,9 +29,7 @@ actions!(
         /// Our own quit (Cmd+Q), so shutdown can wait for core (plan section 5).
         Quit,
         /// Shows or hides the appearance panel (Cmd+comma).
-        Appearance,
-        /// Leaves the Welcome screen for the first sign-in step (Enter).
-        Connect
+        Appearance
     ]
 );
 
@@ -41,7 +39,6 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", Quit, None),
         KeyBinding::new("cmd-,", Appearance, None),
-        KeyBinding::new("enter", Connect, Some(welcome::KEY_CONTEXT)),
     ]
 }
 
@@ -105,10 +102,11 @@ impl Root {
                 .unwrap_or(true)
         });
         let on_app_quit = cx.on_app_quit(|root: &mut Root, _| {
-            if let State::Running(session) = &root.state {
-                session.cancel_core();
-            }
-            async {}
+            quit_signals(&|| {
+                if let State::Running(session) = &root.state {
+                    session.cancel_core();
+                }
+            })
         });
         let on_appearance = cx.observe_window_appearance(window, |_, _, cx| cx.notify());
         Self {
@@ -149,7 +147,7 @@ impl Root {
                 false
             }
             Closing::Waiting => false,
-            Closing::Unconfirmed => true,
+            Closing::Unconfirmed | Closing::LogoutUnfinished => true,
         }
     }
 }
@@ -169,6 +167,7 @@ impl EventSink for Root {
             && session.closing == Closing::Open
         {
             tracing::error!("core stopped unexpectedly");
+            session.core_stopped(cx);
             session.show_notice(crate::ui::copy::CORE_STOPPED.into(), window, cx);
         }
     }
@@ -201,6 +200,33 @@ pub(crate) fn open(launch: Result<Launch, LaunchError>, cx: &mut App) -> gpui::R
         }
     });
     Ok(())
+}
+
+/// The body of the quit callback. Every quit passes here: after core's ack,
+/// the UI's timeout, and an OS-initiated quit. It only signals, and returns
+/// at once (round 30):
+/// - [`abyss_core::cache::begin_exit`], an atomic store: no cache opens
+///   from now on. The exit hook then drains what is open, or ends the
+///   process with `_exit` rather than let SQLCipher tear down under a live
+///   connection (plan section 13).
+/// - `cancel_core`, a `try_send` of a stop request; core cancels on its
+///   own runtime thread.
+/// - In fake runs, a `try_send` that wakes the cleanup worker (after
+///   `begin_exit`, so nothing reopens the directory). The returned future
+///   waits for it, bounded by GPUI.
+///
+/// No lock we own, no file system call, no census wait and no logging runs
+/// here. What GPUI does around it (dropping windows, flushing effects,
+/// waiting up to 200 ms for these futures, `exit`) allocates and takes
+/// its own locks, and is not bounded by us.
+fn quit_signals(cancel_core: &dyn Fn()) -> impl Future<Output = ()> + use<> {
+    abyss_core::cache::begin_exit();
+    cancel_core();
+    #[cfg(feature = "fake")]
+    let cleanup = crate::storage::request_fake_cleanup();
+    #[cfg(not(feature = "fake"))]
+    let cleanup = std::future::ready(());
+    cleanup
 }
 
 #[cfg(test)]

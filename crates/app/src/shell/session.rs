@@ -4,17 +4,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use abyss_core::api::{AuthState, Command, ConnState, Event, PasswordBuf, UserError};
-use abyss_core::{BackendChoice, CoreConfig, SendError, StartError};
-use gpui::{
-    AppContext, Context, Entity, FocusHandle, Focusable, SharedString, Subscription, Task, Window,
+use abyss_core::api::{
+    AuthState, Command, ConnState, CredentialItem, CredentialSource, Event, MAX_CODE_DIGITS,
+    PasswordBuf, UserError,
 };
+use abyss_core::{BackendChoice, CoreConfig, StartError};
+use gpui::{AppContext, Context, Entity, Focusable, SharedString, Subscription, Task, Window};
 
 use super::Root;
 use super::auth::{AuthView, project};
 use super::bridge::{CoreLink, EventSource, SharedCore, spawn_pump};
 use super::shutdown::{self, Closing, Next};
-use crate::chat::ChatShell;
+use crate::chat::{ChatShell, Refused};
 use crate::launch::Launch;
 use crate::ui::copy;
 use crate::ui::password::{PasswordEvent, PasswordInput};
@@ -48,15 +49,24 @@ impl Started {
 pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
     match launch {
         #[cfg(feature = "fake")]
-        Launch::Fake { faults } => {
+        Launch::Fake {
+            faults,
+            start,
+            cache,
+        } => {
             use abyss_core::backend::fake::{FakeBackend, FakeScript};
             let mut script = crate::chat::demo::script(crate::chat::format::now());
+            if start == crate::launch::FakeStart::Onboarding {
+                // No credentials: core starts from `NeedCredentials`.
+                script.env = abyss_core::credentials::EnvResolution::Absent;
+            }
             // The demo account's login: code `FAKE_CODE`, 2FA password with a hint.
             script.login = FakeScript::demo(0, 0).login;
             let (backend, handle) = FakeBackend::new(script);
+            // Opt-in only (`ABYSS_FAKE_CACHE=1`), never the real cache.
             let config = CoreConfig {
                 fake_faults: faults,
-                ..CoreConfig::default()
+                cache: cache.and_then(|location| crate::storage::config(Ok(location))),
             };
             let core = abyss_core::start(config, BackendChoice::Fake(backend))?;
             Ok(Started {
@@ -64,9 +74,18 @@ pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
                 ..Started::new(core)
             })
         }
-        Launch::Telegram(credentials) => {
-            let core =
-                abyss_core::start(CoreConfig::default(), BackendChoice::Grammers(credentials))?;
+        Launch::Telegram { env, cache } => {
+            // `core::start` initializes SQLCipher and the exit hook before
+            // anything opens; a failed directory runs without a cache.
+            #[cfg_attr(
+                not(feature = "fake"),
+                expect(clippy::needless_update, reason = "fake builds add `fake_faults`")
+            )]
+            let config = CoreConfig {
+                cache: crate::storage::config(cache),
+                ..CoreConfig::default()
+            };
+            let core = abyss_core::start(config, BackendChoice::Grammers(env))?;
             Ok(Started::new(core))
         }
     }
@@ -75,17 +94,25 @@ pub(crate) fn start(launch: Launch) -> Result<Started, StartError> {
 pub(crate) struct Session {
     pub(super) core: SharedCore,
     pub(super) auth: AuthView,
-    /// Whether the Welcome screen has been left in this run. It comes before
-    /// the phone step of a signed-out run (plan section 17.3).
-    pub(super) welcomed: bool,
-    /// Holds focus while the Welcome screen shows, so Enter reaches it.
-    pub(super) welcome_focus: FocusHandle,
     /// Core said the password token is gone: the next submission asks for new
     /// parameters first.
     needs_params: bool,
     pub(super) phone: Entity<TextInput>,
     pub(super) code: Entity<TextInput>,
     pub(super) password: Entity<PasswordInput>,
+    /// Credential entry (plan section 17.3). The `api_hash` is a masked
+    /// secret field, like the password.
+    pub(super) api_id: Entity<TextInput>,
+    pub(super) api_hash: Entity<PasswordInput>,
+    /// Log out was pressed and waits for confirmation.
+    logout_prompt: bool,
+    /// Inline validation of the credential entry.
+    pub(super) entry_error: Option<SharedString>,
+    /// Which credential source is in control (core's `CredentialSource`).
+    pub(super) source: Option<CredentialSource>,
+    /// The stored credential item's save or delete (core's
+    /// `CredentialItem`): a failure shows Retry.
+    pub(super) cred_item: CredentialItem,
     pub(super) composer: Entity<TextInput>,
     /// Chat list, open chat and pending sends (`crate::chat`, `shell::chats`).
     pub(super) shell: ChatShell,
@@ -96,7 +123,7 @@ pub(crate) struct Session {
     _pump: Task<()>,
     #[cfg(feature = "fake")]
     fake: Option<abyss_core::backend::fake::FakeHandle>,
-    _subscriptions: [Subscription; 4],
+    _subscriptions: [Subscription; 6],
     _chat_wiring: [Subscription; 2],
 }
 
@@ -107,7 +134,12 @@ impl Session {
         let code = text_input(Limits::CODE, copy::CODE_PLACEHOLDER, cx);
         let composer = text_input(Limits::COMPOSER, copy::COMPOSER_PLACEHOLDER, cx);
         let password = cx.new(|cx| PasswordInput::new(window, cx));
+        let api_id = text_input(Limits::API_ID, copy::onboarding::API_ID_PLACEHOLDER, cx);
+        let api_hash = cx.new(|cx| PasswordInput::api_hash(window, cx));
+        let [id_sub, hash_sub] = credential_subscriptions(&api_id, &api_hash, window, cx);
         let subscriptions = [
+            id_sub,
+            hash_sub,
             cx.subscribe_in(&phone, window, |root, _, _: &TextInputEvent, window, cx| {
                 root.with_session(|s, cx| s.submit_phone(window, cx), cx);
             }),
@@ -131,16 +163,20 @@ impl Session {
         ];
         let pump = spawn_pump(started.events, window, cx);
         let shell = ChatShell::default();
-        let chat_wiring = super::chats::wire(shell.rows(), window, cx);
+        let chat_wiring = super::chats::wire(window, cx);
         let session = Self {
             core: shared,
             auth: AuthView::Connecting,
-            welcomed: false,
-            welcome_focus: cx.focus_handle(),
             needs_params: false,
             phone,
             code,
             password,
+            api_id,
+            api_hash,
+            logout_prompt: false,
+            entry_error: None,
+            source: None,
+            cred_item: CredentialItem::Settled,
             composer,
             shell,
             conn: None,
@@ -158,21 +194,36 @@ impl Session {
     }
 
     /// Queues a command. A full queue shows "busy"; the rejected command is
-    /// dropped (a password in it is zeroized on drop).
+    /// dropped (a password in it is zeroized on drop). Chat commands go
+    /// through `shell::chats`, which changes the UI only once one is admitted.
     pub(super) fn send(&mut self, cmd: Command, window: &mut Window, cx: &mut Context<'_, Root>) {
-        let result = match self.core.try_borrow() {
-            Ok(core) => core.send(cmd),
-            Err(_) => Err(SendError::Full(cmd)),
-        };
-        match result {
-            Ok(()) => {}
-            Err(SendError::Full(_)) => {
-                self.show_notice(copy::user_error(UserError::Busy), window, cx);
-            }
-            Err(SendError::Closed(_)) => {
-                self.show_notice(copy::CORE_GONE.into(), window, cx);
-            }
+        if let Err(refused) = super::chats::admit(&self.core, cmd) {
+            self.show_refused(refused, window, cx);
         }
+    }
+
+    /// Queues an auth command; the caller changes the UI only on `Ok`, so a
+    /// refused command changes nothing and the user can submit again (as
+    /// the chat commands do, task 10b). Refused, it shows "busy".
+    pub(super) fn admit_auth(
+        &mut self,
+        cmd: Command,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) -> Result<(), Refused> {
+        let admitted = super::chats::admit(&self.core, cmd);
+        if let Err(refused) = admitted {
+            self.show_refused(refused, window, cx);
+        }
+        admitted
+    }
+
+    pub(super) fn confirming_logout(&self) -> bool {
+        self.logout_prompt
+    }
+
+    pub(super) fn set_logout_prompt(&mut self, open: LogoutPrompt) {
+        self.logout_prompt = open == LogoutPrompt::Open;
     }
 
     pub(super) fn show_notice(
@@ -213,43 +264,61 @@ impl Session {
         if leaving_password {
             self.password.update(cx, PasswordInput::clear);
         }
+        let ticking = next.ticking_until().is_some() && self.auth.ticking_until().is_none();
+        if next.tears_down() {
+            self.reset_account(window, cx);
+        } else if next.hides_account() {
+            self.shell.hidden();
+        }
+        if let AuthView::Code { sent, .. } = &next {
+            let max = sent.as_ref().map_or(MAX_CODE_DIGITS, |s| s.max_digits);
+            self.code.update(cx, |input, cx| input.set_max_len(max, cx));
+        }
         self.auth = next;
-        if let AuthView::FloodWait { .. } = self.auth {
-            spawn_flood_ticker(window, cx);
+        if ticking {
+            spawn_ticker(window, cx);
         }
         self.focus_for_auth(window, cx);
         cx.notify();
     }
 
-    /// Called every second during a flood wait. Returns whether to keep ticking.
-    pub(super) fn flood_tick(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) -> bool {
-        let AuthView::FloodWait { until, resume } = &self.auth else {
+    /// The account's teardown began (review round 15, B): nothing of it
+    /// stays on screen or in a field. The single entry point for the chat
+    /// state is `ChatShell::reset`.
+    fn reset_account(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        self.shell.reset();
+        self.composer
+            .update(cx, |input, cx| input.clear(window, cx));
+        self.logout_prompt = false;
+    }
+
+    /// Called every second while a countdown runs (a flood wait, a code
+    /// resend). Returns whether to keep ticking.
+    pub(super) fn tick(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) -> bool {
+        let Some(until) = self.auth.ticking_until() else {
             return false;
         };
-        if Instant::now() < *until {
+        if Instant::now() < until {
             cx.notify();
             return true;
         }
-        let resume = (**resume).clone();
-        self.set_auth(resume, window, cx);
+        if let AuthView::FloodWait { resume, .. } = &self.auth {
+            let resume = (**resume).clone();
+            self.set_auth(resume, window, cx);
+        }
+        cx.notify();
         false
     }
 
-    /// Leaves the Welcome screen: the phone step shows and takes focus.
-    pub(super) fn accept_welcome(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
-        self.welcomed = true;
-        self.focus_for_auth(window, cx);
-        cx.notify();
-    }
-
     fn focus_for_auth(&self, window: &mut Window, cx: &mut Context<'_, Root>) {
+        use super::auth::Onboarding;
         let handle = match self.auth {
-            AuthView::Phone { .. } if !self.welcomed => self.welcome_focus.clone(),
+            AuthView::Onboarding(Onboarding::Entry { .. }) => self.api_id.focus_handle(cx),
             AuthView::Phone { .. } => self.phone.focus_handle(cx),
             AuthView::Code { .. } => self.code.focus_handle(cx),
             AuthView::Password { .. } => self.password.focus_handle(cx),
             AuthView::SignedIn if self.shell.selected().is_some() => self.composer.focus_handle(cx),
-            AuthView::Connecting | AuthView::FloodWait { .. } | AuthView::SignedIn => return,
+            _ => return,
         };
         window.focus(&handle, cx);
     }
@@ -259,20 +328,28 @@ impl Session {
             return;
         }
         let phone = self.phone.read(cx).text().to_owned();
-        self.auth = self.auth.cleared();
-        self.send(Command::SubmitPhone(phone), window, cx);
+        if self
+            .admit_auth(Command::SubmitPhone(phone), window, cx)
+            .is_ok()
+        {
+            self.auth = self.auth.cleared();
+        }
         cx.notify();
     }
 
+    /// The code leaves the field only once core accepted it.
     pub(super) fn submit_code(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         if !matches!(self.auth, AuthView::Code { .. }) {
             return;
         }
-        let code = self
-            .code
-            .update(cx, |input, cx| input.take_text(window, cx));
-        self.auth = self.auth.cleared();
-        self.send(Command::SubmitCode(code), window, cx);
+        let code = self.code.read(cx).text().to_owned();
+        if self
+            .admit_auth(Command::SubmitCode(code), window, cx)
+            .is_ok()
+        {
+            self.code.update(cx, |input, cx| input.clear(window, cx));
+            self.auth = self.auth.cleared();
+        }
         cx.notify();
     }
 
@@ -282,17 +359,30 @@ impl Session {
         if !matches!(self.auth, AuthView::Password { .. }) {
             return;
         }
-        self.auth = self.auth.cleared();
-        if std::mem::take(&mut self.needs_params) {
-            self.send(Command::RetryPasswordParams, window, cx);
+        if self.needs_params {
+            if self
+                .admit_auth(Command::RetryPasswordParams, window, cx)
+                .is_ok()
+            {
+                self.needs_params = false;
+                self.auth = self.auth.cleared();
+            }
             cx.notify();
             return;
         }
-        let secret = self.password.update(cx, PasswordInput::take_secret);
+        // A copy: the field keeps the password until core accepted it.
+        let secret = self.password.read(cx).secret();
         let buf = PasswordBuf::from_slice(&secret);
         drop(secret);
         if let Ok(buf) = buf {
-            self.send(Command::SubmitPassword(buf), window, cx);
+            // A refused command is dropped, zeroizing the copy.
+            if self
+                .admit_auth(Command::SubmitPassword(buf), window, cx)
+                .is_ok()
+            {
+                self.password.update(cx, PasswordInput::clear);
+                self.auth = self.auth.cleared();
+            }
         } else if let Some(next) = self
             .auth
             .with_error(UserError::InvalidPassword, Instant::now())
@@ -311,7 +401,13 @@ impl Session {
     ) {
         match event {
             Event::Auth(state) => self.on_auth(state, window, cx),
-            Event::Connection(state) => self.conn = Some(state),
+            Event::CredentialSource(source) => self.source = source,
+            Event::CredentialItem(item) => self.cred_item = item,
+            Event::Connection(state) => {
+                self.conn = Some(state);
+                // Reconnection restarts retries that gave up (`shell::chats`).
+                self.apply_chat_event(Event::Connection(state), window, cx);
+            }
             Event::Error(error) => self.on_error(error, window, cx),
             // Chat list, message view and sends: `shell::chats`.
             chat => self.apply_chat_event(chat, window, cx),
@@ -319,13 +415,9 @@ impl Session {
     }
 
     fn on_auth(&mut self, state: AuthState, window: &mut Window, cx: &mut Context<'_, Root>) {
-        let hint = match &self.auth {
-            AuthView::Password { hint, .. } => hint.clone(),
-            _ => None,
-        };
         #[cfg(feature = "fake")]
         let fake_code = self.fake.is_some() && matches!(state, AuthState::Code { error: None, .. });
-        let projection = project(state, hint, Instant::now());
+        let projection = project(state, &self.auth, Instant::now());
         self.needs_params = projection.needs_params;
         self.set_auth(projection.view, window, cx);
         if let Some(notice) = projection.notice {
@@ -338,8 +430,8 @@ impl Session {
     }
 
     fn on_error(&mut self, error: UserError, window: &mut Window, cx: &mut Context<'_, Root>) {
+        // Errors never end a load: core says which ended (`LoadEnded`).
         tracing::info!(?error, "core reported an error");
-        self.shell.load_failed();
         match self.auth.with_error(error, Instant::now()) {
             Some(next) => self.set_auth(next, window, cx),
             None => self.show_notice(copy::user_error(error), window, cx),
@@ -354,6 +446,7 @@ impl Session {
         }
         self.closing = Closing::Waiting;
         self.password.update(cx, PasswordInput::clear);
+        self.api_hash.update(cx, PasswordInput::clear);
         let ack = self
             .core
             .try_borrow_mut()
@@ -368,6 +461,10 @@ impl Session {
                 Next::Quit => cx.quit(),
                 Next::ShowUnconfirmed => {
                     root.with_session(|s, _| s.closing = Closing::Unconfirmed, cx);
+                    cx.notify();
+                }
+                Next::ShowLogoutUnfinished => {
+                    root.with_session(|s, _| s.closing = Closing::LogoutUnfinished, cx);
                     cx.notify();
                 }
             })
@@ -385,13 +482,40 @@ impl Session {
     }
 }
 
-/// Re-renders the countdown every second until the flood wait ends.
-fn spawn_flood_ticker(window: &mut Window, cx: &mut Context<'_, Root>) {
+/// Whether the logout confirmation is up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogoutPrompt {
+    Open,
+    Closed,
+}
+
+/// Enter in either credential field submits both.
+fn credential_subscriptions(
+    api_id: &Entity<TextInput>,
+    api_hash: &Entity<PasswordInput>,
+    window: &mut Window,
+    cx: &mut Context<'_, Root>,
+) -> [Subscription; 2] {
+    let id_sub = cx.subscribe_in(api_id, window, |root, _, _: &TextInputEvent, window, cx| {
+        root.with_session(|s, cx| s.submit_credentials(window, cx), cx);
+    });
+    let hash_sub = cx.subscribe_in(
+        api_hash,
+        window,
+        |root, _, _: &PasswordEvent, window, cx| {
+            root.with_session(|s, cx| s.submit_credentials(window, cx), cx);
+        },
+    );
+    [id_sub, hash_sub]
+}
+
+/// Re-renders a countdown every second until it ends.
+fn spawn_ticker(window: &mut Window, cx: &mut Context<'_, Root>) {
     cx.spawn_in(window, async move |this, cx| {
         loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let more = this.update_in(cx, |root, window, cx| {
-                root.with_session(|s, cx| s.flood_tick(window, cx), cx)
+                root.with_session(|s, cx| s.tick(window, cx), cx)
             });
             if more.ok().flatten() != Some(true) {
                 return;

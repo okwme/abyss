@@ -30,6 +30,21 @@ pub(super) const STREAM_RETRY: [Duration; 3] = [
     Duration::from_secs(2),
 ];
 
+/// Identity of one history load, unique per actor. A bootstrap snapshot is
+/// tracked by `(chat, ReqId)`, independent of the view it fills, so it always
+/// completes even when its view went stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ReqId(pub(super) u64);
+
+/// One history load (cache read and/or server call): its chat, the view it
+/// fills, and its identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Load {
+    pub(super) chat: ChatId,
+    pub(super) view: ViewGen,
+    pub(super) req: ReqId,
+}
+
 /// A backend call waiting for admission.
 #[derive(Debug)]
 pub(super) enum Job {
@@ -37,16 +52,22 @@ pub(super) enum Job {
         cursor: Option<DialogsCursor>,
     },
     History {
-        chat: ChatId,
-        view: ViewGen,
+        load: Load,
         dir: HistoryDir,
         query: HistoryQuery,
+        /// For tails: the newest id the window held when the request was
+        /// made. The server's answer is authoritative up to it; anything
+        /// newer in the window arrived later (a live update).
+        floor: Option<MsgId>,
     },
     Send {
         local_id: LocalId,
         chat: ChatId,
         text: String,
         random_id: i64,
+        /// A flood-waited send's automatic-retry window: past it, the send
+        /// is not made (checked right before the call; review round 19).
+        expires: Option<tokio::time::Instant>,
     },
     Read {
         chat: ChatId,
@@ -89,21 +110,25 @@ pub(super) enum Outcome {
         res: CallResult<DialogsPage>,
     },
     History {
-        chat: ChatId,
-        view: ViewGen,
+        load: Load,
         dir: HistoryDir,
         query: HistoryQuery,
+        floor: Option<MsgId>,
         res: CallResult<HistoryPage>,
     },
     Send {
         local_id: LocalId,
         res: CallResult<MsgId>,
     },
+    /// An automatic send reached its call after its window closed: it was
+    /// not made.
+    SendExpired {
+        local_id: LocalId,
+    },
     Read(CallResult<()>),
     CacheChats(Option<Vec<ChatSummary>>),
     CacheHistory {
-        chat: ChatId,
-        view: ViewGen,
+        load: Load,
         dir: HistoryDir,
         anchor: Option<MsgId>,
         messages: Option<Vec<Message>>,
@@ -123,11 +148,15 @@ pub(super) struct Done {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TaskKind {
     Dialogs,
-    History(ChatId),
+    /// A history load and its direction: a panic ends only that load
+    /// (task 10e), never one deferred behind it.
+    History(Load, HistoryDir),
     Send(LocalId),
     Read,
     CacheChats,
     Updates,
+    /// A login call (task 6b), for panic handling.
+    Auth(super::auth::AuthTag),
 }
 
 /// A spawned task reporting back to the actor.
@@ -143,6 +172,15 @@ struct Admitted {
 }
 
 impl Admitted {
+    /// Reports `outcome` without a call; the permit is released.
+    fn skip(self, outcome: Outcome) -> Done {
+        Done {
+            cgen: self.cgen,
+            parked: None,
+            outcome,
+        }
+    }
+
     /// Runs `call` under the deadline and reports `outcome(result)`. On time-out
     /// the permit is handed back for parking; otherwise it is released here.
     async fn run<T>(
@@ -208,29 +246,39 @@ pub(super) fn job_future<C: Client>(
             (TaskKind::Dialogs, Box::pin(fut))
         }
         Job::History {
-            chat,
-            view,
+            load,
             dir,
             query,
+            floor,
         } => {
-            let call = async move { client.history(chat, query, PAGE).await };
+            let call = async move { client.history(load.chat, query, PAGE).await };
             let fut = admitted.run(call, move |res| Outcome::History {
-                chat,
-                view,
+                load,
                 dir,
                 query,
+                floor,
                 res,
             });
-            (TaskKind::History(chat), Box::pin(fut))
+            (TaskKind::History(load, dir), Box::pin(fut))
         }
         Job::Send {
             local_id,
             chat,
             text,
             random_id,
+            expires,
         } => {
             let call = async move { client.send_text(chat, text, random_id).await };
-            let fut = admitted.run(call, move |res| Outcome::Send { local_id, res });
+            let fut = async move {
+                // Admission includes the window: a queued (or preserved)
+                // automatic send never reaches the server after it closed.
+                if expires.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                    return admitted.skip(Outcome::SendExpired { local_id });
+                }
+                admitted
+                    .run(call, move |res| Outcome::Send { local_id, res })
+                    .await
+            };
             (TaskKind::Send(local_id), Box::pin(fut))
         }
         Job::Read { chat, max_id } => {
@@ -246,11 +294,11 @@ pub(super) fn job_future<C: Client>(
 pub(super) async fn cache_history(
     cache: CacheHandle,
     cgen: ClientGen,
-    chat: ChatId,
-    view: ViewGen,
+    load: Load,
     dir: HistoryDir,
     anchor: Option<MsgId>,
 ) -> Done {
+    let chat = load.chat;
     let res = match (dir, anchor) {
         (HistoryDir::Older, Some(id)) => cache.before(chat, id, PAGE).await,
         (HistoryDir::Newer, Some(id)) => cache.after(chat, id, PAGE).await,
@@ -260,8 +308,7 @@ pub(super) async fn cache_history(
         cgen,
         parked: None,
         outcome: Outcome::CacheHistory {
-            chat,
-            view,
+            load,
             dir,
             anchor,
             messages: res.ok(),

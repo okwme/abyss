@@ -3,8 +3,8 @@
 mod chat;
 mod launch;
 mod logging;
-mod onboarding;
 mod shell;
+mod storage;
 mod ui;
 
 use gpui::App;

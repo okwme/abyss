@@ -14,7 +14,7 @@ use gpui::{Entity, TestAppContext, VisualTestContext};
 use super::bridge::{CoreLink, DRAIN_MAX, EventSource, ShutdownAck, drain};
 use super::shutdown::Closing;
 use super::{Failure, Root, State};
-use crate::launch::{API_HASH_VAR, API_ID_VAR, LaunchError};
+use crate::launch::LaunchError;
 
 /// Commands the UI sent, and whether the queue reports full.
 #[derive(Default)]
@@ -95,14 +95,14 @@ fn closing(root: &Entity<Root>, cx: &mut VisualTestContext) -> Option<Closing> {
 }
 
 #[gpui::test]
-fn missing_credentials_show_the_error_screen_and_close_freely(cx: &mut TestAppContext) {
-    let missing = LaunchError::MissingCredentials(vec![API_ID_VAR, API_HASH_VAR]);
-    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(missing), window, cx));
+fn launch_errors_show_the_error_screen_and_close_freely(cx: &mut TestAppContext) {
+    let error = LaunchError::FakeNotBuilt;
+    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(error), window, cx));
     cx.run_until_parked();
     root.read_with(cx, |root, _| {
         assert!(matches!(
             root.state,
-            State::Failed(Failure::Launch(LaunchError::MissingCredentials(_)))
+            State::Failed(Failure::Launch(LaunchError::FakeNotBuilt))
         ));
     });
     assert_eq!(closing(&root, cx), None);
@@ -133,8 +133,8 @@ fn drain_takes_at_most_drain_max_per_wake() {
 fn appearance_choice_rethemes_the_window_and_reset_restores_it(cx: &mut TestAppContext) {
     use crate::ui::theme::{Choice, Hue, Mode, Settings, Themes, Tint};
 
-    let missing = LaunchError::MissingCredentials(vec![API_ID_VAR]);
-    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(missing), window, cx));
+    let error = LaunchError::FakeNotBuilt;
+    let (root, cx) = cx.add_window_view(|window, cx| Root::new(Err(error), window, cx));
     cx.run_until_parked();
     let showing = cx.update(|window, _| Mode::of(window));
     let before = cx.update(|window, cx| Themes::of(window, cx));
@@ -172,20 +172,11 @@ mod fake {
     use crate::shell::session::Started;
     use crate::ui::text_input;
 
-    /// A window past the Welcome screen, which has its own test.
-    fn open(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {
-        let (root, cx, harness) = open_at_welcome(cx);
-        root.update(cx, |root, cx| {
-            root.with_session(|s, _| s.welcomed = true, cx);
-        });
-        (root, cx, harness)
-    }
+    mod quit;
+    mod review10e;
 
-    fn open_at_welcome(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {
-        cx.update(|cx| {
-            cx.bind_keys(text_input::key_bindings());
-            cx.bind_keys(crate::shell::key_bindings());
-        });
+    fn open(cx: &mut TestAppContext) -> (Entity<Root>, &mut VisualTestContext, Harness) {
+        cx.update(|cx| cx.bind_keys(text_input::key_bindings()));
         let (commands, events, harness) = link();
         let started = Started {
             commands,
@@ -196,28 +187,6 @@ mod fake {
             cx.add_window_view(|window, cx| Root::with_started(Ok(started), window, cx));
         cx.run_until_parked();
         (root, cx, harness)
-    }
-
-    /// A signed-out run shows the Welcome screen first. Typing does nothing
-    /// there; Enter leaves it, and the phone field then has focus.
-    #[gpui::test]
-    fn welcome_comes_before_the_phone_step(cx: &mut TestAppContext) {
-        let (root, cx, harness) = open_at_welcome(cx);
-        core_says(&harness, cx, AuthState::Phone { error: None });
-        assert!(!read(&root, cx, |s| s.welcomed));
-        cx.simulate_input("+15550100");
-        cx.simulate_keystrokes("enter");
-        assert!(read(&root, cx, |s| s.welcomed), "Enter leaves Welcome");
-        assert!(
-            last_command(&harness).is_none(),
-            "nothing typed on Welcome reaches core"
-        );
-        cx.simulate_input("+15550100");
-        cx.simulate_keystrokes("enter");
-        assert!(matches!(
-            last_command(&harness),
-            Some(Command::SubmitPhone(p)) if p == "+15550100"
-        ));
     }
 
     fn read<R>(
@@ -251,8 +220,33 @@ mod fake {
                 Command::SubmitPassword(PasswordBuf::from_slice(p.as_bytes()).unwrap())
             }
             Command::RetryPasswordParams => Command::RetryPasswordParams,
-            _ => Command::Logout,
+            Command::SubmitCredentials { api_id, api_hash } => Command::SubmitCredentials {
+                api_id: *api_id,
+                api_hash: api_hash.clone(),
+            },
+            Command::Back => Command::Back,
+            Command::ResendCode => Command::ResendCode,
+            Command::ReloadCredentials => Command::ReloadCredentials,
+            Command::ForgetStoredCredentials => Command::ForgetStoredCredentials,
+            Command::Logout => Command::Logout,
+            // A stand-in for commands these tests don't inspect.
+            _ => Command::LoadDialogs,
         })
+    }
+
+    fn sent_count(harness: &Harness) -> usize {
+        harness.sent.borrow().commands.len()
+    }
+
+    fn act(
+        root: &Entity<Root>,
+        cx: &mut VisualTestContext,
+        f: impl FnOnce(&mut super::super::Session, &mut gpui::Window, &mut gpui::Context<'_, Root>),
+    ) {
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| f(s, window, cx), cx);
+        });
+        cx.run_until_parked();
     }
 
     /// The router follows core's states; each form sends its command.
@@ -269,6 +263,7 @@ mod fake {
             cx,
             AuthState::Code {
                 phone_hint: phone_hint.clone(),
+                sent: None,
                 error: None,
             },
         );
@@ -276,6 +271,7 @@ mod fake {
             auth(root, cx),
             AuthView::Code {
                 phone_hint: phone_hint.into(),
+                sent: None,
                 error: None
             }
         );
@@ -302,9 +298,252 @@ mod fake {
             cx,
             AuthState::SignedIn {
                 display_name: "Demo User".into(),
+                new_login: None,
             },
         );
         assert_eq!(auth(root, cx), AuthView::SignedIn);
+    }
+
+    /// Welcome → guide → entry (UI-only), Back locally, inline validation,
+    /// then `SubmitCredentials` with the fields cleared.
+    #[gpui::test]
+    fn onboarding_entry_submits_credentials(cx: &mut TestAppContext) {
+        use crate::shell::auth::{Onboarding, Stored};
+        let (root, cx, harness) = open(cx);
+        let need = AuthState::NeedCredentials {
+            error: None,
+            source: None,
+        };
+        core_says(&harness, cx, need);
+        assert_eq!(auth(&root, cx), AuthView::Onboarding(Onboarding::Welcome));
+        act(&root, cx, super::super::Session::connect);
+        assert_eq!(auth(&root, cx), AuthView::Onboarding(Onboarding::Guide));
+        act(&root, cx, super::super::Session::have_credentials);
+        let entry = AuthView::Onboarding(Onboarding::Entry {
+            error: None,
+            stored: Stored::No,
+        });
+        assert_eq!(auth(&root, cx), entry);
+        act(&root, cx, super::super::Session::back);
+        assert_eq!(auth(&root, cx), AuthView::Onboarding(Onboarding::Guide));
+        assert_eq!(sent_count(&harness), 0, "UI-only Back sends nothing");
+        act(&root, cx, super::super::Session::have_credentials);
+
+        // api_id is focused; Enter with no hash is refused inline.
+        cx.simulate_input("12345");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sent_count(&harness), 0);
+        assert_eq!(
+            read(&root, cx, |s| s.entry_error.clone()),
+            Some(crate::ui::copy::onboarding::HASH_INVALID.into())
+        );
+        act(&root, cx, |s, w, cx| {
+            use gpui::Focusable;
+            let handle = s.api_hash.focus_handle(cx);
+            w.focus(&handle, cx);
+        });
+        let hash = "0123456789abcdef0123456789ABCDEF";
+        cx.simulate_input(hash);
+        // Masked: the field shows bullets, never the hash.
+        let shown = read(&root, cx, |s| s.api_hash.clone());
+        assert_eq!(
+            shown.read_with(cx, |i, _| i.reveal()),
+            crate::ui::password::Reveal::Hidden
+        );
+        cx.simulate_keystrokes("enter");
+        let Some(Command::SubmitCredentials { api_id, api_hash }) = last_command(&harness) else {
+            panic!("expected SubmitCredentials");
+        };
+        assert_eq!(api_id, 12345);
+        assert_eq!(api_hash.expose(), hash.to_lowercase());
+        assert_eq!(read(&root, cx, |s| s.entry_error.clone()), None);
+        let api_id_left = read(&root, cx, |s| s.api_id.clone());
+        assert_eq!(api_id_left.read_with(cx, |i, _| i.text().to_owned()), "");
+        assert!(
+            shown.read_with(cx, |i, _| i.secret().is_empty()),
+            "wiped once admitted"
+        );
+    }
+
+    /// Back on login screens goes to core; never away from an env pair.
+    #[gpui::test]
+    fn back_rules(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        core_says(&harness, cx, AuthState::Phone { error: None });
+        act(&root, cx, super::super::Session::back);
+        assert!(matches!(last_command(&harness), Some(Command::Back)));
+        let sent = sent_count(&harness);
+        let env = Event::CredentialSource(Some(abyss_core::api::CredentialSource::Env));
+        harness.events.unbounded_send(env).unwrap();
+        cx.run_until_parked();
+        act(&root, cx, super::super::Session::back);
+        assert_eq!(sent_count(&harness), sent, "no Back from an env pair");
+        let code = AuthState::Code {
+            phone_hint: "+1 •••• •••00".into(),
+            sent: None,
+            error: None,
+        };
+        core_says(&harness, cx, code);
+        act(&root, cx, super::super::Session::back);
+        assert!(matches!(last_command(&harness), Some(Command::Back)));
+        core_says(&harness, cx, AuthState::Verifying { error: None });
+        let sent = sent_count(&harness);
+        act(&root, cx, super::super::Session::back);
+        assert_eq!(sent_count(&harness), sent, "no Back while verifying");
+    }
+
+    /// A login in this run shows Done (with the 2FA recommendation), then
+    /// the chats; Logout asks first and sends `Command::Logout` only once
+    /// confirmed (task 6c).
+    #[gpui::test]
+    fn done_then_chats_then_logout(cx: &mut TestAppContext) {
+        use crate::shell::auth::Saved;
+        let (root, cx, harness) = open(cx);
+        let signed_in = AuthState::SignedIn {
+            display_name: String::new(),
+            new_login: Some(abyss_core::api::NewLogin {
+                has_password: Some(false),
+            }),
+        };
+        core_says(&harness, cx, signed_in);
+        assert_eq!(
+            auth(&root, cx),
+            AuthView::Done {
+                has_password: Some(false),
+                saved: Saved::Yes
+            }
+        );
+        act(&root, cx, super::super::Session::open_chats);
+        assert_eq!(auth(&root, cx), AuthView::SignedIn);
+        let before = sent_count(&harness);
+        act(&root, cx, super::super::Session::logout);
+        assert_eq!(sent_count(&harness), before, "Logout asks first");
+        assert!(read(&root, cx, super::super::Session::confirming_logout));
+        act(&root, cx, super::super::Session::cancel_logout);
+        assert!(!read(&root, cx, super::super::Session::confirming_logout));
+        assert_eq!(sent_count(&harness), before, "cancel sends nothing");
+        act(&root, cx, super::super::Session::logout);
+        // A refused logout keeps the prompt up for another try.
+        harness.sent.borrow_mut().full = true;
+        act(&root, cx, super::super::Session::confirm_logout);
+        assert!(read(&root, cx, super::super::Session::confirming_logout));
+        harness.sent.borrow_mut().full = false;
+        act(&root, cx, super::super::Session::confirm_logout);
+        assert!(matches!(last_command(&harness), Some(Command::Logout)));
+        assert!(!read(&root, cx, super::super::Session::confirming_logout));
+        core_says(&harness, cx, AuthState::LoggingOut);
+        assert_eq!(auth(&root, cx), AuthView::LoggingOut);
+    }
+
+    /// Task 6c: a failed local deletion shows "Logout incomplete" (never
+    /// "Signed out"); Retry sends `Logout` again once admitted.
+    #[gpui::test]
+    fn logout_incomplete_offers_a_retry(cx: &mut TestAppContext) {
+        use abyss_core::api::{LocalDeletion, RemoteLogout, StorageError};
+        let (root, cx, harness) = open(cx);
+        let failed = AuthState::LoggedOut {
+            remote: RemoteLogout::Revoked,
+            local: LocalDeletion::Failed(StorageError::Internal),
+        };
+        core_says(&harness, cx, failed);
+        let incomplete = AuthView::LogoutIncomplete {
+            remote: RemoteLogout::Revoked,
+        };
+        assert_eq!(auth(&root, cx), incomplete);
+        harness.sent.borrow_mut().full = true;
+        act(&root, cx, super::super::Session::retry_logout);
+        assert_eq!(auth(&root, cx), incomplete, "refused: still incomplete");
+        harness.sent.borrow_mut().full = false;
+        act(&root, cx, super::super::Session::retry_logout);
+        assert!(matches!(last_command(&harness), Some(Command::Logout)));
+        assert_eq!(auth(&root, cx), AuthView::LoggingOut);
+        let done = AuthState::LoggedOut {
+            remote: RemoteLogout::Revoked,
+            local: LocalDeletion::Deleted,
+        };
+        core_says(&harness, cx, done);
+        assert_eq!(auth(&root, cx), AuthView::Connecting);
+    }
+
+    /// Task 6c: a refused auth command changes nothing; the input stays for
+    /// another submit.
+    #[gpui::test]
+    fn refused_auth_commands_keep_the_input(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        let code = AuthState::Code {
+            phone_hint: "+1 •••• •••00".into(),
+            sent: None,
+            error: Some(UserError::Rejected),
+        };
+        core_says(&harness, cx, code);
+        harness.sent.borrow_mut().full = true;
+        cx.simulate_input("12345");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sent_count(&harness), 0);
+        let kept = read(&root, cx, |s| s.code.clone());
+        assert_eq!(kept.read_with(cx, |i, _| i.text().to_owned()), "12345");
+        assert!(
+            matches!(auth(&root, cx), AuthView::Code { error: Some(_), .. }),
+            "the error stays until core takes the code"
+        );
+        assert_eq!(
+            read(&root, cx, |s| s.notice.clone()),
+            Some(crate::ui::copy::user_error(UserError::Busy))
+        );
+        harness.sent.borrow_mut().full = false;
+        cx.simulate_keystrokes("enter");
+        assert!(matches!(last_command(&harness), Some(Command::SubmitCode(c)) if c == "12345"));
+        assert_eq!(kept.read_with(cx, |i, _| i.text().to_owned()), "");
+
+        core_says(
+            &harness,
+            cx,
+            AuthState::Password {
+                hint: None,
+                error: None,
+            },
+        );
+        harness.sent.borrow_mut().full = true;
+        cx.simulate_input("pw");
+        cx.simulate_keystrokes("enter");
+        let field = read(&root, cx, |s| s.password.clone());
+        assert_eq!(&*field.read_with(cx, |i, _| i.secret()), b"pw", "kept");
+        harness.sent.borrow_mut().full = false;
+        cx.simulate_keystrokes("enter");
+        assert!(matches!(
+            last_command(&harness),
+            Some(Command::SubmitPassword(p)) if p.as_bytes() == b"pw"
+        ));
+        assert!(field.read_with(cx, |i, _| i.secret().is_empty()), "wiped");
+    }
+
+    #[gpui::test]
+    fn resend_is_sent_from_the_code_screen(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        act(&root, cx, super::super::Session::resend_code);
+        assert_eq!(sent_count(&harness), 0, "no resend outside the code screen");
+        let code = AuthState::Code {
+            phone_hint: "+1 •••• •••00".into(),
+            sent: None,
+            error: None,
+        };
+        core_says(&harness, cx, code);
+        act(&root, cx, super::super::Session::resend_code);
+        assert!(matches!(last_command(&harness), Some(Command::ResendCode)));
+    }
+
+    #[gpui::test]
+    fn unfinished_logout_at_shutdown_says_so(cx: &mut TestAppContext) {
+        let (root, cx, mut harness) = open(cx);
+        assert!(!cx.simulate_close());
+        let report = ShutdownReport {
+            save: abyss_core::api::SaveStatus::Confirmed,
+            logout: Some(abyss_core::api::LogoutStatus::Incomplete),
+        };
+        harness.ack.take().unwrap().send(report).unwrap();
+        cx.run_until_parked();
+        assert_eq!(closing(&root, cx), Some(Closing::LogoutUnfinished));
+        assert!(cx.simulate_close());
     }
 
     #[gpui::test]
@@ -361,6 +600,7 @@ mod fake {
             cx,
             AuthState::SignedInUnsaved {
                 display_name: String::new(),
+                new_login: None,
             },
         );
         assert_eq!(auth(&root, cx), AuthView::SignedIn);
@@ -369,12 +609,7 @@ mod fake {
             Some(crate::ui::copy::SIGNED_IN_UNSAVED.into())
         );
         core_says(&harness, cx, AuthState::SignUpRequired);
-        assert_eq!(
-            auth(&root, cx),
-            AuthView::Phone {
-                error: Some(UserError::SignUpRequired)
-            }
-        );
+        assert_eq!(auth(&root, cx), AuthView::SignUpRequired);
     }
 
     #[gpui::test]
@@ -423,8 +658,10 @@ mod fake {
             "Bumped",
         );
         bumped.unread = 4;
-        // A new message moves the chat up; read-state changes alone do not.
+        // A new message (a newer id) moves the chat up; read-state changes
+        // alone do not.
         bumped.last_date = i64::from(i32::MAX);
+        bumped.last_id = Some(abyss_core::model::MsgId(i32::MAX));
         harness
             .events
             .unbounded_send(Event::ChatBumped(bumped))
@@ -454,10 +691,784 @@ mod fake {
         root.update_in(cx, |root, window, cx| {
             root.with_session(|s, cx| s.select_chat(chat, window, cx), cx);
         });
+        cx.run_until_parked();
+        assert_eq!(
+            read(&root, cx, |s| s.shell.selected()),
+            None,
+            "a refused OpenChat opens nothing"
+        );
+        harness.sent.borrow_mut().full = false;
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_chat(chat, window, cx), cx);
+        });
+        cx.run_until_parked();
+        harness.sent.borrow_mut().full = true;
         cx.simulate_input("hi");
         cx.simulate_keystrokes("enter");
         let notice = read(&root, cx, |s| s.notice.clone());
         assert_eq!(notice, Some(crate::ui::copy::user_error(UserError::Busy)));
+        let draft = root.read_with(cx, |root, cx| match &root.state {
+            State::Running(s) => s.composer.read(cx).text().to_owned(),
+            State::Failed(_) => String::new(),
+        });
+        assert_eq!(draft, "hi", "the draft stays in the composer");
+        assert_eq!(read(&root, cx, |s| s.shell.row_count()), 0, "no echo");
+        harness.sent.borrow_mut().full = false;
+        cx.simulate_keystrokes("enter");
+        assert_eq!(read(&root, cx, |s| s.shell.row_count()), 1, "sent now");
+        assert!(matches!(
+            harness.sent.borrow().commands.last(),
+            Some(Command::SendText { text, .. }) if text == "hi"
+        ));
+    }
+
+    /// Task 6j: a send core refused (`SendRefused`) keeps its text. Put
+    /// back never overwrites typed text; into an empty box it restores the
+    /// text whole and the echo goes.
+    #[gpui::test]
+    fn a_refused_send_is_put_back_into_an_empty_box(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        sign_in(&root, cx, &harness);
+        let script = FakeScript::demo(1, 0);
+        harness
+            .events
+            .unbounded_send(Event::DialogsReset(script.dialogs))
+            .unwrap();
+        cx.run_until_parked();
+        let chat = ChatId {
+            kind: PeerKind::User,
+            id: 1,
+        };
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_chat(chat, window, cx), cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("keep me");
+        cx.simulate_keystrokes("enter");
+        let local_id = match harness.sent.borrow().commands.last() {
+            Some(Command::SendText { local_id, .. }) => *local_id,
+            other => panic!("{other:?}"),
+        };
+        harness
+            .events
+            .unbounded_send(Event::SendRefused { local_id })
+            .unwrap();
+        cx.run_until_parked();
+        let draft = |cx: &mut gpui::VisualTestContext| {
+            root.read_with(cx, |root, cx| match &root.state {
+                State::Running(s) => s.composer.read(cx).text().to_owned(),
+                State::Failed(_) => String::new(),
+            })
+        };
+        cx.simulate_input("typed");
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.put_back(local_id, window, cx), cx);
+        });
+        assert_eq!(draft(cx), "typed", "typed text is never overwritten");
+        assert_eq!(read(&root, cx, |s| s.shell.row_count()), 1, "still kept");
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(
+                |s, cx| s.composer.update(cx, |c, cx| c.clear(window, cx)),
+                cx,
+            );
+            root.with_session(|s, cx| s.put_back(local_id, window, cx), cx);
+        });
+        assert_eq!(draft(cx), "keep me");
+        assert_eq!(read(&root, cx, |s| s.shell.row_count()), 0);
+    }
+
+    /// Signed in with two chats listed and chat `id` open.
+    fn chats_open(
+        cx: &mut TestAppContext,
+        id: i64,
+    ) -> (Entity<Root>, &mut VisualTestContext, Harness) {
+        let (root, cx, harness) = open(cx);
+        sign_in(&root, cx, &harness);
+        let script = FakeScript::demo(2, 0);
+        harness
+            .events
+            .unbounded_send(Event::DialogsReset(script.dialogs))
+            .unwrap();
+        cx.run_until_parked();
+        select(&root, cx, id);
+        (root, cx, harness)
+    }
+
+    fn select(root: &Entity<Root>, cx: &mut VisualTestContext, id: i64) {
+        let chat = ChatId {
+            kind: PeerKind::User,
+            id,
+        };
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_chat(chat, window, cx), cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn composer_text(root: &Entity<Root>, cx: &mut VisualTestContext) -> String {
+        root.read_with(cx, |root, cx| match &root.state {
+            State::Running(s) => s.composer.read(cx).text().to_owned(),
+            State::Failed(_) => String::new(),
+        })
+    }
+
+    /// Enter with `text` in the box; returns the send's id.
+    fn submit_text(
+        cx: &mut VisualTestContext,
+        harness: &Harness,
+        text: &str,
+    ) -> abyss_core::model::LocalId {
+        cx.simulate_input(text);
+        cx.simulate_keystrokes("enter");
+        match harness.sent.borrow().commands.last() {
+            Some(Command::SendText { local_id, .. }) => *local_id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Task 6k, finding 3: the box belongs to the open chat. Text put back
+    /// in chat 1 stays chat 1's draft when chat 2 opens, so Enter in chat 2
+    /// sends nothing of it; it is back when chat 1 opens again.
+    #[gpui::test]
+    fn put_back_text_never_follows_the_box_into_another_chat(cx: &mut TestAppContext) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let local_id = submit_text(cx, &harness, "for chat 1");
+        harness
+            .events
+            .unbounded_send(Event::SendRefused { local_id })
+            .unwrap();
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.put_back(local_id, window, cx), cx);
+        });
+        assert_eq!(composer_text(&root, cx), "for chat 1");
+        select(&root, cx, 2);
+        assert_eq!(composer_text(&root, cx), "", "chat 2 has its own box");
+        let from = harness.sent.borrow().commands.len();
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("for chat 2");
+        cx.simulate_keystrokes("enter");
+        let sent = commands_since(&harness, from);
+        assert!(
+            sent.iter()
+                .all(|c| !c.contains("chat: ChatId { kind: User, id: 1 }")),
+            "{sent:?}"
+        );
+        assert!(
+            matches!(
+                harness.sent.borrow().commands.last(),
+                Some(Command::SendText { text, chat, .. }) if text == "for chat 2" && chat.id == 2
+            ),
+            "chat 2's own text went to chat 2"
+        );
+        select(&root, cx, 1);
+        assert_eq!(
+            composer_text(&root, cx),
+            "for chat 1",
+            "chat 1's draft is back"
+        );
+    }
+
+    /// Task 6k, finding 3: Put back from another chat than the send's is
+    /// refused (the echo shows only in its chat; this guards the call).
+    #[gpui::test]
+    fn put_back_needs_the_sends_own_chat_open(cx: &mut TestAppContext) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let local_id = submit_text(cx, &harness, "for chat 1");
+        harness
+            .events
+            .unbounded_send(Event::SendRefused { local_id })
+            .unwrap();
+        cx.run_until_parked();
+        select(&root, cx, 2);
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.put_back(local_id, window, cx), cx);
+        });
+        assert_eq!(composer_text(&root, cx), "");
+        assert_eq!(
+            read(&root, cx, |s| s.notice.clone()),
+            Some(crate::chat::copy::OTHER_CHAT.into())
+        );
+    }
+
+    /// Task 6k, finding 2: core's event stream closes while it runs (an
+    /// actor panic drops its event sender) with a submission and a discard
+    /// unanswered. Both are stranded with their text: the submission is
+    /// "unknown", never "not sent"; the discard keeps its last state.
+    #[gpui::test]
+    fn a_core_stop_strands_unanswered_sends_with_their_text(cx: &mut TestAppContext) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let discarding = submit_text(cx, &harness, "old");
+        for event in [
+            Event::SendAdmitted {
+                local_id: discarding,
+            },
+            Event::SendState {
+                local_id: discarding,
+                state: abyss_core::api::SendState::FloodWait { seconds: 30 },
+            },
+        ] {
+            harness.events.unbounded_send(event).unwrap();
+        }
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.discard_send(discarding, window, cx), cx);
+        });
+        let submitted = submit_text(cx, &harness, "new");
+        harness.events.close_channel();
+        cx.run_until_parked();
+        let mut echo = |id: abyss_core::model::LocalId| {
+            read(&root, cx, |s| s.shell.echoes().get(id).cloned()).unwrap()
+        };
+        let new = echo(submitted);
+        assert!(new.is_stranded() && !new.can_retry() && new.text == "new");
+        assert_eq!(
+            crate::chat::copy::send_label(&new, std::time::Instant::now()),
+            crate::chat::copy::STRANDED
+        );
+        let old = echo(discarding);
+        assert!(old.is_stranded() && !old.can_discard());
+        assert_eq!(
+            old.state,
+            abyss_core::api::SendState::FloodWait { seconds: 30 }
+        );
+        assert_eq!(
+            read(&root, cx, |s| s
+                .shell
+                .stranded_text(submitted)
+                .map(str::to_owned)),
+            Some("new".to_owned())
+        );
+    }
+
+    fn user(id: i64) -> ChatId {
+        ChatId {
+            kind: PeerKind::User,
+            id,
+        }
+    }
+
+    /// Chat 1 open with `typed` in the box, and a draft stashed for each of
+    /// chats 2..=65 (the bound), oldest first.
+    fn drafts_at_the_bound<'a>(
+        cx: &'a mut TestAppContext,
+        typed: &str,
+    ) -> (Entity<Root>, &'a mut VisualTestContext, Harness) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let max = i64::try_from(crate::chat::drafts::MAX_DRAFTS).unwrap();
+        root.update_in(cx, |root, _, cx| {
+            root.with_session(
+                |s, _| {
+                    for id in 2..=max + 1 {
+                        s.shell.stash_draft(user(id), format!("t{id}")).unwrap();
+                    }
+                },
+                cx,
+            );
+        });
+        cx.simulate_input(typed);
+        (root, cx, harness)
+    }
+
+    fn selected(root: &Entity<Root>, cx: &mut VisualTestContext) -> Option<ChatId> {
+        read(root, cx, |s| s.shell.selected())
+    }
+
+    /// Task 6l, finding 1: at the bound, switching to the chat with the
+    /// oldest draft frees its slot first, so the box's text is kept and the
+    /// destination's draft comes back: nothing is lost.
+    #[gpui::test]
+    fn switching_to_the_oldest_draft_at_the_bound_loses_nothing(cx: &mut TestAppContext) {
+        let (root, cx, _harness) = drafts_at_the_bound(cx, "typed in 1");
+        select(&root, cx, 2);
+        assert_eq!(selected(&root, cx), Some(user(2)));
+        assert_eq!(composer_text(&root, cx), "t2");
+        let max = i64::try_from(crate::chat::drafts::MAX_DRAFTS).unwrap();
+        root.update_in(cx, |root, _, cx| {
+            root.with_session(
+                |s, _| {
+                    assert_eq!(s.shell.take_draft(user(1)).as_deref(), Some("typed in 1"));
+                    for id in 3..=max + 1 {
+                        let draft = s.shell.take_draft(user(id));
+                        assert_eq!(draft, Some(format!("t{id}")), "chat {id}");
+                    }
+                },
+                cx,
+            );
+        });
+    }
+
+    /// Task 6l, finding 1: at the bound, a switch whose box text needs a
+    /// new slot is refused with a notice; the open chat and its text stay.
+    #[gpui::test]
+    fn a_switch_needing_a_slot_past_the_bound_is_refused(cx: &mut TestAppContext) {
+        let (root, cx, harness) = drafts_at_the_bound(cx, "typed in 1");
+        let from = harness.sent.borrow().commands.len();
+        select(&root, cx, 99);
+        assert_eq!(selected(&root, cx), Some(user(1)));
+        assert_eq!(composer_text(&root, cx), "typed in 1");
+        assert_eq!(
+            read(&root, cx, |s| s.notice.clone()),
+            Some(crate::chat::copy::TOO_MANY_DRAFTS.into())
+        );
+        assert!(commands_since(&harness, from).is_empty(), "no OpenChat");
+    }
+
+    /// Task 6l, finding 1: an empty box stashes nothing, so it switches
+    /// freely at the bound.
+    #[gpui::test]
+    fn an_empty_box_switches_freely_at_the_bound(cx: &mut TestAppContext) {
+        let (root, cx, _harness) = drafts_at_the_bound(cx, "");
+        select(&root, cx, 99);
+        assert_eq!(selected(&root, cx), Some(user(99)));
+        assert_eq!(composer_text(&root, cx), "");
+    }
+
+    /// Core stopped with chat 1 holding `pending` (a send core never
+    /// answered, if any) and the draft "draft in 1", while chat 2 is open.
+    /// Reopening chat 1 is local: its stranded echo and draft are there, no
+    /// command is issued, and Enter sends nothing.
+    fn reopen_after_core_stop(cx: &mut TestAppContext, pending: Option<&str>) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let local_id = pending.map(|text| submit_text(cx, &harness, text));
+        cx.simulate_input("draft in 1");
+        select(&root, cx, 2);
+        harness.events.close_channel();
+        cx.run_until_parked();
+        let from = harness.sent.borrow().commands.len();
+        select(&root, cx, 1);
+        assert_eq!(selected(&root, cx), Some(user(1)), "local navigation");
+        assert_eq!(composer_text(&root, cx), "draft in 1");
+        if let Some(id) = local_id {
+            let stranded = read(&root, cx, |s| s.shell.stranded_text(id).map(str::to_owned));
+            assert_eq!(stranded.as_deref(), pending, "Copy reaches it");
+            assert_eq!(
+                read(&root, cx, |s| s.shell.row_count()),
+                1,
+                "its echo shows"
+            );
+        }
+        cx.simulate_keystrokes("enter");
+        assert!(
+            commands_since(&harness, from).is_empty(),
+            "nothing asked of core"
+        );
+        assert_eq!(composer_text(&root, cx), "draft in 1", "nothing sent");
+        assert_eq!(
+            read(&root, cx, |s| s.notice.clone()),
+            Some(crate::chat::copy::CORE_STOPPED_COPY.into())
+        );
+    }
+
+    /// Task 6l, finding 2.
+    #[gpui::test]
+    fn after_a_core_stop_another_chats_stranded_send_and_draft_stay_reachable(
+        cx: &mut TestAppContext,
+    ) {
+        reopen_after_core_stop(cx, Some("pending in 1"));
+    }
+
+    /// Task 6l, finding 2, with a draft only.
+    #[gpui::test]
+    fn after_a_core_stop_another_chats_draft_stays_reachable(cx: &mut TestAppContext) {
+        reopen_after_core_stop(cx, None);
+    }
+
+    fn screen(root: &Entity<Root>, cx: &mut VisualTestContext) -> crate::shell::view::Screen {
+        read(root, cx, super::super::Session::screen)
+    }
+
+    /// Task 6m, finding 1: a pending send in chat 1, then a logout overlay
+    /// (`state`), then core's stream closes. The overlay gives way to the
+    /// local recovery view under `banner`; navigation and Copy reach the
+    /// text; nothing is asked of core.
+    fn recovery_behind_a_logout_overlay(cx: &mut TestAppContext, state: AuthState, banner: &str) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let id = submit_text(cx, &harness, "pending in 1");
+        core_says(&harness, cx, state);
+        assert_eq!(
+            screen(&root, cx),
+            crate::shell::view::Screen::Auth,
+            "the overlay"
+        );
+        harness.events.close_channel();
+        cx.run_until_parked();
+        assert_eq!(screen(&root, cx), crate::shell::view::Screen::Recovery);
+        assert_eq!(
+            read(&root, cx, super::super::Session::stopped_banner),
+            banner
+        );
+        let from = harness.sent.borrow().commands.len();
+        select(&root, cx, 2);
+        select(&root, cx, 1);
+        assert_eq!(selected(&root, cx), Some(user(1)));
+        let text = read(&root, cx, |s| s.shell.stranded_text(id).map(str::to_owned));
+        assert_eq!(text.as_deref(), Some("pending in 1"), "Copy reaches it");
+        cx.simulate_keystrokes("enter");
+        assert!(
+            commands_since(&harness, from).is_empty(),
+            "nothing asked of core"
+        );
+    }
+
+    #[gpui::test]
+    fn a_core_stop_behind_logging_out_shows_the_recovery_view(cx: &mut TestAppContext) {
+        recovery_behind_a_logout_overlay(
+            cx,
+            AuthState::LogoutStarting,
+            crate::chat::copy::STOPPED_SIGNING_OUT,
+        );
+    }
+
+    #[gpui::test]
+    fn a_core_stop_behind_an_unstarted_logout_shows_the_recovery_view(cx: &mut TestAppContext) {
+        recovery_behind_a_logout_overlay(
+            cx,
+            AuthState::LogoutNotStarted {
+                error: abyss_core::api::StorageError::Keychain,
+                trigger: abyss_core::api::LogoutTrigger::User,
+            },
+            crate::chat::copy::STOPPED_SIGN_OUT_NOT_STARTED,
+        );
+    }
+
+    /// Task 6m audit: screens that keep no account state (a torn-down
+    /// logout, a login step) show only "restart" once core stops; none of
+    /// their actions, which need core, stays on screen.
+    #[gpui::test]
+    fn a_core_stop_without_account_state_asks_for_a_restart(cx: &mut TestAppContext) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        core_says(&harness, cx, AuthState::LoggingOut);
+        harness.events.close_channel();
+        cx.run_until_parked();
+        assert_eq!(screen(&root, cx), crate::shell::view::Screen::Stopped);
+        assert_eq!(read(&root, cx, |s| s.shell.echoes().count(user(1))), 0);
+    }
+
+    /// Task 6m, finding 2: a chat opened after a core stop, whose history
+    /// was never loaded, says so instead of "Loading…" forever.
+    #[gpui::test]
+    fn a_chat_opened_after_a_core_stop_has_no_endless_loading(cx: &mut TestAppContext) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        assert_eq!(
+            read(&root, cx, |s| super::super::chat_view::placeholder(
+                &s.shell
+            )),
+            Some(crate::chat::copy::LOADING_HISTORY),
+            "loading while core runs"
+        );
+        harness.events.close_channel();
+        cx.run_until_parked();
+        select(&root, cx, 2);
+        assert_eq!(
+            read(&root, cx, |s| super::super::chat_view::placeholder(
+                &s.shell
+            )),
+            Some(crate::chat::copy::HISTORY_UNAVAILABLE)
+        );
+    }
+
+    fn commands_since(harness: &Harness, from: usize) -> Vec<String> {
+        harness
+            .sent
+            .borrow()
+            .commands
+            .iter()
+            .skip(from)
+            .map(|c| format!("{c:?}"))
+            .collect()
+    }
+
+    fn message(chat: ChatId, id: i32) -> abyss_core::model::Message {
+        abyss_core::backend::fake::text_message(chat, id, "m")
+    }
+
+    /// Finding 3 through the real window: the check runs after the frame
+    /// is painted and counts only rows inside the viewport.
+    #[gpui::test]
+    fn painted_rows_drive_mark_read_and_the_live_tail(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        sign_in(&root, cx, &harness);
+        cx.simulate_resize(gpui::size(gpui::px(800.), gpui::px(300.)));
+        let chat = ChatId {
+            kind: PeerKind::User,
+            id: 1,
+        };
+        let script = FakeScript::demo(1, 0);
+        harness
+            .events
+            .unbounded_send(Event::DialogsReset(script.dialogs))
+            .unwrap();
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_chat(chat, window, cx), cx);
+        });
+        cx.run_until_parked();
+        let from = harness.sent.borrow().commands.len();
+        harness
+            .events
+            .unbounded_send(Event::History {
+                chat,
+                view: abyss_core::store::ViewGen(1),
+                dir: abyss_core::api::HistoryDir::Tail,
+                messages: (1..=30).map(|id| message(chat, id)).collect(),
+                removed: Vec::new(),
+                has_more: false,
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let sent = commands_since(&harness, from);
+        assert!(
+            sent.iter()
+                .any(|c| c.contains("MarkRead") && c.contains("MsgId(30)"))
+        );
+        assert!(sent.iter().any(|c| c.starts_with("ViewingTail(Some")));
+
+        // Own sends fill the screen; a new incoming message lands above them.
+        for n in 0..12 {
+            cx.simulate_input(&format!("e{n}"));
+            cx.simulate_keystrokes("enter");
+        }
+        cx.run_until_parked();
+        let from = harness.sent.borrow().commands.len();
+        harness
+            .events
+            .unbounded_send(Event::History {
+                chat,
+                view: abyss_core::store::ViewGen(1),
+                dir: abyss_core::api::HistoryDir::Newer,
+                messages: vec![message(chat, 31)],
+                removed: Vec::new(),
+                has_more: false,
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let sent = commands_since(&harness, from);
+        assert!(
+            !sent.iter().any(|c| c.contains("MarkRead")),
+            "message 31 is above the viewport: {sent:?}"
+        );
+        assert_eq!(
+            read(&root, cx, |s| s.shell.viewing()),
+            None,
+            "the newest message is off screen: core counts it unread"
+        );
+    }
+
+    const CHAT: ChatId = ChatId {
+        kind: PeerKind::User,
+        id: 1,
+    };
+
+    /// Whether a tail has older history.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum More {
+        Older,
+        Start,
+    }
+
+    /// Signs in, lists one chat, opens it and delivers its tail `ids`.
+    fn open_chat(
+        root: &Entity<Root>,
+        cx: &mut VisualTestContext,
+        harness: &Harness,
+        ids: std::ops::RangeInclusive<i32>,
+        more: More,
+    ) {
+        sign_in(root, cx, harness);
+        cx.simulate_resize(gpui::size(gpui::px(800.), gpui::px(300.)));
+        let script = FakeScript::demo(1, 0);
+        harness
+            .events
+            .unbounded_send(Event::DialogsReset(script.dialogs))
+            .unwrap();
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            root.with_session(|s, cx| s.select_chat(CHAT, window, cx), cx);
+        });
+        cx.run_until_parked();
+        harness
+            .events
+            .unbounded_send(Event::History {
+                chat: CHAT,
+                view: abyss_core::store::ViewGen(1),
+                dir: abyss_core::api::HistoryDir::Tail,
+                messages: ids.map(|id| message(CHAT, id)).collect(),
+                removed: Vec::new(),
+                has_more: more == More::Older,
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn count(sent: &[String], prefix: &str) -> usize {
+        sent.iter().filter(|c| c.starts_with(prefix)).count()
+    }
+
+    /// Review round 28, finding 4: a logout overlay hides the chat, so its
+    /// tail is no longer viewed (core forgot it too); after "Stay signed
+    /// in" the tail is reported again once the chat is painted.
+    #[gpui::test]
+    fn a_logout_overlay_withdraws_the_viewed_tail(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        open_chat(&root, cx, &harness, 1..=30, More::Start);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(read(&root, cx, |s| s.shell.viewing()), Some(CHAT));
+        core_says(&harness, cx, AuthState::LogoutStarting);
+        assert_eq!(read(&root, cx, |s| s.shell.viewing()), None, "hidden");
+        core_says(
+            &harness,
+            cx,
+            AuthState::LogoutNotStarted {
+                error: abyss_core::api::StorageError::Keychain,
+                trigger: abyss_core::api::LogoutTrigger::User,
+            },
+        );
+        assert_eq!(read(&root, cx, |s| s.shell.viewing()), None);
+        let from = harness.sent.borrow().commands.len();
+        core_says(
+            &harness,
+            cx,
+            AuthState::SignedIn {
+                display_name: "A".into(),
+                new_login: None,
+            },
+        );
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let sent = commands_since(&harness, from);
+        assert_eq!(count(&sent, "ViewingTail(Some"), 1, "{sent:?}");
+        assert_eq!(read(&root, cx, |s| s.shell.viewing()), Some(CHAT));
+    }
+
+    /// Task 10c, finding 1 (HIGH), through the real window: a deactivation
+    /// core refuses still stops read marks and the live tail, and core is
+    /// told once the backoff ends.
+    #[gpui::test]
+    fn a_refused_deactivation_stops_reads_and_is_retried(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        open_chat(&root, cx, &harness, 1..=30, More::Start);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(read(&root, cx, |s| s.shell.viewing()), Some(CHAT));
+        let from = harness.sent.borrow().commands.len();
+        harness.sent.borrow_mut().full = true;
+        cx.deactivate_window();
+        harness.sent.borrow_mut().full = false;
+        harness
+            .events
+            .unbounded_send(Event::History {
+                chat: CHAT,
+                view: abyss_core::store::ViewGen(1),
+                dir: abyss_core::api::HistoryDir::Newer,
+                messages: vec![message(CHAT, 31)],
+                removed: Vec::new(),
+                has_more: false,
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let sent = commands_since(&harness, from);
+        assert_eq!(count(&sent, "MarkRead"), 0, "inactive: {sent:?}");
+        assert_eq!(count(&sent, "Window"), 0, "refused, not yet retried");
+        // Refused commands wait out their backoff (task 10d, finding 2).
+        cx.executor().advance_clock(crate::chat::retry::FIRST_DELAY);
+        cx.run_until_parked();
+        let sent = commands_since(&harness, from);
+        assert_eq!(count(&sent, "Window(Inactive)"), 1, "{sent:?}");
+        assert_eq!(count(&sent, "ViewingTail(None)"), 1, "{sent:?}");
+        assert_eq!(count(&sent, "MarkRead"), 0);
+        cx.executor()
+            .advance_clock(crate::chat::retry::MAX_DELAY * 4);
+        cx.run_until_parked();
+        assert_eq!(commands_since(&harness, from).len(), sent.len(), "settled");
+    }
+
+    /// Task 10c, finding 2, through the real window: errors (a full core
+    /// queue, a failed send) never re-ask a history load, and a load core
+    /// reports failed is retried a bounded number of times.
+    #[gpui::test]
+    fn errors_do_not_loop_history_loads(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        let from = harness.sent.borrow().commands.len();
+        open_chat(&root, cx, &harness, 1..=5, More::Older);
+        assert_eq!(count(&commands_since(&harness, from), "LoadOlder"), 1);
+        for error in [UserError::Busy, UserError::Rejected].repeat(10) {
+            harness.events.unbounded_send(Event::Error(error)).unwrap();
+            cx.run_until_parked();
+        }
+        assert_eq!(count(&commands_since(&harness, from), "LoadOlder"), 1);
+        let ended = Event::LoadEnded {
+            target: abyss_core::api::LoadTarget::History {
+                chat: CHAT,
+                dir: abyss_core::api::HistoryDir::Older,
+            },
+            error: Some(UserError::Busy),
+        };
+        for _ in 0..20 {
+            let ended = match &ended {
+                Event::LoadEnded { target, error } => Event::LoadEnded {
+                    target: *target,
+                    error: *error,
+                },
+                _ => unreachable!(),
+            };
+            harness.events.unbounded_send(ended).unwrap();
+            harness
+                .events
+                .unbounded_send(Event::Error(UserError::Busy))
+                .unwrap();
+            cx.run_until_parked();
+            cx.executor().advance_clock(crate::chat::retry::MAX_DELAY);
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            count(&commands_since(&harness, from), "LoadOlder"),
+            usize::from(crate::chat::retry::MAX_FAILURES),
+            "bounded"
+        );
+    }
+
+    /// Task 10c, finding 3, through the real window: the empty sidebar's
+    /// refused request for the next page is retried, not forgotten.
+    #[gpui::test]
+    fn empty_sidebar_retries_a_refused_page(cx: &mut TestAppContext) {
+        let (root, cx, harness) = open(cx);
+        sign_in(&root, cx, &harness);
+        let from = harness.sent.borrow().commands.len();
+        harness.sent.borrow_mut().full = true;
+        harness
+            .events
+            .unbounded_send(Event::DialogsReset(Vec::new()))
+            .unwrap();
+        harness
+            .events
+            .unbounded_send(Event::DialogsPaging { has_more: true })
+            .unwrap();
+        cx.run_until_parked();
+        harness.sent.borrow_mut().full = false;
+        cx.run_until_parked();
+        assert_eq!(count(&commands_since(&harness, from), "LoadDialogs"), 0);
+        cx.executor().advance_clock(crate::chat::retry::FIRST_DELAY);
+        cx.run_until_parked();
+        assert_eq!(count(&commands_since(&harness, from), "LoadDialogs"), 1);
+        // Core fails the page: retried after a backoff, never in a loop.
+        harness
+            .events
+            .unbounded_send(Event::LoadEnded {
+                target: abyss_core::api::LoadTarget::Dialogs,
+                error: Some(UserError::Network),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(count(&commands_since(&harness, from), "LoadDialogs"), 1);
+        // The second failure in a row: twice the first wait.
+        cx.executor().advance_clock(crate::chat::retry::FIRST_DELAY);
+        cx.run_until_parked();
+        assert_eq!(count(&commands_since(&harness, from), "LoadDialogs"), 1);
+        cx.executor().advance_clock(crate::chat::retry::FIRST_DELAY);
+        cx.run_until_parked();
+        assert_eq!(count(&commands_since(&harness, from), "LoadDialogs"), 2);
     }
 
     #[gpui::test]

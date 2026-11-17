@@ -109,6 +109,30 @@ fn prepend_past_cap_slides_and_detaches_from_tail() {
     );
 }
 
+/// Task 10d, finding 6: a page core fetches on its own fills only the room
+/// left and never drops the newest messages (the end the user looks at).
+#[test]
+fn prepend_fitting_never_trims_and_stays_contiguous() {
+    let mut w = Windows::default();
+    let c = user(1);
+    let g = w.open(c);
+    for i in 1..=CAP - 3 {
+        w.upsert(msg(c, CAP + i, "")); // CAP+1 ..= 2*CAP-3
+    }
+    let older: Vec<_> = (1..=10).map(|i| msg(c, CAP + 1 - i, "")).collect();
+    let change = w.prepend_fitting(c, g, last(older)).unwrap();
+    let win = w.get(c).unwrap();
+    assert_eq!(win.messages().len(), MAX_MESSAGES_PER_CHAT);
+    assert!(change.removed.is_empty(), "nothing dropped");
+    assert_eq!(ids(&w, c).first(), Some(&(CAP - 2)), "the 3 adjacent ones");
+    assert_eq!(ids(&w, c).last(), Some(&(2 * CAP - 3)), "the tail stays");
+    let win = w.get(c).unwrap();
+    assert!(!win.has_newer(), "still attached");
+    assert!(win.has_older(), "the rest did not fit: more exists");
+    let full = w.prepend_fitting(c, g, last(vec![msg(c, 1, "")])).unwrap();
+    assert_eq!(full, Change::default(), "no room: nothing changes");
+}
+
 #[test]
 fn detached_window_ignores_live_messages_then_reattaches() {
     let mut w = Windows::default();
@@ -286,4 +310,91 @@ fn byte_accounting_is_exact_after_mixed_ops() {
         .map(Message::retained_bytes)
         .sum();
     assert_eq!(w.total_bytes(), expected);
+}
+
+/// Cache contiguity lives on the window: it is bounded by `MAX_WINDOWS` and
+/// gone with eviction, close, reopen and invalidation (it used to be an
+/// unbounded per-chat set in the actor).
+#[test]
+fn cache_contiguity_is_bounded_by_the_windows() {
+    let mut w = Windows::default();
+    let max = i64::try_from(MAX_WINDOWS).unwrap();
+    for id in 1..=max * 4 {
+        w.open(user(id));
+        w.set_cache_contiguous(user(id));
+    }
+    let marked = (1..=max * 4)
+        .filter(|id| w.is_cache_contiguous(user(*id)))
+        .count();
+    assert_eq!(marked, MAX_WINDOWS, "evicted windows took their flag along");
+    let c = user(max * 4);
+    w.close(c);
+    assert!(!w.is_cache_contiguous(c));
+    w.set_cache_contiguous(c);
+    w.open(c);
+    assert!(!w.is_cache_contiguous(c), "a reopen re-establishes it");
+    w.set_cache_contiguous(c);
+    w.invalidate(c);
+    assert!(!w.is_cache_contiguous(c));
+    w.set_cache_contiguous(user(1));
+    assert!(!w.is_cache_contiguous(user(1)), "no window, no flag");
+}
+
+/// A message retaining more than the whole byte budget: its sender name's
+/// capacity is charged, though it holds one byte.
+fn huge(c: ChatId, id: i32) -> Message {
+    let mut name = String::with_capacity(MAX_STORE_BYTES + 1);
+    name.push('x');
+    Message {
+        sender: Some(crate::model::Sender { id: c, name }),
+        ..msg(c, id, "big")
+    }
+}
+
+/// Task 10g (round 21, finding 1): a background chat's growth never evicts
+/// the open chat's window, whose loads and owed answers rely on it. The
+/// background windows go first, then the growing chat trims itself.
+#[test]
+fn byte_budget_never_evicts_the_open_window() {
+    let mut w = Windows::default();
+    let (a, b, c) = (user(1), user(2), user(3));
+    w.open(c);
+    w.upsert(msg(c, 1, "c"));
+    w.close(c);
+    w.open(b);
+    w.upsert(msg(b, 1, "b"));
+    w.close(b);
+    let view = w.open(a);
+    w.upsert(msg(a, 1, "a"));
+    assert_eq!(w.shown(), Some(a));
+    // Least recently used first: c, b, a. The new message is b's.
+    w.upsert(huge(b, 2));
+    assert!(w.get(c).is_none(), "background window evicted");
+    assert_eq!(ids(&w, a), vec![1], "the open window stays whole");
+    assert_eq!(w.get(a).map(Window::view_gen), Some(view));
+    assert!(ids(&w, b).is_empty(), "the growing chat trimmed itself");
+    assert!(w.total_bytes() <= MAX_STORE_BYTES);
+    // An edit of a retained chat's message is held to the same rule.
+    w.upsert(msg(b, 3, "b"));
+    assert!(w.replace(huge(b, 3)));
+    assert_eq!(ids(&w, a), vec![1]);
+    assert!(w.total_bytes() <= MAX_STORE_BYTES);
+    // Once closed, it is a background window like any other.
+    w.close(a);
+    assert_eq!(w.shown(), None);
+    w.upsert(huge(b, 4));
+    assert!(w.get(a).is_none());
+}
+
+/// The open window's own growth trims it within itself: it is never
+/// evicted, even when it alone would exceed the budget.
+#[test]
+fn the_open_window_alone_over_budget_trims_itself() {
+    let mut w = Windows::default();
+    let a = user(1);
+    w.open(a);
+    w.upsert(msg(a, 1, "a"));
+    w.upsert(huge(a, 2));
+    assert!(w.get(a).is_some(), "trimmed, not evicted");
+    assert!(w.total_bytes() <= MAX_STORE_BYTES);
 }

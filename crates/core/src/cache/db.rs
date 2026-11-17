@@ -9,15 +9,19 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, ffi, params};
 
+use super::census::{self, Open};
 use super::{CacheError, CacheKey, MAX_CACHE_BYTES, MAX_CACHED_PER_CHAT, MAX_ROW_BYTES};
 use crate::model::{ChatId, ChatSummary, Message, MsgId, PeerKind, group_by_chat};
 use crate::store::MAX_DIALOGS;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 /// Version 2 replaced `Message::edited` with `edit_date`; version 1 message rows
 /// cannot be decoded, so they are dropped (the cache is disposable).
 const MIGRATE_1_TO_2: &str =
     "BEGIN; DELETE FROM messages; DELETE FROM cached_chats; PRAGMA user_version = 2; COMMIT;";
+/// Version 3 added `ChatSummary::last_id`; version 2 chat rows cannot be
+/// decoded, so the cached chat list is dropped (messages are unchanged).
+const MIGRATE_2_TO_3: &str = "BEGIN; DELETE FROM chats; PRAGMA user_version = 3; COMMIT;";
 /// Messages deleted per eviction step.
 const EVICT_BATCH: i64 = 1000;
 /// Upper bound on eviction steps per call; exceeding it is reported, not hidden.
@@ -49,12 +53,48 @@ fn bounded_body(param: u8) -> String {
     format!("CASE WHEN typeof(body) = 'blob' AND length(body) <= ?{param} THEN body END")
 }
 
+/// An open cache database. Fields drop in declaration order: the connection
+/// closes first and the census entry is released last, on every path,
+/// unwinding included, so nothing waiting on the census (shutdown, process
+/// exit) ever sees the cache gone while its connection is still closing.
 #[derive(Debug)]
 pub struct Cache {
     conn: Connection,
     /// Sum of `messages.size`, as committed.
     bytes: u64,
     budget: u64,
+    /// Tests: runs between the connection's close and the entry's release.
+    #[cfg(test)]
+    probe: Option<DropProbe>,
+    /// Census entry (see `census`). Must stay the last field.
+    _entry: Open,
+}
+
+/// Tests: a callback run when it is dropped.
+#[cfg(test)]
+pub(crate) struct DropProbe(Option<Box<dyn FnOnce() + Send>>);
+
+#[cfg(test)]
+impl DropProbe {
+    pub(crate) fn new(f: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(f)))
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for DropProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DropProbe")
+    }
+}
+
+#[cfg(test)]
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
 }
 
 fn kind_code(kind: PeerKind) -> i64 {
@@ -108,9 +148,17 @@ fn decode_chat(kind: i64, id: i64, body: Option<Vec<u8>>) -> Option<ChatSummary>
 
 impl Cache {
     /// Opens or creates the cache in `dir`.
+    ///
+    /// Refused before SQLCipher or the disk is touched until SQLCipher is
+    /// initialized with the exit hook in place (`census::init`), and once
+    /// admission to `dir` is closed (core shutdown, process exit). The
+    /// census entry is taken before the connection opens; on an error the
+    /// connection, declared after it, closes first.
     pub fn open(dir: &Path, key: &CacheKey) -> Result<Self, CacheError> {
+        census::init().map_err(CacheError::Init)?;
+        let entry = Open::enter(dir).map_err(CacheError::Refused)?;
         super::prepare_dir(dir)?;
-        let conn = Connection::open(super::db_path(dir))?;
+        let conn = Self::connect(dir)?;
         Self::unlock(&conn, key)?;
         Self::migrate(&conn)?;
         let bytes: i64 =
@@ -121,7 +169,24 @@ impl Cache {
             conn,
             bytes: to_u64(bytes),
             budget: MAX_CACHE_BYTES,
+            #[cfg(test)]
+            probe: None,
+            _entry: entry,
         })
+    }
+
+    /// Opens the database file without following a symlink (round 26,
+    /// finding 2). The directory is resolved first, so a symlink above it
+    /// (macOS's `/var` -> `/private/var`) is allowed, while a `cache.db`
+    /// that is itself a link is refused (`SQLITE_OPEN_NOFOLLOW` fails on any
+    /// link in the name it is given). The side files (`-wal`, `-shm`,
+    /// `-journal`) are named after that resolved path, and SQLite's unix VFS
+    /// opens every file with `O_NOFOLLOW` (SQLCipher 4.20.0, `unixOpen` and
+    /// `unixOpenSharedMemory`), so a linked side file fails to open too.
+    fn connect(dir: &Path) -> Result<Connection, CacheError> {
+        let dir = std::fs::canonicalize(dir)?;
+        let flags = rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        Ok(Connection::open_with_flags(super::db_path(&dir), flags)?)
     }
 
     fn unlock(conn: &Connection, key: &CacheKey) -> Result<(), CacheError> {
@@ -138,10 +203,7 @@ impl Cache {
         let rc = unsafe { ffi::sqlite3_key_v2(db, c"main".as_ptr(), literal.as_ptr().cast(), len) };
         drop(literal);
         if rc != ffi::SQLITE_OK {
-            return Err(CacheError::Sql(rusqlite::Error::SqliteFailure(
-                ffi::Error::new(rc),
-                None,
-            )));
+            return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(rc), None).into());
         }
         // Any read fails with NOTADB when the key is wrong.
         let probe: Result<i64, _> =
@@ -179,6 +241,11 @@ impl Cache {
             }
             1 => {
                 conn.execute_batch(MIGRATE_1_TO_2)?;
+                conn.execute_batch(MIGRATE_2_TO_3)?;
+                Ok(())
+            }
+            2 => {
+                conn.execute_batch(MIGRATE_2_TO_3)?;
                 Ok(())
             }
             SCHEMA_VERSION => Ok(()),
@@ -207,6 +274,13 @@ impl Cache {
         super::remove_files(dir).map_err(EraseError::Files)
     }
 
+    /// Tests: runs `probe` after the connection closes, before the census
+    /// entry is released.
+    #[cfg(test)]
+    pub(crate) fn set_drop_probe(&mut self, probe: DropProbe) {
+        self.probe = Some(probe);
+    }
+
     #[cfg(test)]
     pub(super) fn set_budget(&mut self, budget: u64) {
         self.budget = budget;
@@ -215,6 +289,60 @@ impl Cache {
     #[cfg(test)]
     pub(super) fn conn(&self) -> &Connection {
         &self.conn
+    }
+}
+
+/// What [`Cache::bind`] found (plan section 16, account binding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// The cache belongs to the given account.
+    Same,
+    /// The cache was empty and unowned; it now belongs to the given account.
+    Claimed,
+    /// Empty and unowned, and no account was given: nothing to protect.
+    Blank,
+    /// Owned by another account, or holding rows of an unknown owner. The
+    /// caller must not serve it: crypto-erase and recreate.
+    Foreign,
+}
+
+// Account binding.
+impl Cache {
+    /// Binds the cache to `owner` (the verified self user id), or checks an
+    /// unbound cache when `owner` is `None`. Rows are served only after
+    /// `Same` or `Claimed`.
+    pub fn bind(&mut self, owner: Option<i64>) -> Result<Binding, CacheError> {
+        let stored: Option<i64> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'owner'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let (Some(stored), Some(owner)) = (stored, owner)
+            && stored == owner
+        {
+            return Ok(Binding::Same);
+        }
+        if stored.is_some() || !self.is_empty()? {
+            return Ok(Binding::Foreign);
+        }
+        let Some(owner) = owner else {
+            return Ok(Binding::Blank);
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('owner', ?1)",
+            params![owner],
+        )?;
+        Ok(Binding::Claimed)
+    }
+
+    fn is_empty(&self) -> Result<bool, CacheError> {
+        let any: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM chats) OR EXISTS (SELECT 1 FROM messages)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(!any)
     }
 }
 

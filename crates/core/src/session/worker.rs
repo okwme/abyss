@@ -109,6 +109,22 @@ pub(crate) enum PersistMsg {
     ForgetCacheKey {
         reply: Reply<Result<(), StoreError>>,
     },
+    /// A plain item: the API credentials (plan section 17.1) or the
+    /// logout-pending marker (review round 15, A). Ordered like every other
+    /// message, so a delete queued after a write wins.
+    LoadItem {
+        item: SecretItem,
+        reply: Reply<Result<Option<Zeroizing<Vec<u8>>>, StoreError>>,
+    },
+    StoreItem {
+        item: SecretItem,
+        blob: Zeroizing<Vec<u8>>,
+        reply: Reply<Result<(), StoreError>>,
+    },
+    DeleteItem {
+        item: SecretItem,
+        reply: Reply<Result<(), StoreError>>,
+    },
 }
 
 impl std::fmt::Debug for PersistMsg {
@@ -150,6 +166,10 @@ pub struct LoadedSession {
 pub struct PersistHandle {
     tx: mpsc::Sender<PersistMsg>,
     next_gen: Arc<AtomicU64>,
+    /// Tests: keeps a paused clock still while a request is awaited
+    /// (`secret::ClockGate`).
+    #[cfg(test)]
+    gate: Option<crate::secret::ClockGate>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -171,6 +191,8 @@ impl PersistHandle {
     /// Starts the worker thread, which takes sole ownership of `store`.
     pub fn spawn(store: impl SecretStore) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel(PERSIST_QUEUE);
+        #[cfg(test)]
+        let gate = store.clock_gate();
         let worker = Worker {
             store: Box::new(store),
             terminated: None,
@@ -182,6 +204,8 @@ impl PersistHandle {
         Ok(Self {
             tx,
             next_gen: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            gate,
         })
     }
 
@@ -191,8 +215,16 @@ impl PersistHandle {
 
     async fn ask<T>(&self, make: impl FnOnce(Reply<T>) -> PersistMsg) -> Option<T> {
         let (reply, rx) = oneshot::channel();
+        #[cfg(test)]
+        let _busy = self.gate.as_ref().map(crate::secret::ClockGate::busy);
         self.tx.send(make(reply)).await.ok()?;
         rx.await.ok()
+    }
+
+    /// Tests: see the `gate` field.
+    #[cfg(test)]
+    pub(crate) fn clock_gate(&self) -> Option<crate::secret::ClockGate> {
+        self.gate.clone()
     }
 
     /// Reads the session item (process startup only; rebuilds reuse the live
@@ -284,6 +316,60 @@ impl PersistHandle {
         })
     }
 
+    /// Reads the API credentials item. `Ok(None)`: none stored; `Err`: the
+    /// Keychain could not be read, which is not the same.
+    pub async fn load_api_credentials(&self) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        self.load_item(SecretItem::ApiCredentials).await
+    }
+
+    /// Creates or replaces the API credentials item.
+    pub async fn store_api_credentials(&self, blob: Zeroizing<Vec<u8>>) -> Result<(), StoreError> {
+        self.store_item(SecretItem::ApiCredentials, blob).await
+    }
+
+    /// Deletes the API credentials item; succeeds when none exists.
+    pub async fn delete_api_credentials(&self) -> Result<(), StoreError> {
+        self.delete_item(SecretItem::ApiCredentials).await
+    }
+
+    /// Reads the logout-pending marker. `Ok(None)`: no logout is pending;
+    /// `Err`: the store could not be read, which startup treats as pending.
+    pub async fn load_logout_marker(&self) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        self.load_item(SecretItem::LogoutPending).await
+    }
+
+    /// Records (or updates) the logout-pending marker.
+    pub async fn store_logout_marker(&self, blob: Zeroizing<Vec<u8>>) -> Result<(), StoreError> {
+        self.store_item(SecretItem::LogoutPending, blob).await
+    }
+
+    /// Clears the logout-pending marker; succeeds when none exists.
+    pub async fn delete_logout_marker(&self) -> Result<(), StoreError> {
+        self.delete_item(SecretItem::LogoutPending).await
+    }
+
+    async fn load_item(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        self.ask(|reply| PersistMsg::LoadItem { item, reply })
+            .await
+            .unwrap_or(Err(StoreError::Stopped))
+    }
+
+    async fn store_item(
+        &self,
+        item: SecretItem,
+        blob: Zeroizing<Vec<u8>>,
+    ) -> Result<(), StoreError> {
+        self.ask(|reply| PersistMsg::StoreItem { item, blob, reply })
+            .await
+            .unwrap_or(Err(StoreError::Stopped))
+    }
+
+    async fn delete_item(&self, item: SecretItem) -> Result<(), StoreError> {
+        self.ask(|reply| PersistMsg::DeleteItem { item, reply })
+            .await
+            .unwrap_or(Err(StoreError::Stopped))
+    }
+
     pub(crate) fn sender(&self) -> mpsc::Sender<PersistMsg> {
         self.tx.clone()
     }
@@ -344,6 +430,15 @@ impl Worker {
             }
             PersistMsg::ForgetCacheKey { reply } => {
                 drop(reply.send(delete_cache_key(&*self.store)));
+            }
+            PersistMsg::LoadItem { item, reply } => {
+                drop(reply.send(self.store.get(item)));
+            }
+            PersistMsg::StoreItem { item, blob, reply } => {
+                drop(reply.send(self.store.set(item, &blob)));
+            }
+            PersistMsg::DeleteItem { item, reply } => {
+                drop(reply.send(self.store.delete(item)));
             }
         }
     }

@@ -1,9 +1,10 @@
-//! The pinned-chat set: bounded, union across pages, priority order.
+//! The pin selection: core's set first, then in-flight extras; bounded.
 
-use crate::backend::MAX_CARRIED_PEERS;
-use crate::backend::grammers::pins::{Pins, Recency};
+use grammers_client::session::types::PeerId;
+
+use crate::backend::grammers::pins::{MAX_IN_FLIGHT, Pins};
 use crate::model::{ChatId, PeerKind};
-use crate::store::MAX_DIALOGS;
+use crate::session::MAX_PINNED_PEERS;
 
 fn chat(id: i64) -> ChatId {
     ChatId {
@@ -12,48 +13,100 @@ fn chat(id: i64) -> ChatId {
     }
 }
 
-#[test]
-fn recency_evicts_the_least_recently_touched() {
-    let mut r = Recency::new(3);
-    assert!(r.touch(chat(1)));
-    assert!(r.touch(chat(2)));
-    assert!(r.touch(chat(3)));
-    assert!(!r.touch(chat(1)), "a re-touch changes no membership");
-    assert!(r.touch(chat(4)));
-    assert_eq!(r.len(), 3);
-    let order: Vec<i64> = r.newest_first().map(|c| c.id).collect();
-    assert_eq!(order, vec![4, 1, 3], "2 was the oldest");
+fn pid(id: i64) -> PeerId {
+    PeerId::user(id).unwrap()
+}
+
+fn chats(ids: impl IntoIterator<Item = i64>) -> Vec<ChatId> {
+    ids.into_iter().map(chat).collect()
 }
 
 #[test]
-fn pages_accumulate_and_carried_and_used_chats_come_first() {
-    let mut pins = Pins::new(&[chat(100)], [chat(50), chat(100)]);
-    assert!(pins.list([chat(1), chat(2)].into_iter()));
-    assert!(pins.list([chat(3)].into_iter()));
-    // A refreshed first page does not drop the second page.
-    assert!(!pins.list([chat(1), chat(2)].into_iter()));
-    assert!(pins.use_chat(chat(9)));
-    assert!(!pins.use_chat(chat(9)));
-    let all: Vec<i64> = pins.all().iter().map(|c| c.id).collect();
-    assert_eq!(all, vec![100, 9, 1, 2, 3, 50]);
+fn inherited_pins_are_kept_as_they_are_until_core_reconciles() {
+    let inherited: Vec<PeerId> = (1..=1264).map(pid).collect();
+    let mut pins = Pins::new(inherited);
+    assert_eq!(pins.changed(), None, "already pinned");
+    assert!(pins.begin(pid(1)));
+    assert_eq!(pins.changed(), None, "an inherited chat adds nothing");
+    assert!(pins.begin(pid(5000)));
+    // At the cap, an extra never displaces an inherited peer.
+    let selected = pins.selected();
+    assert_eq!(selected.len(), MAX_PINNED_PEERS);
+    assert!(!selected.contains(&pid(5000)));
+}
+
+#[test]
+fn core_set_comes_first_then_in_flight_extras() {
+    let mut pins = Pins::new(vec![pid(99)]);
+    assert!(pins.begin(pid(9)));
+    assert_eq!(pins.require(&chats([3, 1, 3, 2])), 0);
+    assert_eq!(pins.selected(), vec![pid(3), pid(1), pid(2), pid(9)]);
+    pins.applied(&pins.selected(), 0);
+    // A second call on the same chat; the first one ending keeps the pin.
+    assert!(pins.begin(pid(9)));
+    pins.end(pid(9));
+    assert_eq!(pins.changed(), None);
+    pins.end(pid(9));
+    assert_eq!(pins.changed(), Some(vec![pid(3), pid(1), pid(2)]));
 }
 
 #[test]
 fn every_part_is_bounded() {
-    let carried: Vec<ChatId> = (0..1_000).map(chat).collect();
-    let mut pins = Pins::new(&carried, (0..5_000).map(chat));
-    let mut id = 10_000;
-    for _ in 0..30 {
-        let page: Vec<ChatId> = (0..100).map(|i| chat(id + i)).collect();
-        id += 100;
-        pins.list(page.into_iter());
+    let mut pins = Pins::new(Vec::new());
+    assert_eq!(pins.require(&chats(1..=5000)), 0);
+    for id in 10_000..10_000 + i64::try_from(MAX_IN_FLIGHT).unwrap() {
+        assert!(pins.begin(pid(id)));
     }
-    for i in 0..1_000 {
-        pins.use_chat(chat(50_000 + i));
-    }
-    let all = pins.all();
-    assert_eq!(all.len(), MAX_CARRIED_PEERS * 2 + MAX_DIALOGS);
-    // The newest page survived; the oldest pages were evicted.
-    assert!(all.contains(&chat(id - 1)));
-    assert!(!all.contains(&chat(10_000)));
+    assert!(!pins.begin(pid(1)), "tracked chats are bounded");
+    assert_eq!(pins.selected().len(), MAX_PINNED_PEERS);
+    // Out-of-range ids are reported, not selected.
+    let bad = ChatId {
+        kind: PeerKind::User,
+        id: -1,
+    };
+    assert_eq!(pins.require(&[bad, chat(1)]), 1);
+}
+
+#[test]
+fn a_reorder_that_changes_the_capped_membership_is_a_change() {
+    let mut pins = Pins::new(Vec::new());
+    pins.require(&chats(1..=1264));
+    pins.applied(&pins.selected(), 0);
+    // Same order, same set: nothing to do.
+    pins.require(&chats(1..=1264));
+    assert_eq!(pins.changed(), None);
+    // A reorder alone keeps the membership: nothing to do either.
+    pins.require(&chats((1..=1264).rev()));
+    assert_eq!(pins.changed(), None);
+    // A new head pushes the tail out of the cap.
+    pins.require(&chats(std::iter::once(2000).chain(1..=1264)));
+    let next = pins.changed().expect("membership changed");
+    assert!(next.contains(&pid(2000)) && !next.contains(&pid(1264)));
+}
+
+/// Review round 14: a role change with identical membership (transient to
+/// required, or inherited to core) must reach the session, because only
+/// required ids end a handoff hold.
+#[test]
+fn a_role_change_with_the_same_members_is_a_change() {
+    // Inherited base -> core requires the same ids.
+    let mut pins = Pins::new(vec![pid(1), pid(2)]);
+    pins.applied(&pins.selected(), 0);
+    assert_eq!(pins.changed(), None);
+    pins.require(&chats([1, 2]));
+    assert_eq!(pins.changed(), Some(vec![pid(1), pid(2)]));
+    pins.applied(&pins.selected(), 0);
+    assert_eq!(pins.changed(), None);
+
+    // In-flight only -> core requires it -> the call ends.
+    let mut pins = Pins::new(Vec::new());
+    pins.require(&chats([]));
+    assert!(pins.begin(pid(7)));
+    pins.applied(&pins.selected(), 0);
+    pins.require(&chats([7]));
+    assert_eq!(
+        pins.changed(),
+        Some(vec![pid(7)]),
+        "transient became required"
+    );
 }

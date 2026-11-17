@@ -56,6 +56,35 @@ fn platform_apis_only_see_bullets(cx: &mut TestAppContext) {
     });
 }
 
+/// Task 6c: the `api_hash` field keeps hex only, and the platform text APIs
+/// and the clipboard never see the hash, shown or hidden.
+#[gpui::test]
+fn api_hash_never_reaches_the_platform(cx: &mut TestAppContext) {
+    let _serial = SERIAL.lock();
+    cx.update(|cx| cx.bind_keys(key_bindings()));
+    let (input, cx) = cx.add_window_view(PasswordInput::api_hash);
+    cx.update(|window, cx| {
+        window.activate_window();
+        window.focus(&input.focus_handle(cx), cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_input("ab cd\n12");
+    for reveal in [super::Reveal::Hidden, super::Reveal::Shown] {
+        input.update(cx, |input, cx| input.set_reveal(reveal, cx));
+        input.update_in(cx, |input, window, cx| {
+            assert_eq!(&*input.secret(), b"abcd12");
+            let mut actual = None;
+            let text = input.text_for_range(0..99, &mut actual, window, cx);
+            assert_eq!(text.as_deref(), Some("••••••"), "{reveal:?}");
+            assert!(!format!("{:?}", input.edit).contains("abcd"));
+        });
+        cx.simulate_keystrokes("cmd-a cmd-c");
+        assert!(cx.read_from_clipboard().is_none());
+    }
+    input.update(cx, PasswordInput::clear);
+    input.update(cx, |input, _| assert!(input.secret().is_empty()));
+}
+
 #[gpui::test]
 fn dead_key_through_the_input_handler(cx: &mut TestAppContext) {
     let _serial = SERIAL.lock();

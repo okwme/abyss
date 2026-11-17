@@ -3,12 +3,13 @@
 //! State and decisions live in `crate::chat`; this only draws them.
 
 use std::ops::Range;
+use std::time::Instant;
 
 use abyss_core::model::{Body, ChatKind, ChatSummary, Message, MsgId};
 use abyss_core::rich_text::RichText;
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, Hsla, InteractiveText,
-    Rgba, SharedString, Stateful, StyledText, WeakEntity, Window, div, font, list, prelude::*, px,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, ElementId, Hsla, Rgba, SharedString,
+    Stateful, StyledText, WeakEntity, Window, canvas, div, font, list, prelude::*, px,
     transparent_black, uniform_list,
 };
 use jiff::tz::TimeZone;
@@ -17,9 +18,9 @@ use super::session::Session;
 use super::view::{centered, field, muted};
 use super::{Root, State};
 use crate::chat::messages::MessageWindow;
-use crate::chat::rich::{self, Fonts, Palette, Spoilers};
+use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
-use crate::chat::{Row, copy, format, list as chat_list};
+use crate::chat::{ChatShell, Row, copy, format, list as chat_list};
 use crate::ui::mark::mark;
 use crate::ui::theme::{self, Depth, Theme, Themes};
 
@@ -81,10 +82,14 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
     let floor = chats.last().map_or(Depth::NOW, |c| {
         depth_of(c.last_date, format::now(), &format::local_tz())
     });
+    // After a core stop nothing can load: no Retry (round 37).
+    let retry = (session.shell.list.gave_up() && !session.shell.is_stopped())
+        .then(|| retry_button("retry-chats", copy::RETRY_CHATS, theme, cx).bottom_3());
     div()
         .w(px(SIDEBAR_WIDTH))
         .flex_none()
         .h_full()
+        .relative()
         .flex()
         .flex_col()
         .bg(theme.surface(floor))
@@ -120,6 +125,8 @@ fn sidebar(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> Div 
                 ),
         )
         .child(body)
+        // Last, so it paints over the rows and takes their clicks.
+        .children(retry)
 }
 
 /// Opens the appearance panel; also in the app menu and on Cmd+comma.
@@ -267,6 +274,21 @@ fn avatar(chat: &ChatSummary, ink: Rgba) -> Div {
         .child(chat_list::initials(&chat.title))
 }
 
+/// What the open chat's pane shows instead of rows (`None`: its rows).
+/// After a core stop, history never loaded is unavailable, never
+/// "Loading…" (task 6m).
+pub(super) fn placeholder(shell: &ChatShell) -> Option<&'static str> {
+    if shell.row_count() > 0 {
+        None
+    } else if shell.window().is_some_and(MessageWindow::is_loaded) {
+        Some(copy::EMPTY_CHAT)
+    } else if shell.is_stopped() {
+        Some(copy::HISTORY_UNAVAILABLE)
+    } else {
+        Some(copy::LOADING_HISTORY)
+    }
+}
+
 fn chat_pane(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     let Some(chat) = session.shell.selected_chat() else {
         return centered()
@@ -274,23 +296,29 @@ fn chat_pane(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> An
             .into_any_element();
     };
     let window = session.shell.window();
-    let loaded = window.is_some_and(MessageWindow::is_loaded);
-    let body = if session.shell.row_count() > 0 {
-        list(session.shell.rows().clone(), cx.processor(message_row))
+    let body = match placeholder(&session.shell) {
+        None => list(session.shell.rows().clone(), cx.processor(message_row))
             .size_full()
-            .into_any_element()
-    } else if loaded {
-        centered().child(muted(copy::EMPTY_CHAT)).into_any_element()
-    } else {
-        centered()
-            .child(muted(copy::LOADING_HISTORY))
-            .into_any_element()
+            .into_any_element(),
+        Some(text) => centered().child(muted(text)).into_any_element(),
     };
-    let detached = window.is_some_and(MessageWindow::has_newer);
     // Above the oldest loaded message the pane keeps that message's tone.
     let oldest = session.shell.row(0).map_or(Depth::NOW, |r| {
         depth_of(r.date(), format::now(), &format::local_tz())
     });
+    // After a core stop nothing can load: no Jump or Retry (round 37).
+    let live = !session.shell.is_stopped();
+    let detached = live && window.is_some_and(MessageWindow::has_newer);
+    let gave_up = live && session.shell.history_gave_up();
+    // Once this pane is painted, check what the list shows (mark read,
+    // load more, live tail): the layout is then the one on screen.
+    let this = cx.weak_entity();
+    let after_paint = canvas(
+        |_, _, _| {},
+        move |_, (), window, cx| super::chats::after_paint(this, window, cx),
+    )
+    .absolute()
+    .size_0();
     div()
         .flex_1()
         .h_full()
@@ -306,7 +334,13 @@ fn chat_pane(session: &Session, theme: &Theme, cx: &mut Context<'_, Root>) -> An
                 .bg(theme.surface(oldest))
                 .text_color(theme.text_on(oldest))
                 .child(body)
-                .children(detached.then(|| jump_button(theme, cx))),
+                .children(detached.then(|| jump_button(theme, cx)))
+                .children(
+                    gave_up.then(|| {
+                        retry_button("retry-history", copy::RETRY_HISTORY, theme, cx).top_3()
+                    }),
+                )
+                .child(after_paint),
         )
         .child(composer_area(session, chat, theme))
         .into_any_element()
@@ -343,6 +377,26 @@ fn jump_button(theme: &Theme, cx: &mut Context<'_, Root>) -> Stateful<Div> {
     .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
         root.with_session(|s, cx| s.jump_to_latest(window, cx), cx);
     }))
+}
+
+/// Offered once automatic retries gave up: retries everything now. An
+/// overlay: rendered after what it covers, it blocks the mouse for the
+/// rows below and stops the click there (task 10e).
+fn retry_button(
+    id: &'static str,
+    label: &'static str,
+    theme: &Theme,
+    cx: &mut Context<'_, Root>,
+) -> Stateful<Div> {
+    pill(id, label, theme.text, theme.on_text)
+        .debug_selector(|| id.to_owned())
+        .absolute()
+        .left_3()
+        .occlude()
+        .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
+            cx.stop_propagation();
+            root.with_session(|s, cx| s.retry_loads(window, cx), cx);
+        }))
 }
 
 /// A small action in `ink` on `fill`.
@@ -412,7 +466,7 @@ fn message_row(
     };
     // Each row carries the tone of its own age, so history darkens upward.
     let depth = depth_of(row.date(), format::now(), &ctx.tz);
-    div()
+    let row = div()
         .w_full()
         .px_4()
         .py_1()
@@ -422,8 +476,9 @@ fn message_row(
         .text_color(theme.text_on(depth))
         .children(start)
         .children(separator)
-        .child(content)
-        .into_any_element()
+        .child(content);
+    // Painted bounds feed the after-paint check (mark read, live tail).
+    shell.painted().track(ix, row).w_full().into_any_element()
 }
 
 fn day_separator(label: SharedString) -> Div {
@@ -586,65 +641,70 @@ impl RowCtx {
     /// Formatted text: a link click copies its target (links never open), a
     /// spoiler click reveals the message's spoilers.
     fn rich(&self, id: MsgId, rt: &RichText, spoilers: Spoilers, ink: Rgba) -> AnyElement {
-        let rich::Body {
-            text,
-            runs,
-            links,
-            spoilers: hidden,
-        } = rich::style(rt, &fonts(), &palette(ink, &self.theme), spoilers);
-        let (mut ranges, targets): (Vec<Range<usize>>, Vec<SharedString>) =
-            links.into_iter().unzip();
-        ranges.extend(hidden);
         let this = self.this.clone();
         let element_id =
             ElementId::NamedInteger("msg".into(), u64::try_from(id.0).unwrap_or_default());
-        InteractiveText::new(element_id, StyledText::new(text).with_runs(runs))
-            .on_click(ranges, move |range_ix, window, cx| {
-                on_text_click(&this, id, targets.get(range_ix), window, cx);
+        rich::style(rt, &fonts(), &palette(ink, &self.theme), spoilers)
+            .interactive(element_id, move |click, window, cx| {
+                on_text_click(&this, id, &click, window, cx);
             })
             .into_any_element()
     }
 }
 
 /// An own send without a server copy yet: its state, and Retry and Discard
-/// where core accepts them.
+/// where core accepts them; text core refused offers Put back and Dismiss.
 fn echo_row(e: &Echo, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
     let local_id = e.local_id;
+    // Actions sit inside the user's own bubble, so their colors are swapped.
+    let (fill, ink) = (theme.on_text, theme.text);
     let status = div()
         .flex()
         .gap_2()
         .items_center()
         .justify_end()
-        .child(muted(copy::send_label(e.state)).text_xs());
-    let status = if e.actionable() {
+        .child(muted(copy::send_label(e, Instant::now())).text_xs());
+    let retry = e.can_retry().then(|| {
         let retry = cx.listener(move |root, _: &ClickEvent, window, cx| {
             root.with_session(|s, cx| s.retry_send(local_id, window, cx), cx);
         });
+        pill(("retry", local_id.0), copy::RETRY, fill, ink).on_click(retry)
+    });
+    let discard = e.can_discard().then(|| {
         let discard = cx.listener(move |root, _: &ClickEvent, window, cx| {
             root.with_session(|s, cx| s.discard_send(local_id, window, cx), cx);
         });
-        status
-            .child(
-                pill(
-                    ("retry", local_id.0),
-                    copy::RETRY,
-                    theme.on_text,
-                    theme.text,
-                )
-                .on_click(retry),
-            )
-            .child(
-                pill(
-                    ("discard", local_id.0),
-                    copy::DISCARD,
-                    theme.on_text,
-                    theme.text,
-                )
-                .on_click(discard),
-            )
-    } else {
-        status
-    };
+        pill(("discard", local_id.0), copy::DISCARD, fill, ink).on_click(discard)
+    });
+    let returned = e.is_returned().then(|| {
+        let put_back = cx.listener(move |root, _: &ClickEvent, window, cx| {
+            root.with_session(|s, cx| s.put_back(local_id, window, cx), cx);
+        });
+        let dismiss = cx.listener(move |root, _: &ClickEvent, _, cx| {
+            root.with_session(|s, cx| s.dismiss_returned(local_id, cx), cx);
+        });
+        [
+            pill(("put-back", local_id.0), copy::PUT_BACK, fill, ink).on_click(put_back),
+            pill(("dismiss", local_id.0), copy::DISMISS, fill, ink).on_click(dismiss),
+        ]
+    });
+    let stranded = e.is_stranded().then(|| {
+        let copy_text = cx.listener(move |root, _: &ClickEvent, window, cx| {
+            root.with_session(|s, cx| s.copy_stranded(local_id, window, cx), cx);
+        });
+        let dismiss = cx.listener(move |root, _: &ClickEvent, _, cx| {
+            root.with_session(|s, cx| s.dismiss_returned(local_id, cx), cx);
+        });
+        [
+            pill(("copy-text", local_id.0), copy::COPY_TEXT, fill, ink).on_click(copy_text),
+            pill(("dismiss", local_id.0), copy::DISMISS, fill, ink).on_click(dismiss),
+        ]
+    });
+    let status = status
+        .children(retry)
+        .children(discard)
+        .children(returned.into_iter().flatten())
+        .children(stranded.into_iter().flatten());
     let text = rich::plain(
         &e.text,
         &fonts(),
@@ -661,18 +721,18 @@ fn echo_row(e: &Echo, theme: &Theme, cx: &mut Context<'_, Root>) -> AnyElement {
 fn on_text_click(
     this: &WeakEntity<Root>,
     id: MsgId,
-    target: Option<&SharedString>,
+    click: &Click,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if let Some(target) = target {
+    if let Click::Copy(target) = click {
         cx.write_to_clipboard(ClipboardItem::new_string(target.to_string()));
     }
     this.update(cx, |root, cx| {
         root.with_session(
-            |s, cx| match target {
-                Some(_) => s.show_notice(copy::LINK_COPIED.into(), window, cx),
-                None => s.shell.reveal(id),
+            |s, cx| match click {
+                Click::Copy(_) => s.show_notice(copy::LINK_COPIED.into(), window, cx),
+                Click::Reveal => s.shell.reveal(id),
             },
             cx,
         );

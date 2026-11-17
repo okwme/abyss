@@ -2,6 +2,7 @@
 //! mappers, a scripted invoker for the call layer, a scripted source for the
 //! update stream.
 
+mod auth;
 mod calls;
 mod errors;
 mod map;

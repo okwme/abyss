@@ -12,8 +12,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use super::{
-    Backend, BackendError, CarriedPeers, Client, HistoryQuery, Instance, InstanceControl, Seed,
-    SessionSeed, SessionSnapshot, StreamError, StreamItem, Update, UpdateStream,
+    Backend, BackendError, Client, HistoryQuery, Instance, InstanceControl, Seed, SessionSeed,
+    SessionSnapshot, StreamError, StreamItem, Update, UpdateStream,
 };
 use crate::model::{ChatId, Message, MsgId};
 
@@ -70,7 +70,7 @@ async fn consume(mut updates: impl UpdateStream) {
                 assert!(m.is_valid());
             }
             Ok(StreamItem::Update(_)) => {}
-            Err(StreamError::Fatal) => return,
+            Err(StreamError::Fatal | StreamError::Unauthorized | StreamError::Migrated) => return,
             Err(StreamError::Transient) => {
                 errors += 1;
                 if errors >= MAX_STREAM_ERRORS {
@@ -154,7 +154,6 @@ async fn check_rebuild<B: Backend>(
 ) -> SessionSnapshot {
     let seed = Seed {
         session: SessionSeed::Live(snapshot),
-        peers: CarriedPeers::new([chat]),
     };
     let Instance {
         client,
@@ -220,7 +219,6 @@ async fn check_send(client: &impl Client, chat: ChatId) -> MsgId {
 pub(crate) async fn run<B: Backend>(backend: &B, target: Option<ChatId>, sends: Sends) {
     let seed = Seed {
         session: SessionSeed::Stored,
-        peers: CarriedPeers::default(),
     };
     let Instance {
         client,
@@ -243,6 +241,9 @@ pub(crate) async fn run<B: Backend>(backend: &B, target: Option<ChatId>, sends: 
     let chat = target
         .or_else(|| sendable.first().copied())
         .expect("a chat to check");
+    // As core does once the window opens: the chat's peer must survive the
+    // rebuild below.
+    client.retain_peers(&[chat]);
     let mut newest = check_history(&client, chat).await;
     if sends == Sends::Check {
         newest = Some(check_send(&client, chat).await);
@@ -276,7 +277,7 @@ async fn fake_backend_passes_the_contract() {
     assert_eq!(fake.runners_finished(), 2);
 }
 
-/// Needs `ABYSS_API_ID` and a signed-in session in the Keychain. With
+/// Needs `ABYSS_API_ID`/`ABYSS_API_HASH` and a signed-in session in the Keychain. With
 /// `ABYSS_CONTRACT_CHAT=user:<id>` (or `chat:`/`channel:`), the suite also
 /// sends one message there; the chat must be in the first dialogs pages or be
 /// Saved Messages, so its access hash is known.
@@ -284,13 +285,15 @@ async fn fake_backend_passes_the_contract() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Telegram credentials and a signed-in session (task 12)"]
 async fn grammers_backend_passes_the_contract() {
-    let api_id: i32 = std::env::var("ABYSS_API_ID")
-        .expect("ABYSS_API_ID")
-        .parse()
-        .expect("numeric ABYSS_API_ID");
+    let env = crate::credentials::from_env(|k| std::env::var(k).ok());
+    let crate::credentials::EnvResolution::Pair(creds) = env.clone() else {
+        panic!("set ABYSS_API_ID and ABYSS_API_HASH");
+    };
+    let slot = crate::credentials::CredentialSlot::new(env);
+    slot.set(Some(creds));
     let persist = crate::session::PersistHandle::spawn(crate::secret::KeychainStore::new())
         .expect("persistence worker");
-    let backend = super::grammers::GrammersBackend::new(api_id, persist);
+    let backend = super::grammers::GrammersBackend::new(slot, persist);
     let target = std::env::var("ABYSS_CONTRACT_CHAT").ok().map(|s| {
         let (kind, id) = s.split_once(':').expect("kind:id");
         let kind = match kind {

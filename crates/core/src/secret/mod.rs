@@ -9,6 +9,8 @@
 //! Keychain call ever runs on an async runtime thread.
 
 mod cache_key;
+#[cfg(any(test, feature = "fake"))]
+mod clock_gate;
 #[cfg(target_os = "macos")]
 mod keychain;
 #[cfg(any(test, feature = "fake"))]
@@ -19,6 +21,8 @@ mod tests;
 use zeroize::Zeroizing;
 
 pub use cache_key::{CacheKeyError, create_cache_key, delete_cache_key, load_or_create_cache_key};
+#[cfg(any(test, feature = "fake"))]
+pub use clock_gate::{Busy, ClockGate};
 #[cfg(target_os = "macos")]
 pub use keychain::{KeychainLocation, KeychainStore};
 #[cfg(any(test, feature = "fake"))]
@@ -31,6 +35,13 @@ pub enum SecretItem {
     Session,
     /// Raw 32-byte SQLCipher key of the message cache.
     CacheKey,
+    /// The entered API credentials (`dev.abyss.apicreds`, plan section 17.1).
+    /// Survives logout; deleted only by `ForgetStoredCredentials`.
+    ApiCredentials,
+    /// Present while a logout has begun and not finished deleting (review
+    /// round 15, A): startup resumes the logout before using the session.
+    /// One byte, the remote result so far.
+    LogoutPending,
 }
 
 impl SecretItem {
@@ -39,6 +50,8 @@ impl SecretItem {
         match self {
             Self::Session => "session",
             Self::CacheKey => "cachekey",
+            Self::ApiCredentials => "apicreds",
+            Self::LogoutPending => "logoutpending",
         }
     }
 }
@@ -85,4 +98,11 @@ pub trait SecretStore: Send + 'static {
     fn get(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError>;
     fn set(&self, item: SecretItem, secret: &[u8]) -> Result<(), StoreError>;
     fn delete(&self, item: SecretItem) -> Result<(), StoreError>;
+
+    /// Tests: the gate that keeps a paused clock still while this store's
+    /// thread works (`clock_gate`).
+    #[cfg(test)]
+    fn clock_gate(&self) -> Option<ClockGate> {
+        None
+    }
 }

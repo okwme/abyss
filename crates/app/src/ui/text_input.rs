@@ -16,8 +16,10 @@
 // scrolls, length counter); Up/Down, submit and cancel actions; key bindings
 // scoped to the input's key context; the demo window was removed.
 
-//! Text fields: single-line fields (phone, code) and the message composer.
-//! Passwords use the separate [`super::password::PasswordInput`].
+//! Text fields: single-line fields (phone, code, `api_id`) and the message
+//! composer. Secrets (the 2FA password, the `api_hash`) use the separate
+//! [`super::password::PasswordInput`], which never hands plaintext to the
+//! platform.
 
 mod edit;
 mod element;
@@ -142,6 +144,43 @@ impl TextInput {
 
     pub(crate) fn text(&self) -> &str {
         self.buffer.text()
+    }
+
+    /// Changes the field's length bound; text over it is cleared.
+    pub(crate) fn set_max_len(&mut self, max: usize, cx: &mut Context<'_, Self>) {
+        if self.buffer.limits().max_utf16 != max {
+            self.buffer.set_max_utf16(max);
+            cx.notify();
+        }
+    }
+
+    /// Clears the field.
+    pub(crate) fn clear(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        drop(self.take_text(window, cx));
+    }
+
+    /// The text as drawn.
+    pub(super) fn display_text(&self) -> String {
+        self.buffer.text().to_owned()
+    }
+
+    /// Fills an empty field with `text`, whole. Returns whether it did:
+    /// never over typed text, and never clipped.
+    pub(crate) fn put_text(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if !self.buffer.text().is_empty() {
+            return false;
+        }
+        if self.buffer.replace(None, text) == Fit::Clipped {
+            drop(self.buffer.take());
+            return false;
+        }
+        self.after_edit(Fit::Whole, window, cx);
+        true
     }
 
     /// Takes the text, leaving the field empty.
