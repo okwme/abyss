@@ -423,7 +423,7 @@ Messages carry no `random_id` (`api.tl:128`). The only correlation is `updateMes
   - Exceptions to "every command is answered" (task 6k):
     - **Shutdown:** once the app quits, core's last events may never be applied; nothing outlives the window.
     - **Epoch reset:** a command made for an earlier account epoch is dropped unanswered; the UI already cleared that account's echoes and drafts.
-    - **Core stop:** if core's event stream closes while it runs (an actor panic), no answer comes. The UI finalizes every pending echo: a delivered one is kept; any other is stranded (unknown fate, text kept for Copy, never Retry). From then on chat selection is local and nothing is sent (task 6l).
+    - **Core stop:** if core's event stream closes while it runs (an actor panic), no answer comes. The UI finalizes every pending echo: a delivered one is kept; any other is stranded (unknown fate, text kept for Copy, never Retry). From then on chat selection is local and nothing is sent (task 6l). A screen that keeps account state, a logout overlay included, gives way to that local view with an honest banner; other screens ask for a restart (task 6m).
     - **Superseded answer:** the stream is ordered, so an answer reflects core's state when it ran. The one answer that can be older than state the UI already shows is a `SendRefused` for a Retry queued before a late confirmation; it never changes a delivered echo.
 - **States:**
 
@@ -1032,6 +1032,19 @@ Open items:
 5. **Revocation after a failed marker (LOW).** Also fixed by the overlay: the screen is derived from the gate's current trigger, which a revocation escalates to `Server`, so "Stay signed in" goes. Test: `revocation_after_a_failed_marker_takes_stay_signed_in_away`. It was not run against the pre-overlay gate, which predates the other round 25 changes.
 - Also: the Fragment allowlist stays on `fragment.com`, with a comment that subdomains and the path format are unverified. `docs/connecting.md` now describes "Logging out" during the marker write, and says an unreadable record loads no session, opens no cache and deletes nothing.
 
+**Task 6m status (2026-11-17): round 36 re-check of task 6l, offline against the fake.** Each regression test fails with its fix disabled in place (checked one fix at a time). Tests are in `crates/app/src/shell/tests.rs`. Core and the exit-safety files were not touched.
+1. **Recovery was unreachable behind the logout screens (P2).** Once core stops, the session shows one of three screens (`shell::view::Screen`):
+   - **Recovery:** where the screen keeps account state (`AuthView::retains_account`: signed in, a login's tips, "Logging out" over a kept account, "Couldn't start logout"). It shows the local view from 6l: navigation, stranded echoes with Copy/Dismiss, and drafts. A banner on top is honest about the logout:
+     - "abyss stopped while signing out. Sign-out may not have finished. Copy anything you need, then restart."
+     - "abyss stopped. Sign-out did not start. Copy anything you need, then restart."
+     - signed in: "abyss stopped: copy anything you need, then restart."
+     The overlay and its actions ("Stay signed in", Retry) are gone. So are Log out, the logout prompt and the credential item's Retry, which all need core. Quit stays.
+   - **Stopped:** every other screen keeps no account state: login steps, onboarding, verification, the dead ends, `StartupBlocked` (its RetryStartup needs core), and the torn-down `LoggingOut`/`LogoutIncomplete` (cleared by `ChatShell::reset`). These show "abyss stopped. Restart it to continue." with no action.
+   - **Auth:** while core runs, the screens are unchanged.
+   - Enter after a stop shows the stopped notice whatever the screen.
+   - Tests: `a_core_stop_behind_logging_out_shows_the_recovery_view` and `a_core_stop_behind_an_unstarted_logout_shows_the_recovery_view` (each: a pending send in chat 1, the overlay, then the stream closes; the recovery view and its banner, navigation, Copy reaching the text, no command even on Enter). Also `a_core_stop_without_account_state_asks_for_a_restart`.
+2. **Local navigation showed "Loading…" forever (P3).** A chat whose history was never loaded shows "History unavailable: abyss stopped." after a core stop (`chat_view::placeholder`). Test: `a_chat_opened_after_a_core_stop_has_no_endless_loading`.
+
 **Task 6l status (2026-11-17): round 35 re-check of task 6k, offline against the fake.** Each regression test fails with its fix disabled in place (checked one fix at a time). Tests are in `crates/app/src/shell/tests.rs`, `chat/drafts.rs` and `chat/tests/review6k.rs`. Exit-safety files and core were not touched.
 1. **Draft eviction destroyed unsent text (P2).** A draft is never dropped now.
    - `Drafts::stash` hands the text back when full instead of evicting.
@@ -1480,6 +1493,10 @@ Open items:
   - **High:** the UI kept account A's messages and draft after logout, so account B could see them under a shared peer id.
   - **High:** commands queued behind Logout (sends included) could act for the next account. Reject account-scoped commands during logout and while signed out, quarantine the cache at teardown, and tag commands with an account generation.
   - **Medium:** a cache re-binding could lose its only completion notification: it reported before returning, and the actor checked `is_finished()`.
+
+- **Round 36 (re-check of task 6l, 2026-11-17).** GPT-6 Astra confirmed that queued events drain before stranding, that no production path restarts core in-process, that Quit stays available, and that the draft, local-navigation and finalize fixes otherwise hold. Fixed in task 6m (section 13, Task 6m status):
+  - **P2:** a core stop behind "Logging out" or "Couldn't start logout" left the overlay up: navigation, Copy and drafts were hidden, and "Stay signed in" needed the dead core. Such screens now give way to the local recovery view with an honest banner. Screens that keep no account state ask for a restart.
+  - **P3:** local navigation after a core stop showed "Loading…" forever. It now says history is unavailable.
 
 - **Round 35 (re-check of task 6k, 2026-11-17).** GPT-6 Astra confirmed the delivered-refusal guard, checked allocation, the capacity comment, the audit verdicts, draft redaction and clearing, the shutdown exclusion, and stranded echoes counting toward 288 with Retry disabled. Three P2s remained. All fixed in task 6l (section 13, Task 6l status):
   - **P2:** draft eviction silently destroyed unsent text. At the bound, switching to the chat with the oldest draft evicted that very draft. Drafts are never dropped now: the switch is transactional and refused when it would need a slot past the bound.

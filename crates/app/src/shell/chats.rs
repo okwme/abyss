@@ -282,11 +282,11 @@ impl Session {
     /// Enter in the composer. The text leaves the composer only once core
     /// admitted the send, together with its echo.
     pub(super) fn submit_message(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
-        if self.auth != AuthView::SignedIn {
-            return;
-        }
         if self.shell.is_stopped() {
             self.show_notice(chat_copy::CORE_STOPPED_COPY.into(), window, cx);
+            return;
+        }
+        if self.auth != AuthView::SignedIn {
             return;
         }
         let chat = match self.shell.send_target() {

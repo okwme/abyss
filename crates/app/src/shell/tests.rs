@@ -1040,6 +1040,100 @@ mod fake {
         reopen_after_core_stop(cx, None);
     }
 
+    fn screen(root: &Entity<Root>, cx: &mut VisualTestContext) -> crate::shell::view::Screen {
+        read(root, cx, super::super::Session::screen)
+    }
+
+    /// Task 6m, finding 1: a pending send in chat 1, then a logout overlay
+    /// (`state`), then core's stream closes. The overlay gives way to the
+    /// local recovery view under `banner`; navigation and Copy reach the
+    /// text; nothing is asked of core.
+    fn recovery_behind_a_logout_overlay(cx: &mut TestAppContext, state: AuthState, banner: &str) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        let id = submit_text(cx, &harness, "pending in 1");
+        core_says(&harness, cx, state);
+        assert_eq!(
+            screen(&root, cx),
+            crate::shell::view::Screen::Auth,
+            "the overlay"
+        );
+        harness.events.close_channel();
+        cx.run_until_parked();
+        assert_eq!(screen(&root, cx), crate::shell::view::Screen::Recovery);
+        assert_eq!(
+            read(&root, cx, super::super::Session::stopped_banner),
+            banner
+        );
+        let from = harness.sent.borrow().commands.len();
+        select(&root, cx, 2);
+        select(&root, cx, 1);
+        assert_eq!(selected(&root, cx), Some(user(1)));
+        let text = read(&root, cx, |s| s.shell.stranded_text(id).map(str::to_owned));
+        assert_eq!(text.as_deref(), Some("pending in 1"), "Copy reaches it");
+        cx.simulate_keystrokes("enter");
+        assert!(
+            commands_since(&harness, from).is_empty(),
+            "nothing asked of core"
+        );
+    }
+
+    #[gpui::test]
+    fn a_core_stop_behind_logging_out_shows_the_recovery_view(cx: &mut TestAppContext) {
+        recovery_behind_a_logout_overlay(
+            cx,
+            AuthState::LogoutStarting,
+            crate::chat::copy::STOPPED_SIGNING_OUT,
+        );
+    }
+
+    #[gpui::test]
+    fn a_core_stop_behind_an_unstarted_logout_shows_the_recovery_view(cx: &mut TestAppContext) {
+        recovery_behind_a_logout_overlay(
+            cx,
+            AuthState::LogoutNotStarted {
+                error: abyss_core::api::StorageError::Keychain,
+                trigger: abyss_core::api::LogoutTrigger::User,
+            },
+            crate::chat::copy::STOPPED_SIGN_OUT_NOT_STARTED,
+        );
+    }
+
+    /// Task 6m audit: screens that keep no account state (a torn-down
+    /// logout, a login step) show only "restart" once core stops; none of
+    /// their actions, which need core, stays on screen.
+    #[gpui::test]
+    fn a_core_stop_without_account_state_asks_for_a_restart(cx: &mut TestAppContext) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        core_says(&harness, cx, AuthState::LoggingOut);
+        harness.events.close_channel();
+        cx.run_until_parked();
+        assert_eq!(screen(&root, cx), crate::shell::view::Screen::Stopped);
+        assert_eq!(read(&root, cx, |s| s.shell.echoes().count(user(1))), 0);
+    }
+
+    /// Task 6m, finding 2: a chat opened after a core stop, whose history
+    /// was never loaded, says so instead of "Loading…" forever.
+    #[gpui::test]
+    fn a_chat_opened_after_a_core_stop_has_no_endless_loading(cx: &mut TestAppContext) {
+        let (root, cx, harness) = chats_open(cx, 1);
+        assert_eq!(
+            read(&root, cx, |s| super::super::chat_view::placeholder(
+                &s.shell
+            )),
+            Some(crate::chat::copy::LOADING_HISTORY),
+            "loading while core runs"
+        );
+        harness.events.close_channel();
+        cx.run_until_parked();
+        select(&root, cx, 2);
+        assert_eq!(
+            read(&root, cx, |s| super::super::chat_view::placeholder(
+                &s.shell
+            )),
+            Some(crate::chat::copy::HISTORY_UNAVAILABLE)
+        );
+    }
+
     fn commands_since(harness: &Harness, from: usize) -> Vec<String> {
         harness
             .sent

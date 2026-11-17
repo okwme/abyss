@@ -20,7 +20,7 @@ use super::{Root, State};
 use crate::chat::messages::MessageWindow;
 use crate::chat::rich::{self, Click, Fonts, Palette, Spoilers};
 use crate::chat::sends::Echo;
-use crate::chat::{Row, copy, format, list as chat_list};
+use crate::chat::{ChatShell, Row, copy, format, list as chat_list};
 
 const CHAT_ROW_HEIGHT: f32 = 56.;
 const SIDEBAR_WIDTH: f32 = 300.;
@@ -220,6 +220,21 @@ fn avatar(chat: &ChatSummary) -> Div {
         .child(chat_list::initials(&chat.title))
 }
 
+/// What the open chat's pane shows instead of rows (`None`: its rows).
+/// After a core stop, history never loaded is unavailable, never
+/// "Loading…" (task 6m).
+pub(super) fn placeholder(shell: &ChatShell) -> Option<&'static str> {
+    if shell.row_count() > 0 {
+        None
+    } else if shell.window().is_some_and(MessageWindow::is_loaded) {
+        Some(copy::EMPTY_CHAT)
+    } else if shell.is_stopped() {
+        Some(copy::HISTORY_UNAVAILABLE)
+    } else {
+        Some(copy::LOADING_HISTORY)
+    }
+}
+
 fn chat_pane(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
     let Some(chat) = session.shell.selected_chat() else {
         return centered()
@@ -227,17 +242,11 @@ fn chat_pane(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
             .into_any_element();
     };
     let window = session.shell.window();
-    let loaded = window.is_some_and(MessageWindow::is_loaded);
-    let body = if session.shell.row_count() > 0 {
-        list(session.shell.rows().clone(), cx.processor(message_row))
+    let body = match placeholder(&session.shell) {
+        None => list(session.shell.rows().clone(), cx.processor(message_row))
             .size_full()
-            .into_any_element()
-    } else if loaded {
-        centered().child(muted(copy::EMPTY_CHAT)).into_any_element()
-    } else {
-        centered()
-            .child(muted(copy::LOADING_HISTORY))
-            .into_any_element()
+            .into_any_element(),
+        Some(text) => centered().child(muted(text)).into_any_element(),
     };
     let detached = window.is_some_and(MessageWindow::has_newer);
     // Once this pane is painted, check what the list shows (mark read,

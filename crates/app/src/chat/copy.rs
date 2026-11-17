@@ -38,6 +38,16 @@ pub(crate) const COPY_TEXT: &str = "Copy text";
 pub(crate) const TOO_MANY_DRAFTS: &str = "Too many unsent drafts: send or clear one first.";
 /// Enter while core is stopped.
 pub(crate) const CORE_STOPPED_COPY: &str = "abyss stopped: copy anything you need, then restart.";
+/// The recovery view's banner after a core stop behind "Logging out"
+/// (task 6m): the marker write may or may not have finished.
+pub(crate) const STOPPED_SIGNING_OUT: &str = "abyss stopped while signing out. Sign-out may not have finished. Copy anything you need, then restart.";
+/// The same behind "Couldn't start logout".
+pub(crate) const STOPPED_SIGN_OUT_NOT_STARTED: &str =
+    "abyss stopped. Sign-out did not start. Copy anything you need, then restart.";
+/// A core stop with no account state kept on screen.
+pub(crate) const STOPPED_RESTART: &str = "abyss stopped. Restart it to continue.";
+/// A chat opened after a core stop whose history was never loaded.
+pub(crate) const HISTORY_UNAVAILABLE: &str = "History unavailable: abyss stopped.";
 pub(crate) const TEXT_COPIED: &str = "Text copied.";
 /// Put back from a chat other than the send's.
 pub(crate) const OTHER_CHAT: &str = "Open the chat this message was for to put it back.";

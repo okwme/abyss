@@ -383,6 +383,19 @@ impl AuthView {
         )
     }
 
+    /// Whether the account's chat state (echoes, drafts) is kept behind
+    /// this screen: signed in, a login's tips, or a logout overlay over a
+    /// kept account. Torn-down and signed-out screens keep none (task 6m).
+    pub(crate) fn retains_account(&self) -> bool {
+        matches!(
+            self,
+            AuthView::SignedIn
+                | AuthView::Done { .. }
+                | AuthView::LogoutStarting
+                | AuthView::LogoutNotStarted { .. }
+        )
+    }
+
     /// A logout overlay hides the account's UI, which is kept: its live
     /// tail is not on screen (review round 28).
     pub(crate) fn hides_account(&self) -> bool {

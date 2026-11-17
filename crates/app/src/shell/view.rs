@@ -14,6 +14,7 @@ use super::chat_view::chat_shell;
 use super::session::Session;
 use super::shutdown::Closing;
 use super::{Failure, Root, State};
+use crate::chat::copy as chat_copy;
 use crate::ui::copy;
 
 mod onboarding;
@@ -86,27 +87,87 @@ fn failure_screen(failure: &Failure) -> impl IntoElement {
     )
 }
 
+/// What the session shows (task 6m).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Screen {
+    /// The auth router (`SignedIn` is the chat shell).
+    Auth,
+    /// Core stopped with account state kept: the local recovery view (the
+    /// chat shell, nothing asked of core) under an honest banner.
+    Recovery,
+    /// Core stopped with no account state kept: restart.
+    Stopped,
+}
+
+impl Session {
+    pub(super) fn screen(&self) -> Screen {
+        if !self.shell.is_stopped() {
+            Screen::Auth
+        } else if self.auth.retains_account() {
+            Screen::Recovery
+        } else {
+            Screen::Stopped
+        }
+    }
+
+    /// The recovery view's banner: honest about a logout core stopped in.
+    pub(super) fn stopped_banner(&self) -> &'static str {
+        match self.auth {
+            AuthView::LogoutStarting => chat_copy::STOPPED_SIGNING_OUT,
+            AuthView::LogoutNotStarted { .. } => chat_copy::STOPPED_SIGN_OUT_NOT_STARTED,
+            _ => chat_copy::CORE_STOPPED_COPY,
+        }
+    }
+}
+
 fn session_body(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
-    let screen = auth_screen(session, cx);
-    // The Logout control of the signed-in shell (plan section 17.3).
-    let logout = (session.auth == AuthView::SignedIn).then(|| {
+    let screen = match session.screen() {
+        Screen::Auth => auth_screen(session, cx),
+        Screen::Recovery => recovery_view(session, cx),
+        Screen::Stopped => centered()
+            .child(muted(chat_copy::STOPPED_RESTART))
+            .into_any_element(),
+    };
+    let live = session.screen() == Screen::Auth;
+    // The Logout control of the signed-in shell (plan section 17.3); none
+    // once core stopped (it needs core).
+    let logout = (live && session.auth == AuthView::SignedIn).then(|| {
         div().absolute().top_2().right_4().child(on(
             secondary("logout", copy::onboarding::LOGOUT),
             Session::logout,
             cx,
         ))
     });
-    let confirm = session
-        .confirming_logout()
-        .then(|| logout_confirm(cx).into_any_element());
+    let confirm =
+        (live && session.confirming_logout()).then(|| logout_confirm(cx).into_any_element());
+    let credential = live.then(|| credential_banner(session, cx)).flatten();
     div()
         .size_full()
         .relative()
         .child(screen)
-        .children(credential_banner(session, cx))
+        .children(credential)
         .children(logout)
         .children(confirm)
         .children(session.notice.clone().map(toast))
+        .into_any_element()
+}
+
+/// Core stopped with account state kept (task 6m): the chat shell, local
+/// only, under a banner. Replaces a logout overlay, whose actions need core.
+fn recovery_view(session: &Session, cx: &mut Context<'_, Root>) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .w_full()
+                .px_4()
+                .py_2()
+                .border_b_1()
+                .child(muted(session.stopped_banner())),
+        )
+        .child(div().flex_1().min_h_0().child(chat_shell(session, cx)))
         .into_any_element()
 }
 
