@@ -21,7 +21,7 @@ Message links are copy-only. The only URL abyss ever opens is the hardcoded `htt
 |---|---|---|
 | 1 | Sign-in and onboarding, chat list, text history with formatting, sending, live updates, logout, encrypted message cache | Code done and reviewed against the fake backend; live verification (task 12) open |
 | 2 | Forum topics | Not started; plan to write |
-| 3 | Notifications, code signing, App Sandbox, accessibility | Not started |
+| 3 | Notifications, Developer ID signing and notarization, App Sandbox, accessibility | Not started; the bundle (`scripts/bundle.sh`) is signed ad hoc |
 | 4 | Media download and decode: chat images, then avatars (letter avatars and stripped thumbnails included) | Not started; images come last in v1 |
 
 Notes:
@@ -63,9 +63,9 @@ This is blocked on a real `api_id`/`api_hash`. Everything else in Stage 1 has ru
 **Cache:**
 - [ ] History survives a restart. Check that the `~/Library/Application Support/dev.abyss/cache` permissions are 0700 with no ACLs.
 
-## Settings page (planned, not yet specified)
+## Settings page (partly built, not yet specified)
 
-A settings page is wanted, but it has no plan section yet.
+An appearance panel exists (`shell/appearance.rs`). It sets hue and tint for night and day, saved to a small file in Application Support (`ui/theme/settings.rs`). A fuller settings page has no plan section yet.
 
 Open question: should it show active sessions? If so:
 - Listing them is read-only and low risk.
@@ -75,7 +75,15 @@ Open question: should it show active sessions? If so:
 ## Open decisions
 
 - Active sessions on the settings page (above).
-- Brand: the items under "Open" in `docs/brand/brand.md`, once that guide is committed. The app still uses the placeholder palette.
+- **A project `api_id` for packaged releases** (stage-1.md section 17.1, amendment):
+  - Packaged builds are to embed one and go straight to sign-in.
+  - Source builds keep bring-your-own credentials.
+  - None is registered yet, so nothing changes in code until one is.
+- **Brand:** the items under "Open" in [brand/brand.md](brand/brand.md):
+  - the layered icon;
+  - per-network Welcome copy;
+  - fonts off macOS;
+  - publishing the landing page and store listing.
 
 ## Non-blocking follow-ups
 
