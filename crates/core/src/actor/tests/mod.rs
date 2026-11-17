@@ -24,6 +24,7 @@ mod review6d;
 mod review6e;
 mod review6f;
 mod review6g;
+mod review6h;
 
 use std::path::PathBuf;
 use std::sync::Arc;

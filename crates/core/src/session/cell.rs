@@ -26,6 +26,9 @@ pub(crate) struct CellInner {
     /// A revision whose `Write` could not be queued, until a later one is.
     unqueued: Option<u64>,
     tx: mpsc::Sender<PersistMsg>,
+    /// Tests: see `PersistHandle`'s `gate`.
+    #[cfg(test)]
+    gate: Option<crate::secret::ClockGate>,
 }
 
 /// Shared, lock-protected critical state. Outlives client instances.
@@ -99,6 +102,11 @@ impl Cell {
             }
             (inner.account, inner.rev, inner.tx.clone())
         };
+        #[cfg(test)]
+        let _busy = self
+            .lock()
+            .ok()
+            .and_then(|inner| inner.gate.as_ref().map(crate::secret::ClockGate::busy));
         let (reply, rx) = oneshot::channel();
         tx.send(PersistMsg::Barrier {
             account,
@@ -141,7 +149,12 @@ impl SessionSnapshot {
         account: AccountGen,
         persist: &PersistHandle,
     ) -> Self {
-        Self::with_sender(state, blob, account, persist.sender())
+        let snapshot = Self::with_sender(state, blob, account, persist.sender());
+        #[cfg(test)]
+        if let Ok(mut inner) = snapshot.cell.lock() {
+            inner.gate = persist.clock_gate();
+        }
+        snapshot
     }
 
     pub(crate) fn with_sender(
@@ -159,6 +172,8 @@ impl SessionSnapshot {
             last_writer: NO_WRITER,
             unqueued: None,
             tx,
+            #[cfg(test)]
+            gate: None,
         };
         Self {
             cell: Cell(Arc::new(Mutex::new(inner))),

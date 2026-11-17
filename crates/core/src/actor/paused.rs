@@ -65,8 +65,8 @@ impl<B: Backend> Actor<B> {
 
     /// Answers an account command refused in the UI's epoch, so no UI state
     /// waits on it (review round 25, finding 1): a send ends `Failed`, a
-    /// retry goes back to its send's state (`Failed` if core has none), a
-    /// load ends `Busy`.
+    /// retry goes back to its send's state (`answer_unrun_retry`), a load
+    /// ends `Busy`.
     pub(super) async fn acknowledge_refused(&mut self, cmd: Command) {
         match cmd {
             Command::SendText { local_id, .. } => {
@@ -76,10 +76,7 @@ impl<B: Backend> Actor<B> {
                 })
                 .await;
             }
-            Command::RetrySend(local_id) => {
-                let state = self.sends.state_of(local_id).unwrap_or(SendState::Failed);
-                self.emit(Event::SendState { local_id, state }).await;
-            }
+            Command::RetrySend(local_id) => self.answer_unrun_retry(local_id).await,
             Command::LoadDialogs => {
                 self.load_ended(LoadTarget::Dialogs, Some(UserError::Busy))
                     .await;

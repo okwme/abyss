@@ -13,13 +13,13 @@ use crate::model::LocalId;
 use crate::secret::SecretItem;
 
 /// The next `SendState` of `id` other than `Sending`.
-fn settled(id: LocalId) -> impl Fn(&Event) -> bool {
+pub(super) fn settled(id: LocalId) -> impl Fn(&Event) -> bool {
     move |e| matches!(e, Event::SendState { local_id, state } if *local_id == id && *state != SendState::Sending)
 }
 
 /// Logout with the marker write stalled (shown "Logging out"); it fails
 /// once the store is released.
-async fn logout_stalled(h: &mut Harness) {
+pub(super) async fn logout_stalled(h: &mut Harness) {
     h.faults.fail_set_of(SecretItem::LogoutPending);
     h.faults.hold();
     h.send(Command::Logout).await;
@@ -27,7 +27,7 @@ async fn logout_stalled(h: &mut Harness) {
 }
 
 /// Releases the stalled marker write (it fails), then "Stay signed in".
-async fn stay_signed_in(h: &mut Harness) {
+pub(super) async fn stay_signed_in(h: &mut Harness) {
     h.faults.release();
     h.auth(|s| matches!(s, AuthState::LogoutNotStarted { .. }))
         .await;

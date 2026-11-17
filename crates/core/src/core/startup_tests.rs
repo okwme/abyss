@@ -226,14 +226,24 @@ async fn shutdown_during_a_stalled_deferred_cache_provisioning_acks_promptly() {
     control.hold_item(SecretItem::CacheKey);
     control.heal_item(SecretItem::LogoutPending);
     core.send(Command::RetryStartup).unwrap();
-    // Until the provisioning is stalled on the key.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Until the provisioning is stalled on the key (bounded in wall time).
+    let entered = Instant::now();
+    while !control.hold_entered(SecretItem::CacheKey) {
+        assert!(
+            entered.elapsed() < Duration::from_secs(30),
+            "the key was never read"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let started = Instant::now();
     let done = core.begin_shutdown().unwrap();
     let acked = tokio::time::timeout(SHUTDOWN_DEADLINE + Duration::from_secs(2), done).await;
     let elapsed = started.elapsed();
     control.release();
-    assert!(acked.is_ok(), "no shutdown ack after {elapsed:?}");
+    let report = acked
+        .unwrap_or_else(|_| panic!("no shutdown ack after {elapsed:?}"))
+        .expect("the core thread dropped the ack");
+    assert_eq!(report.logout, None, "{report:?}");
     assert!(crate::cache::wait_closed(
         Some(dir.path()),
         Duration::from_secs(15)

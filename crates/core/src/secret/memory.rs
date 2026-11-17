@@ -7,11 +7,15 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use super::{SecretItem, SecretStore, StoreError};
+use super::{ClockGate, SecretItem, SecretStore, StoreError};
 
 /// Longest a held operation waits for [`FaultControl::release`]. Bounds every
 /// test that forgets to release.
 const MAX_HOLD: Duration = Duration::from_secs(10);
+
+/// Tests: milliseconds every [`FaultyStore`] operation sleeps (unset: none).
+#[cfg(test)]
+const TEST_STORE_DELAY_VAR: &str = "ABYSS_TEST_STORE_DELAY_MS";
 
 /// Thread-safe in-memory store. Clones share storage, so a test can keep one
 /// clone to inspect what the persistence worker wrote.
@@ -87,6 +91,9 @@ struct Faults {
     failing_sets: AtomicU8,
     /// Operations on these items block until released (one bit per item).
     held_items: AtomicU8,
+    /// Items an operation is blocked on by [`FaultControl::hold_item`].
+    entered_items: AtomicU8,
+    gate: ClockGate,
     calls: AtomicU64,
     held: Mutex<bool>,
     released: Condvar,
@@ -176,15 +183,34 @@ impl FaultControl {
         if let Ok(mut held) = self.0.held.lock() {
             *held = false;
             self.0.held_items.store(0, Ordering::SeqCst);
+            self.0.entered_items.store(0, Ordering::SeqCst);
         }
+        self.0.gate.released();
         self.0.released.notify_all();
+    }
+
+    /// Whether an operation on `item` is blocked by [`Self::hold_item`] now.
+    pub fn hold_entered(&self, item: SecretItem) -> bool {
+        self.0.entered_items.load(Ordering::SeqCst) & item_bit(item) != 0
+    }
+
+    /// The gate keeping a paused clock still while the store works.
+    pub fn clock_gate(&self) -> ClockGate {
+        self.0.gate.clone()
     }
 
     /// Waits while `item` is held (bounded like [`Self::hold`]).
     fn wait_item(&self, item: SecretItem) {
-        let held = |_: &mut bool| self.0.held_items.load(Ordering::SeqCst) & item_bit(item) != 0;
+        let bit = item_bit(item);
+        let held = |_: &mut bool| self.0.held_items.load(Ordering::SeqCst) & bit != 0;
         if let Ok(guard) = self.0.held.lock() {
+            if !held(&mut false) {
+                return;
+            }
+            self.0.entered_items.fetch_or(bit, Ordering::SeqCst);
+            let epoch = self.0.gate.hold_began();
             let _ = self.0.released.wait_timeout_while(guard, MAX_HOLD, held);
+            self.0.gate.hold_ended(epoch);
         }
     }
 
@@ -195,13 +221,18 @@ impl FaultControl {
 
     fn before(&self, op: StoreOp) -> Result<(), StoreError> {
         self.0.calls.fetch_add(1, Ordering::SeqCst);
-        if let Ok(held) = self.0.held.lock() {
+        if let Ok(held) = self.0.held.lock()
+            && *held
+        {
+            // Time may pass on a paused clock while held (`ClockGate`).
+            let epoch = self.0.gate.hold_began();
             // A timeout or poisoned lock just ends the hold; the bound matters
             // more than the reason.
             let _ = self
                 .0
                 .released
                 .wait_timeout_while(held, MAX_HOLD, |held| *held);
+            self.0.gate.hold_ended(epoch);
         }
         let ms = self.0.delay_ms.load(Ordering::SeqCst);
         if ms > 0 {
@@ -226,6 +257,16 @@ pub struct FaultyStore<S> {
 impl<S: SecretStore> FaultyStore<S> {
     pub fn new(inner: S) -> (Self, FaultControl) {
         let control = FaultControl::default();
+        // Tests: every operation of every faulty store this slow, to prove
+        // that no test depends on how fast the store thread answers (review
+        // round 31).
+        #[cfg(test)]
+        if let Some(ms) = std::env::var(TEST_STORE_DELAY_VAR)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            control.set_delay(Duration::from_millis(ms));
+        }
         (
             Self {
                 inner,
@@ -237,6 +278,11 @@ impl<S: SecretStore> FaultyStore<S> {
 }
 
 impl<S: SecretStore> SecretStore for FaultyStore<S> {
+    #[cfg(test)]
+    fn clock_gate(&self) -> Option<ClockGate> {
+        Some(self.control.clock_gate())
+    }
+
     fn get(&self, item: SecretItem) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
         self.control.before(StoreOp::Get)?;
         self.control.wait_item(item);

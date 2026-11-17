@@ -166,6 +166,10 @@ pub struct LoadedSession {
 pub struct PersistHandle {
     tx: mpsc::Sender<PersistMsg>,
     next_gen: Arc<AtomicU64>,
+    /// Tests: keeps a paused clock still while a request is awaited
+    /// (`secret::ClockGate`).
+    #[cfg(test)]
+    gate: Option<crate::secret::ClockGate>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -187,6 +191,8 @@ impl PersistHandle {
     /// Starts the worker thread, which takes sole ownership of `store`.
     pub fn spawn(store: impl SecretStore) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel(PERSIST_QUEUE);
+        #[cfg(test)]
+        let gate = store.clock_gate();
         let worker = Worker {
             store: Box::new(store),
             terminated: None,
@@ -198,6 +204,8 @@ impl PersistHandle {
         Ok(Self {
             tx,
             next_gen: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            gate,
         })
     }
 
@@ -207,8 +215,16 @@ impl PersistHandle {
 
     async fn ask<T>(&self, make: impl FnOnce(Reply<T>) -> PersistMsg) -> Option<T> {
         let (reply, rx) = oneshot::channel();
+        #[cfg(test)]
+        let _busy = self.gate.as_ref().map(crate::secret::ClockGate::busy);
         self.tx.send(make(reply)).await.ok()?;
         rx.await.ok()
+    }
+
+    /// Tests: see the `gate` field.
+    #[cfg(test)]
+    pub(crate) fn clock_gate(&self) -> Option<crate::secret::ClockGate> {
+        self.gate.clone()
     }
 
     /// Reads the session item (process startup only; rebuilds reuse the live
